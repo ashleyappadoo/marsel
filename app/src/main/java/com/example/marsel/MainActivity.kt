@@ -2,12 +2,15 @@ package com.example.marsel
 
 import android.Manifest
 import android.annotation.SuppressLint
+import android.content.Intent
 import android.content.pm.PackageManager
+import android.net.Uri
 import android.os.Bundle
 import android.util.Log
 import android.webkit.GeolocationPermissions
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
+import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.ComponentActivity
@@ -48,7 +51,27 @@ class MainActivity : ComponentActivity() {
         webView.settings.allowContentAccess = true
         webView.settings.setGeolocationEnabled(true)
 
-        webView.webViewClient = WebViewClient()
+        webView.webViewClient = object : WebViewClient() {
+            override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
+                val url = request.url.toString()
+                return when {
+                    url.startsWith("tel:") -> {
+                        startActivity(Intent(Intent.ACTION_DIAL, Uri.parse(url)))
+                        true
+                    }
+                    url.startsWith("mailto:") -> {
+                        startActivity(Intent(Intent.ACTION_SENDTO, Uri.parse(url)))
+                        true
+                    }
+                    url.startsWith("sms:") -> {
+                        startActivity(Intent(Intent.ACTION_SENDTO, Uri.parse(url)))
+                        true
+                    }
+                    else -> false
+                }
+            }
+        }
+
         webView.webChromeClient = object : WebChromeClient() {
             override fun onGeolocationPermissionsShowPrompt(
                 origin: String,
