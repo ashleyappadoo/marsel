@@ -1,0 +1,256 @@
+:root {
+  --marsel-blue: #004aad;
+  --marsel-orange: #ff4800;
+  --marsel-dark: #102033;
+  --marsel-light: #f5f8ff;
+  --marsel-white: #ffffff;
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: Arial, sans-serif;
+  background: var(--marsel-light);
+  color: var(--marsel-dark);
+  min-height: 100vh;
+}
+
+header {
+  background: linear-gradient(135deg, var(--marsel-blue), var(--marsel-orange));
+  color: var(--marsel-white);
+  text-align: center;
+  padding: 25px;
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.15);
+}
+
+header h1 {
+  font-size: 2.2rem;
+  letter-spacing: 1px;
+}
+
+main {
+  padding: 25px;
+}
+
+.card {
+  background: var(--marsel-white);
+  max-width: 450px;
+  margin: 25px auto;
+  padding: 20px;
+  border-radius: 18px;
+  text-align: center;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.12);
+}
+
+.card h2 {
+  color: var(--marsel-blue);
+  margin-bottom: 12px;
+}
+
+#userIdDisplay,
+#networkStatus {
+  margin-top: 10px;
+  font-size: 0.85rem;
+  word-break: break-all;
+}
+
+#networkStatus {
+  color: var(--marsel-blue);
+  font-weight: bold;
+}
+
+.urgence-container {
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  height: 45vh;
+}
+
+.btn-urgence {
+  width: 150px;
+  height: 150px;
+  border-radius: 50%;
+  border: none;
+  background: radial-gradient(circle, var(--marsel-orange), var(--marsel-blue));
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  box-shadow: 0 0 25px rgba(255, 72, 0, 0.8);
+  animation: pulse 1.5s infinite;
+}
+
+.btn-urgence img {
+  width: 80px;
+  height: 80px;
+  object-fit: contain;
+}
+
+.btn-urgence:hover {
+  transform: scale(1.08);
+}
+
+.btn-urgence.disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  animation: none;
+}
+
+@keyframes pulse {
+  0% {
+    transform: scale(1);
+    box-shadow: 0 0 12px var(--marsel-orange);
+  }
+
+  50% {
+    transform: scale(1.1);
+    box-shadow: 0 0 35px var(--marsel-orange);
+  }
+
+  100% {
+    transform: scale(1);
+    box-shadow: 0 0 12px var(--marsel-orange);
+  }
+}
+
+.logs-container {
+  max-width: 600px;
+  margin: 25px auto;
+  padding: 15px;
+  background: var(--marsel-dark);
+  color: var(--marsel-white);
+  border-radius: 14px;
+  max-height: 220px;
+  overflow-y: auto;
+  box-shadow: 0 8px 20px rgba(0, 0, 0, 0.2);
+}
+
+.logs-container h3 {
+  color: var(--marsel-orange);
+  margin-bottom: 10px;
+}
+
+#logs div {
+  font-size: 0.85rem;
+  padding: 6px 0;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.15);
+}
+
+button {
+  font-family: inherit;
+}
+
+@media (max-width: 600px) {
+  header h1 {
+    font-size: 1.8rem;
+  }
+
+  main {
+    padding: 15px;
+  }
+
+  .btn-urgence {
+    width: 135px;
+    height: 135px;
+  }
+
+  .btn-urgence img {
+    width: 70px;
+    height: 70px;
+  }
+
+  .urgence-container {
+    height: 40vh;
+  }
+}
+
+.online {
+  color: orange !important;
+  font-weight: bold;
+}
+
+.offline {
+  color: blue !important;
+  font-weight: bold;
+}
+
+.offline {
+  color: blue !important;
+  font-weight: bold;
+}
+
+/* TABLE VOISINS */
+
+.table-container {
+  overflow-x: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  margin-top: 12px;
+  font-size: 0.85rem;
+}
+
+th,
+td {
+  border: 1px solid #ddd;
+  padding: 8px;
+  text-align: center;
+  word-break: break-all;
+}
+
+th {
+  background: var(--marsel-blue);
+  color: var(--marsel-white);
+}
+
+td {
+  background: #fdfdfd;
+}
+
+.actif {
+  color: green;
+  font-weight: bold;
+}
+
+.expire {
+  color: red;
+  font-weight: bold;
+}
+
+#messageInput {
+  width: 100%;
+  padding: 12px;
+  margin-top: 10px;
+  border-radius: 10px;
+  border: 1px solid #ccc;
+}
+
+#sendMessageBtn {
+  margin-top: 10px;
+  padding: 12px 18px;
+  border: none;
+  border-radius: 10px;
+  background: #004aad;
+  color: white;
+  cursor: pointer;
+}
+
+#messages {
+  margin-top: 15px;
+  max-height: 200px;
+  overflow-y: auto;
+  text-align: left;
+}
+
+.message {
+  background: #f1f1f1;
+  padding: 10px;
+  border-radius: 10px;
+  margin-bottom: 10px;
+}
