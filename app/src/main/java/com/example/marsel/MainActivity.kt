@@ -26,13 +26,12 @@ class MainActivity : ComponentActivity() {
 
     private val requestPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { /* permission accordée ou refusée, le WebView gère via onGeolocationPermissionsShowPrompt */ }
+    ) { }
 
     @SuppressLint("SetJavaScriptEnabled")
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Demande des permissions GPS au démarrage
         val permissions = arrayOf(
             Manifest.permission.ACCESS_FINE_LOCATION,
             Manifest.permission.ACCESS_COARSE_LOCATION
@@ -43,7 +42,6 @@ class MainActivity : ComponentActivity() {
         if (notGranted.isNotEmpty()) requestPermissionLauncher.launch(notGranted.toTypedArray())
 
         webView = WebView(this)
-
         webView.settings.javaScriptEnabled = true
         webView.settings.domStorageEnabled = true
         webView.settings.allowFileAccess = true
@@ -60,68 +58,60 @@ class MainActivity : ComponentActivity() {
             }
         }
 
-        webView.addJavascriptInterface(
-            WifiDirectBridge(),
-            "AndroidWifiDirect"
-        )
-
+        webView.addJavascriptInterface(WifiDirectBridge(), "AndroidWifiDirect")
         setContentView(webView)
-
         webView.loadUrl("file:///android_asset/app.html")
-
         startWifiServer()
     }
 
     inner class WifiDirectBridge {
-
         @JavascriptInterface
         fun sendWifiMessage(message: String) {
-
-            sendMessage(
-                "192.168.49.1",
-                message
-            )
+            sendMessage("192.168.49.1", message)
         }
     }
 
     private fun startWifiServer() {
-
         thread {
-
             try {
-
                 val serverSocket = ServerSocket(8888)
-
                 while (true) {
-
                     val client = serverSocket.accept()
-
-                    val reader = BufferedReader(
-                        InputStreamReader(
-                            client.getInputStream()
-                        )
-                    )
-
+                    val reader = BufferedReader(InputStreamReader(client.getInputStream()))
                     val message = reader.readLine()
-
-                    Log.d(
-                        "MARSEL_WIFI",
-                        "Message reçu : $message"
-                    )
-
+                    Log.d("MARSEL_WIFI", "Message recu : $message")
                     runOnUiThread {
-
                         webView.evaluateJavascript(
                             "window.recevoirWifiMessage(${escapeJs(message)})",
                             null
                         )
                     }
-
                     reader.close()
                     client.close()
                 }
-
             } catch (e: Exception) {
+                Log.e("MARSEL_WIFI", "Erreur serveur : ${e.message}")
+            }
+        }
+    }
 
-                Log.e(
-                    "MARSEL_W
+    private fun sendMessage(host: String, message: String) {
+        thread {
+            try {
+                val socket = Socket(host, 8888)
+                val json = "{\"sourceUserId\":\"Marsel\",\"message\":\"$message\",\"status\":\"DIRECT_SENT\"}"
+                val writer = OutputStreamWriter(socket.getOutputStream())
+                writer.write(json + "\n")
+                writer.flush()
+                writer.close()
+                socket.close()
+            } catch (e: Exception) {
+                Log.e("MARSEL_WIFI", "Erreur client : ${e.message}")
+            }
+        }
+    }
+
+    private fun escapeJs(text: String): String {
+        return "\"" + text.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n") + "\""
+    }
+}
