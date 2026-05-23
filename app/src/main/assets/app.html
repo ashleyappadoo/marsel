@@ -1,119 +1,644 @@
 <!DOCTYPE html>
 <html lang="fr">
 <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-
-    <title>Marsel</title>
-
-    <link rel="stylesheet" href="style.css" />
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
+  <title>Marsel</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <link rel="stylesheet" href="style.css" />
 </head>
-
 <body>
 
-<!-- HEADER -->
-<header>
-    <h1>⚡ MARSEL</h1>
-    <p>Réseau de secours et relais d'urgence</p>
-</header>
+<!-- ===================== SCREEN 1: SPLASH ===================== -->
+<div id="screen-splash" class="screen active">
+  <div class="splash-bg">
+    <div class="splash-logo" id="splash-logo">
+      <div class="marsel-wordmark large">
+        <span class="mw-text">marsel</span>
+        <span class="mw-dot">
+          <svg width="22" height="22" viewBox="0 0 22 22">
+            <circle cx="11" cy="11" r="11" fill="#E84315"/>
+            <path d="M12.5 3.5L7.5 12h5l-2.5 6.5 8-9.5H13z" fill="white"/>
+          </svg>
+        </span>
+      </div>
+    </div>
+  </div>
+</div>
 
-<!-- MAIN -->
-<main>
+<!-- ===================== SCREEN 2: AUTH ===================== -->
+<div id="screen-auth" class="screen">
+  <!-- Orange header -->
+  <div class="auth-header">
+    <div class="auth-logo">
+      <div class="marsel-wordmark small">
+        <span class="mw-text">marsel</span>
+        <span class="mw-dot">
+          <svg width="14" height="14" viewBox="0 0 22 22">
+            <circle cx="11" cy="11" r="11" fill="#E84315"/>
+            <path d="M12.5 3.5L7.5 12h5l-2.5 6.5 8-9.5H13z" fill="white"/>
+          </svg>
+        </span>
+      </div>
+    </div>
+    <div class="auth-tabs">
+      <button class="auth-tab active" id="tab-signin" onclick="switchAuthTab('signin')">Sign in</button>
+      <button class="auth-tab" id="tab-signup" onclick="switchAuthTab('signup')">Sign up</button>
+    </div>
+  </div>
 
-    <!-- INFOS -->
-    <section class="card">
-        <h2>État du système</h2>
+  <!-- White body -->
+  <div class="auth-body">
+    <!-- Sign In Form -->
+    <div id="form-signin" class="auth-form active">
+      <div class="input-group">
+        <span class="input-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#9E9E9E" stroke-width="2">
+            <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/>
+            <polyline points="22,6 12,13 2,6"/>
+          </svg>
+        </span>
+        <input type="email" id="signin-email" placeholder="Email" class="auth-input" />
+      </div>
+      <div class="input-group">
+        <span class="input-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#9E9E9E" stroke-width="2">
+            <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+            <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+          </svg>
+        </span>
+        <input type="password" id="signin-password" placeholder="Mot de passe" class="auth-input" />
+        <span class="input-eye" onclick="togglePassword('signin-password', this)">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#9E9E9E" stroke-width="2">
+            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+            <circle cx="12" cy="12" r="3"/>
+          </svg>
+        </span>
+      </div>
+      <div class="auth-row">
+        <label class="checkbox-label">
+          <input type="checkbox" id="remember-me" />
+          <span>Remember me</span>
+        </label>
+        <a href="#" class="forgot-link" onclick="return false;">Forgot password?</a>
+      </div>
+      <button class="btn-primary full-width" onclick="doLogin()">Sign in</button>
+      <div class="auth-or"><span>OR</span></div>
+      <div class="social-row">
+        <button class="social-btn google" aria-label="Google">
+          <svg width="22" height="22" viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#fff"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#fff"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z" fill="#fff"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#fff"/></svg>
+        </button>
+        <button class="social-btn facebook" aria-label="Facebook">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="white"><path d="M18 2h-3a5 5 0 0 0-5 5v3H7v4h3v8h4v-8h3l1-4h-4V7a1 1 0 0 1 1-1h3z"/></svg>
+        </button>
+        <button class="social-btn apple" aria-label="Apple">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="white"><path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.8-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M13 3.5c.73-.83 1.94-1.46 2.94-1.5.13 1.17-.34 2.35-1.04 3.19-.69.85-1.83 1.51-2.95 1.42-.15-1.15.41-2.35 1.05-3.11z"/></svg>
+        </button>
+      </div>
+    </div>
 
-        <p id="userIdDisplay">
-            Chargement utilisateur...
-        </p>
+    <!-- Sign Up Form -->
+    <div id="form-signup" class="auth-form">
+      <div class="input-group">
+        <span class="input-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#9E9E9E" stroke-width="2">
+            <path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/>
+            <polyline points="22,6 12,13 2,6"/>
+          </svg>
+        </span>
+        <input type="email" id="signup-email" placeholder="Email" class="auth-input" />
+      </div>
+      <div class="input-group">
+        <span class="input-icon">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#9E9E9E" stroke-width="2">
+            <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
+            <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+          </svg>
+        </span>
+        <input type="password" id="signup-password" placeholder="Mot de passe" class="auth-input" />
+        <span class="input-eye" onclick="togglePassword('signup-password', this)">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#9E9E9E" stroke-width="2">
+            <path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/>
+            <circle cx="12" cy="12" r="3"/>
+          </svg>
+        </span>
+      </div>
+      <label class="checkbox-label" style="margin-top:4px;">
+        <input type="checkbox" id="agree-tnc" />
+        <span>I agree with the T&amp;C &amp; Privacy Policy</span>
+      </label>
+      <button class="btn-primary full-width" onclick="doRegister()">Sign up</button>
+      <div class="auth-or"><span>OR</span></div>
+      <div class="social-row">
+        <button class="social-btn google" aria-label="Google">
+          <svg width="22" height="22" viewBox="0 0 24 24"><path d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z" fill="#fff"/><path d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z" fill="#fff"/><path d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z" fill="#fff"/><path d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z" fill="#fff"/></svg>
+        </button>
+        <button class="social-btn facebook" aria-label="Facebook">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="white"><path d="M18 2h-3a5 5 0 0 0-5 5v3H7v4h3v8h4v-8h3l1-4h-4V7a1 1 0 0 1 1-1h3z"/></svg>
+        </button>
+        <button class="social-btn apple" aria-label="Apple">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="white"><path d="M18.71 19.5c-.83 1.24-1.71 2.45-3.05 2.47-1.34.03-1.77-.79-3.29-.79-1.53 0-2 .77-3.27.82-1.31.05-2.3-1.32-3.14-2.53C4.25 17 2.94 12.45 4.7 9.39c.87-1.52 2.43-2.48 4.12-2.51 1.28-.02 2.5.87 3.29.87.78 0 2.26-1.07 3.8-.91.65.03 2.47.26 3.64 1.98-.09.06-2.17 1.28-2.15 3.81.03 3.02 2.65 4.03 2.68 4.04-.03.07-.42 1.44-1.38 2.83M13 3.5c.73-.83 1.94-1.46 2.94-1.5.13 1.17-.34 2.35-1.04 3.19-.69.85-1.83 1.51-2.95 1.42-.15-1.15.41-2.35 1.05-3.11z"/></svg>
+        </button>
+      </div>
+    </div>
+  </div>
+</div>
 
-        <p id="networkStatus">
-            Vérification réseau...
-        </p>
-    </section>
+<!-- ===================== SCREEN 3: HOME ===================== -->
+<div id="screen-home" class="screen">
+  <!-- Settings button -->
+  <button class="home-settings-btn" onclick="showScreen('screen-profile-menu')" aria-label="Réglages">
+    <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#1A35C8" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="12" r="3"/>
+      <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+    </svg>
+  </button>
 
-    <!-- BOUTON URGENCE -->
-    <section class="urgence-container">
+  <!-- Map container -->
+  <div class="map-wrapper">
+    <div id="map" class="map-container">
+      <div class="map-placeholder">
+        <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="#9E9E9E" stroke-width="1.5">
+          <path d="M21 10c0 7-9 13-9 13s-9-6-9-13a9 9 0 0 1 18 0z"/>
+          <circle cx="12" cy="10" r="3"/>
+        </svg>
+        <p>Carte</p>
+      </div>
+    </div>
+    <div class="network-badge" id="network-badge">WiFi</div>
+  </div>
 
-        <button id="btnUrgence" class="btn-urgence">
+  <!-- Bottom panel -->
+  <div class="home-bottom">
+    <div class="emergency-label" id="emergency-label">Activation Marsel</div>
 
-            <!-- ÉCLAIR -->
-            <svg
-                    xmlns="http://www.w3.org/2000/svg"
-                    width="90"
-                    height="90"
-                    viewBox="0 0 24 24"
-                    fill="white"
-            >
-                <path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/>
+    <!-- Emergency button with progress ring -->
+    <div class="emergency-btn-wrapper">
+      <svg class="progress-ring" id="progress-ring" width="168" height="168" viewBox="0 0 168 168">
+        <circle class="progress-ring-bg" cx="84" cy="84" r="78" />
+        <circle class="progress-ring-fill" id="progress-ring-fill" cx="84" cy="84" r="78" />
+      </svg>
+      <div
+        class="emergency-btn"
+        id="emergency-btn"
+        onpointerdown="startEmergencyHold(event)"
+        onpointerup="cancelEmergencyHold(event)"
+        onpointercancel="cancelEmergencyHold(event)"
+        onpointerleave="cancelEmergencyHold(event)"
+      >
+        <!-- Normal state -->
+        <div class="emergency-btn-inner" id="emergency-btn-inner">
+          <div class="emergency-s-wrapper">
+            <span class="emergency-s">S</span>
+            <span class="emergency-bolt-dot">
+              <svg width="22" height="22" viewBox="0 0 22 22">
+                <circle cx="11" cy="11" r="11" fill="#E84315"/>
+                <path d="M12.5 3.5L7.5 12h5l-2.5 6.5 8-9.5H13z" fill="white"/>
+              </svg>
+            </span>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Chat icon (only in emergency mode) -->
+    <button class="chat-fab" id="chat-fab" onclick="showScreen('screen-messaging')" aria-label="Messagerie">
+      <svg width="28" height="28" viewBox="0 0 24 24" fill="white">
+        <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
+      </svg>
+    </button>
+  </div>
+</div>
+
+<!-- ===================== SCREEN 4: PROFILE MENU ===================== -->
+<div id="screen-profile-menu" class="screen">
+  <div class="screen-header-plain">
+    <button class="back-btn orange" onclick="goBack()" aria-label="Retour">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#E84315" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="9 14 4 9 9 4"/>
+        <path d="M20 20v-7a4 4 0 0 0-4-4H4"/>
+      </svg>
+    </button>
+  </div>
+
+  <!-- Profile top area -->
+  <div class="profile-top">
+    <div class="avatar-circle blue">
+      <svg width="52" height="52" viewBox="0 0 24 24" fill="#E84315">
+        <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+        <circle cx="12" cy="7" r="4"/>
+      </svg>
+    </div>
+    <div class="profile-info">
+      <div class="profile-pseudo" id="pm-pseudo">H</div>
+      <div class="profile-email" id="pm-email">user@email.com</div>
+    </div>
+    <button class="btn-outline-orange small" onclick="showScreen('screen-my-profile')">Edit Profile</button>
+    <div class="orange-divider"></div>
+  </div>
+
+  <!-- Menu cards -->
+  <div class="profile-menu-body">
+    <div class="menu-card" onclick="showScreen('screen-settings')">
+      <div class="menu-card-left">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#1A35C8" stroke-width="2">
+          <circle cx="12" cy="12" r="3"/>
+          <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>
+        </svg>
+        <span class="menu-card-title">Réglages</span>
+      </div>
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#E84315" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
+    </div>
+
+    <div class="menu-card" onclick="showScreen('screen-subscription')">
+      <div class="menu-card-left">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#1A35C8" stroke-width="2">
+          <rect x="1" y="4" width="22" height="16" rx="2" ry="2"/>
+          <line x1="1" y1="10" x2="23" y2="10"/>
+        </svg>
+        <span class="menu-card-title">Abonnement</span>
+      </div>
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#E84315" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
+    </div>
+  </div>
+
+  <!-- Logout button -->
+  <div class="profile-menu-footer">
+    <button class="btn-logout" onclick="doLogout()">
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round">
+        <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+        <polyline points="16 17 21 12 16 7"/>
+        <line x1="21" y1="12" x2="9" y2="12"/>
+      </svg>
+      Se Déconnecter
+    </button>
+  </div>
+</div>
+
+<!-- ===================== SCREEN 5: MY PROFILE ===================== -->
+<div id="screen-my-profile" class="screen">
+  <div class="screen-header">
+    <button class="back-btn orange" onclick="goBack()" aria-label="Retour">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#E84315" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="9 14 4 9 9 4"/>
+        <path d="M20 20v-7a4 4 0 0 0-4-4H4"/>
+      </svg>
+    </button>
+    <h2 class="screen-title blue">My profile</h2>
+    <div style="width:40px;"></div>
+  </div>
+
+  <div class="screen-body">
+    <!-- Avatar with edit button -->
+    <div class="avatar-edit-wrapper">
+      <div class="avatar-circle blue medium">
+        <svg width="44" height="44" viewBox="0 0 24 24" fill="#E84315">
+          <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+          <circle cx="12" cy="7" r="4"/>
+        </svg>
+      </div>
+      <button class="avatar-edit-btn" aria-label="Modifier avatar">
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2.5" stroke-linecap="round">
+          <path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/>
+          <path d="M18.5 2.5a2.121 2.121 0 0 1 3 3L12 15l-4 1 1-4 9.5-9.5z"/>
+        </svg>
+      </button>
+    </div>
+
+    <!-- Profile form fields -->
+    <div class="field-group">
+      <label class="field-label grey">Identifiant</label>
+      <input type="text" value="012345" readonly class="field-input readonly" />
+    </div>
+    <div class="field-group">
+      <label class="field-label blue">Pseudo</label>
+      <input type="text" id="profile-pseudo" class="field-input editable" placeholder="Pseudo" />
+    </div>
+    <div class="field-group">
+      <label class="field-label blue">Mobile</label>
+      <input type="tel" id="profile-mobile" class="field-input editable" placeholder="+33 6 00 00 00 00" />
+    </div>
+    <div class="field-group">
+      <label class="field-label dark">Email</label>
+      <input type="email" id="profile-email" class="field-input editable" placeholder="email@example.com" />
+    </div>
+
+    <button class="btn-primary full-width orange-btn" onclick="saveProfile()" style="margin-top:8px;">Enregistrer</button>
+  </div>
+</div>
+
+<!-- ===================== SCREEN 6: SETTINGS (RÉGLAGES) ===================== -->
+<div id="screen-settings" class="screen">
+  <div class="screen-header">
+    <button class="back-btn orange" onclick="goBack()" aria-label="Retour">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#E84315" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="9 14 4 9 9 4"/>
+        <path d="M20 20v-7a4 4 0 0 0-4-4H4"/>
+      </svg>
+    </button>
+    <h2 class="screen-title blue">Réglages</h2>
+    <div style="width:40px;"></div>
+  </div>
+
+  <div class="screen-body">
+    <!-- Section Localisation -->
+    <h3 class="section-heading blue">Localisation</h3>
+    <div class="settings-card">
+      <div class="settings-row">
+        <div class="settings-row-text">
+          <div class="settings-row-title">Activation de la localisation</div>
+          <div class="settings-row-subtitle">Partage avec vos proches</div>
+        </div>
+        <label class="toggle-switch">
+          <input type="checkbox" id="toggle-location" onchange="saveSetting('location', this.checked)" />
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+    </div>
+
+    <!-- Section Ajout d'un proche -->
+    <h3 class="section-heading blue" style="margin-top:24px;">Ajout d'un proche</h3>
+    <div class="menu-card" onclick="showScreen('screen-contacts')">
+      <div class="menu-card-left">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#1A35C8" stroke-width="2">
+          <path d="M16 11c1.66 0 2.99-1.34 2.99-3S17.66 5 16 5c-1.66 0-3 1.34-3 3s1.34 3 3 3zm-8 0c1.66 0 2.99-1.34 2.99-3S9.66 5 8 5C6.34 5 5 6.34 5 8s1.34 3 3 3zm0 2c-2.33 0-7 1.17-7 3.5V19h14v-2.5c0-2.33-4.67-3.5-7-3.5zm8 0c-.29 0-.62.02-.97.05 1.16.84 1.97 1.97 1.97 3.45V19h6v-2.5c0-2.33-4.67-3.5-7-3.5z"/>
+        </svg>
+        <span class="menu-card-title">Ajout d'un proche</span>
+      </div>
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#E84315" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
+    </div>
+
+    <!-- Section Activation Shield -->
+    <h3 class="section-heading blue" style="margin-top:24px;">Activation Shield</h3>
+    <div class="settings-card">
+      <div class="settings-row">
+        <div class="settings-row-left">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#1A35C8" stroke-width="2" stroke-linecap="round">
+            <path d="M9 21c0 .55.45 1 1 1h4c.55 0 1-.45 1-1v-1H9v1zm3-19a6 6 0 0 0-6 6c0 2.22 1.21 4.16 3 5.2V15c0 .55.45 1 1 1h4c.55 0 1-.45 1-1v-1.8c1.79-1.04 3-2.98 3-5.2a6 6 0 0 0-6-6z"/>
+          </svg>
+          <div class="settings-row-text">
+            <div class="settings-row-title">Activation flash LED</div>
+          </div>
+        </div>
+        <label class="toggle-switch">
+          <input type="checkbox" id="toggle-flash" onchange="saveSetting('flash', this.checked)" />
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+      <div class="settings-divider"></div>
+      <div class="settings-row">
+        <div class="settings-row-left">
+          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#1A35C8" stroke-width="2" stroke-linecap="round">
+            <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+            <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+            <line x1="12" y1="19" x2="12" y2="23"/>
+            <line x1="8" y1="23" x2="16" y2="23"/>
+          </svg>
+          <div class="settings-row-text">
+            <div class="settings-row-title">Activation enregistrement audio</div>
+          </div>
+        </div>
+        <label class="toggle-switch">
+          <input type="checkbox" id="toggle-audio" onchange="saveSetting('audio', this.checked)" />
+          <span class="toggle-slider"></span>
+        </label>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- ===================== SCREEN 7: CONTACTS ===================== -->
+<div id="screen-contacts" class="screen">
+  <div class="screen-header">
+    <button class="back-btn orange" onclick="goBack()" aria-label="Retour">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#E84315" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="9 14 4 9 9 4"/>
+        <path d="M20 20v-7a4 4 0 0 0-4-4H4"/>
+      </svg>
+    </button>
+    <h2 class="screen-title blue">Ajout d'un proche</h2>
+    <div style="width:40px;"></div>
+  </div>
+  <p class="screen-subtitle grey">Ajout de 5 personnes max.</p>
+
+  <div class="screen-body">
+    <div id="contacts-list">
+      <!-- Rendered by JS -->
+    </div>
+  </div>
+</div>
+
+<!-- ===================== SCREEN 8: CONTACT DETAIL ===================== -->
+<div id="screen-contact-detail" class="screen">
+  <div class="screen-header">
+    <button class="back-btn orange" onclick="goBack()" aria-label="Retour">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#E84315" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="9 14 4 9 9 4"/>
+        <path d="M20 20v-7a4 4 0 0 0-4-4H4"/>
+      </svg>
+    </button>
+    <h2 class="screen-title blue">Saisie du proche</h2>
+    <div style="width:40px;"></div>
+  </div>
+
+  <div class="screen-body">
+    <input type="hidden" id="contact-slot-index" value="0" />
+    <div class="field-group">
+      <label class="field-label blue">Nom</label>
+      <input type="text" id="contact-nom" class="field-input editable" placeholder="Nom du proche" />
+    </div>
+    <div class="field-group">
+      <label class="field-label blue">Mobile</label>
+      <input type="tel" id="contact-mobile" class="field-input editable" placeholder="+33 6 00 00 00 00" />
+    </div>
+    <div class="field-group">
+      <label class="field-label dark" style="font-weight:700;">Email</label>
+      <input type="email" id="contact-email" class="field-input editable" placeholder="email@example.com" />
+    </div>
+    <div class="field-group">
+      <label class="field-label grey">Pseudo</label>
+      <input type="text" id="contact-pseudo" class="field-input readonly" readonly placeholder="Auto-rempli" />
+    </div>
+    <button class="btn-primary full-width orange-btn" onclick="saveContact()" style="margin-top:8px;">Enregistrer</button>
+  </div>
+</div>
+
+<!-- ===================== SCREEN 9: SUBSCRIPTION ===================== -->
+<div id="screen-subscription" class="screen">
+  <div class="screen-header">
+    <button class="back-btn orange" onclick="goBack()" aria-label="Retour">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#E84315" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="9 14 4 9 9 4"/>
+        <path d="M20 20v-7a4 4 0 0 0-4-4H4"/>
+      </svg>
+    </button>
+    <h2 class="screen-title blue">Abonnement</h2>
+    <div style="width:40px;"></div>
+  </div>
+
+  <div class="screen-body" style="overflow-y:auto; padding-bottom: 120px;">
+    <!-- Plan cards (horizontal scroll) -->
+    <div class="plan-scroll-wrapper">
+      <div class="plan-cards" id="plan-cards">
+        <!-- Card 1: Autonomie -->
+        <div class="plan-card selected" data-plan="0" onclick="selectPlan(0)">
+          <div class="plan-icon blue-circle">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="#1A35C8">
+              <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+              <circle cx="12" cy="7" r="4"/>
             </svg>
+          </div>
+          <div class="plan-name">Autonomie</div>
+          <div class="plan-price">€0 <span class="plan-period">/ mois</span></div>
+        </div>
+        <!-- Card 2: Autonomie+ -->
+        <div class="plan-card orange-card" data-plan="1" onclick="selectPlan(1)">
+          <div class="plan-icon orange-circle">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="white">
+              <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
+              <line x1="12" y1="9" x2="12" y2="13"/>
+              <line x1="12" y1="17" x2="12.01" y2="17"/>
+            </svg>
+          </div>
+          <div class="plan-name white-text">Autonomie +</div>
+          <div class="plan-price white-text">€5 <span class="plan-period">/ mois</span></div>
+        </div>
+        <!-- Card 3: Assistance event -->
+        <div class="plan-card" data-plan="2" onclick="selectPlan(2)">
+          <div class="plan-icon grey-circle">
+            <svg width="28" height="28" viewBox="0 0 24 24" fill="#1A35C8">
+              <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
+              <circle cx="12" cy="7" r="4"/>
+            </svg>
+          </div>
+          <div class="plan-name">Assistance event</div>
+          <div class="plan-price">€15 <span class="plan-period">/ mois</span></div>
+        </div>
+      </div>
+    </div>
 
-        </button>
+    <!-- Dots -->
+    <div class="plan-dots">
+      <span class="plan-dot active" data-dot="0"></span>
+      <span class="plan-dot" data-dot="1"></span>
+      <span class="plan-dot" data-dot="2"></span>
+    </div>
 
-    </section>
+    <!-- Features table -->
+    <div class="features-section-header">Fonctionnalités</div>
+    <div class="features-table">
+      <div class="features-header-row">
+        <div class="features-label-col"></div>
+        <div class="features-plan-col blue-text">Auto</div>
+        <div class="features-plan-col blue-text">Auto+</div>
+        <div class="features-plan-col blue-text">Assist</div>
+      </div>
+      <div class="features-row">
+        <div class="features-label">Alerte d'urgence Marsel</div>
+        <div class="features-val check">✓</div>
+        <div class="features-val check">✓</div>
+        <div class="features-val check">✓</div>
+      </div>
+      <div class="features-row">
+        <div class="features-label">Notification aux proches</div>
+        <div class="features-val check">✓</div>
+        <div class="features-val check">✓</div>
+        <div class="features-val check">✓</div>
+      </div>
+      <div class="features-row">
+        <div class="features-label">Affichage Safe Places</div>
+        <div class="features-val check">✓</div>
+        <div class="features-val check">✓</div>
+        <div class="features-val check">✓</div>
+      </div>
+      <div class="features-row">
+        <div class="features-label">Marsel Auto Network <span class="info-badge">ⓘ</span></div>
+        <div class="features-val check">✓</div>
+        <div class="features-val check">✓</div>
+        <div class="features-val check">✓</div>
+      </div>
+      <div class="features-row">
+        <div class="features-label">Tracking Alerte d'urgence</div>
+        <div class="features-val dash">–</div>
+        <div class="features-val check">✓</div>
+        <div class="features-val check">✓</div>
+      </div>
+      <div class="features-row">
+        <div class="features-label">Notification aux alentours</div>
+        <div class="features-val dash">–</div>
+        <div class="features-val check">✓</div>
+        <div class="features-val check">✓</div>
+      </div>
+      <div class="features-row">
+        <div class="features-label">Chat proxy</div>
+        <div class="features-val dash">–</div>
+        <div class="features-val check">✓</div>
+        <div class="features-val check">✓</div>
+      </div>
+      <div class="features-row">
+        <div class="features-label">Localisation des proches</div>
+        <div class="features-val dash">–</div>
+        <div class="features-val check">✓</div>
+        <div class="features-val check">✓</div>
+      </div>
+      <div class="features-row">
+        <div class="features-label">Marsel Relay Network <span class="info-badge">ⓘ</span></div>
+        <div class="features-val dash">–</div>
+        <div class="features-val dash">–</div>
+        <div class="features-val check">✓</div>
+      </div>
+      <div class="features-row">
+        <div class="features-label">Assistance sécurité <span class="info-badge">ⓘ</span></div>
+        <div class="features-val dash">–</div>
+        <div class="features-val dash">–</div>
+        <div class="features-val check">✓</div>
+      </div>
+    </div>
 
-    <!-- TABLE VOISINS -->
-    <section class="card">
+    <p class="sub-legal-text">By joining, you agree to our privacy policy and term of service</p>
+    <button class="btn-primary full-width" style="margin-top:12px;">Commencez l'aventure</button>
+    <p class="sub-cancel-text">Cancel anytime</p>
+  </div>
+</div>
 
-        <h2>📡 Table des voisins</h2>
+<!-- ===================== SCREEN 10: MESSAGING ===================== -->
+<div id="screen-messaging" class="screen">
+  <div class="screen-header">
+    <button class="back-btn orange" onclick="goBack()" aria-label="Retour">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#E84315" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="9 14 4 9 9 4"/>
+        <path d="M20 20v-7a4 4 0 0 0-4-4H4"/>
+      </svg>
+    </button>
+    <h2 class="screen-title blue">Messagerie</h2>
+    <div style="width:40px;"></div>
+  </div>
 
-        <table class="table-voisins">
+  <div class="chat-area" id="chat-area">
+    <!-- Messages rendered by JS -->
+  </div>
 
-            <thead>
-            <tr>
-                <th>Source User</th>
-                <th>Relay Device</th>
-                <th>Réseau</th>
-                <th>Status</th>
-                <th>First Seen</th>
-                <th>Last Seen</th>
-            </tr>
-            </thead>
+  <div class="chat-input-bar">
+    <input
+      type="text"
+      id="chat-input"
+      class="chat-input"
+      placeholder="Écrire un message..."
+      onkeydown="if(event.key==='Enter') sendChatMessage()"
+    />
+    <button class="chat-send-btn" onclick="sendChatMessage()" aria-label="Envoyer">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="white">
+        <line x1="22" y1="2" x2="11" y2="13"/>
+        <polygon points="22 2 15 22 11 13 2 9 22 2"/>
+      </svg>
+    </button>
+  </div>
+</div>
 
-            <tbody id="tableVoisins">
-
-            <tr>
-                <td colspan="6">
-                    Aucun voisin détecté
-                </td>
-            </tr>
-
-            </tbody>
-
-        </table>
-
-    </section>
-    <section class="card">
-
-        <h2>💬 Messagerie Marsel</h2>
-
-        <input
-                type="text"
-                id="messageInput"
-                placeholder="Message..."
-        />
-
-        <button id="sendMessageBtn">
-            Envoyer
-        </button>
-
-        <div id="messages"></div>
-
-    </section>
-    <!-- LOGS -->
-    <section class="logs-container">
-
-        <h3> Logs système</h3>
-
-        <div id="logs"></div>
-
-    </section>
-
-</main>
-
-<!-- JS -->
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="script.js"></script>
-
 </body>
 </html>
