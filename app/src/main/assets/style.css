@@ -1259,3 +1259,90 @@ body {
    ========================================================= */
 
 .hidden { display: none !important; }
+
+/* =========================================================
+   MAP MARKERS & ANIMATIONS
+   ========================================================= */
+
+.user-location-marker {
+  width: 20px;
+  height: 20px;
+  border-radius: 50%;
+  background: #1A35C8;
+  border: 3px solid white;
+  box-shadow: 0 2px 8px rgba(26, 53, 200, 0.5);
+  position: relative;
+}
+
+.user-pulse {
+  position: absolute;
+  top: -6px;
+  left: -6px;
+  width: 32px;
+  height: 32px;
+  border-radius: 50%;
+  background: rgba(26, 53, 200, 0.2);
+  animation: pulse-user 2s infinite;
+}
+
+@keyframes pulse-user {
+  0%   { transform: scale(1); opacity: 0.6; }
+  100% { transform: scale(2.2); opacity: 0; }
+}
+
+@keyframes pulse-emergency {
+  0%, 100% { box-shadow: 0 2px 8px rgba(232, 67, 21, 0.6); }
+  50%       { box-shadow: 0 2px 20px rgba(232, 67, 21, 0.9); }
+}
+
+/* Chat timestamp */
+.chat-time {
+  font-size: 10px;
+  opacity: 0.65;
+  margin-top: 4px;
+  font-weight: 400;
+}
+
+/* =========================================================
+   MODE BAR
+   ========================================================= */
+
+.mode-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 16px;
+  background: white;
+  border-bottom: 1px solid #F0F0F0;
+  flex-shrink: 0;
+}
+
+.mode-toggle-btn {
+  background: var(--blue);
+  color: white;
+  border: none;
+  border-radius: 20px;
+  padding: 6px 18px;
+  font-family: 'Nunito', sans-serif;
+  font-weight: 700;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.2s;
+}
+
+.mode-toggle-btn.assistance {
+  background: var(--orange);
+}
+
+/* Override network badge when in mode-bar (not map overlay) */
+.mode-bar .network-badge {
+  position: static;
+  font-size: 12px;
+  font-family: 'Nunito', sans-serif;
+  font-weight: 700;
+  padding: 4px 10px;
+  border-radius: 12px;
+  background: #4CAF50;
+  color: white;
+  transition: background 0.3s;
+}

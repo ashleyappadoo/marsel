@@ -9,6 +9,80 @@
   <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&display=swap" rel="stylesheet" />
   <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
   <link rel="stylesheet" href="style.css" />
+  <style>
+    /* Mode bar */
+    .mode-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 16px;
+      background: white;
+      border-bottom: 1px solid #F0F0F0;
+      flex-shrink: 0;
+      z-index: 10;
+    }
+    .mode-toggle-btn {
+      background: #1A35C8;
+      color: white;
+      border: none;
+      border-radius: 20px;
+      padding: 6px 18px;
+      font-family: 'Nunito', sans-serif;
+      font-weight: 700;
+      font-size: 13px;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .mode-toggle-btn.assistance { background: #E84315; }
+    /* Map network badge overrides (now in mode-bar instead of map overlay) */
+    .map-wrapper .network-badge {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      font-size: 11px;
+      font-weight: 700;
+      font-family: 'Nunito', sans-serif;
+      color: white;
+      padding: 4px 10px;
+      border-radius: 12px;
+      z-index: 450;
+      transition: background 0.3s;
+    }
+    /* User GPS marker */
+    .user-location-marker {
+      width: 20px; height: 20px;
+      border-radius: 50%;
+      background: #1A35C8;
+      border: 3px solid white;
+      box-shadow: 0 2px 8px rgba(26,53,200,0.5);
+      position: relative;
+    }
+    .user-pulse {
+      position: absolute;
+      top: -6px; left: -6px;
+      width: 32px; height: 32px;
+      border-radius: 50%;
+      background: rgba(26,53,200,0.2);
+      animation: pulse-user 2s infinite;
+    }
+    @keyframes pulse-user {
+      0%   { transform: scale(1); opacity: 0.6; }
+      100% { transform: scale(2.2); opacity: 0; }
+    }
+    @keyframes pulse-emergency {
+      0%, 100% { box-shadow: 0 2px 8px rgba(232,67,21,0.6); }
+      50%       { box-shadow: 0 2px 20px rgba(232,67,21,0.9); }
+    }
+    /* Chat timestamp */
+    .chat-time {
+      font-size: 10px;
+      opacity: 0.65;
+      margin-top: 4px;
+      font-weight: 400;
+    }
+    /* Emergency label state text */
+    #emergency-label { text-align: center; font-size: 16px; }
+  </style>
 </head>
 <body>
 
@@ -149,6 +223,14 @@
 
 <!-- ===================== SCREEN 3: HOME ===================== -->
 <div id="screen-home" class="screen">
+  <!-- Mode bar (network badge + mode toggle) -->
+  <div class="mode-bar">
+    <span class="network-badge" id="network-badge" style="position:static;padding:4px 10px;font-size:12px;border-radius:12px;">WiFi</span>
+    <button class="mode-toggle-btn" id="mode-toggle-btn" onclick="toggleMode()">
+      <span id="mode-label">Autonome</span>
+    </button>
+  </div>
+
   <!-- Settings button -->
   <button class="home-settings-btn" onclick="showScreen('screen-profile-menu')" aria-label="Réglages">
     <svg width="26" height="26" viewBox="0 0 24 24" fill="none" stroke="#1A35C8" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
@@ -168,7 +250,6 @@
         <p>Carte</p>
       </div>
     </div>
-    <div class="network-badge" id="network-badge">WiFi</div>
   </div>
 
   <!-- Bottom panel -->
@@ -311,7 +392,7 @@
     <!-- Profile form fields -->
     <div class="field-group">
       <label class="field-label grey">Identifiant</label>
-      <input type="text" value="012345" readonly class="field-input readonly" />
+      <input type="text" id="profile-id" readonly class="field-input readonly" placeholder="—" />
     </div>
     <div class="field-group">
       <label class="field-label blue">Pseudo</label>
@@ -639,6 +720,7 @@
 </div>
 
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="config.js"></script>
 <script src="script.js"></script>
 </body>
 </html>
