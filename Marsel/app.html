@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+
+    <title>Marsel</title>
+
+    <link rel="stylesheet" href="style.css" />
+</head>
+
+<body>
+
+<!-- HEADER -->
+<header>
+    <h1>⚡ MARSEL</h1>
+    <p>Réseau de secours et relais d'urgence</p>
+</header>
+
+<!-- MAIN -->
+<main>
+
+    <!-- INFOS -->
+    <section class="card">
+        <h2>État du système</h2>
+
+        <p id="userIdDisplay">
+            Chargement utilisateur...
+        </p>
+
+        <div id="networkStatus">
+            Analyse réseau...
+        </div>
+    </section>
+
+    <!-- BOUTON URGENCE -->
+    <section class="urgence-container">
+
+        <button id="btnUrgence" class="btn-urgence">
+
+            <!-- ÉCLAIR -->
+            <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    width="90"
+                    height="90"
+                    viewBox="0 0 24 24"
+                    fill="white"
+            >
+                <path d="M13 2L3 14h7l-1 8 10-12h-7l1-8z"/>
+            </svg>
+
+        </button>
+
+    </section>
+
+    <!-- TABLE VOISINS -->
+    <section class="card">
+
+        <h2>📡 Table des voisins</h2>
+
+        <table class="table-voisins">
+
+            <thead>
+            <tr>
+                <th>Source User</th>
+                <th>Relay Device</th>
+                <th>Réseau</th>
+                <th>Status</th>
+                <th>First Seen</th>
+                <th>Last Seen</th>
+            </tr>
+            </thead>
+
+            <tbody id="tableVoisins">
+
+            <tr>
+                <td colspan="6">
+                    Aucun voisin détecté
+                </td>
+            </tr>
+
+            </tbody>
+
+        </table>
+
+    </section>
+    <section class="card">
+
+        <h2>💬 Messagerie Marsel</h2>
+
+        <input
+                type="text"
+                id="messageInput"
+                placeholder="Message..."
+        />
+
+        <button id="sendMessageBtn">
+            Envoyer
+        </button>
+
+        <div id="messages"></div>
+
+    </section>
+    <!-- LOGS -->
+    <section class="logs-container">
+
+        <h3> Logs système</h3>
+
+        <div id="logs"></div>
+
+    </section>
+
+</main>
+
+<!-- JS -->
+<script src="script.js"></script>
+
+</body>
+</html>
