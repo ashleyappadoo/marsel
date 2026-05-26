@@ -42,7 +42,11 @@ var MARSEL = {
     screenHistory: [],
 
     // IndexedDB handle
-    db: null
+    db: null,
+
+    // GPS tracking during emergency
+    trackingInterval: null,    // setInterval handle for continuous position broadcast
+    firstGpsFix: false         // true once real GPS replaces Paris default
 };
 
 /* Ring circumference for r=78 */
@@ -228,15 +232,21 @@ window.onLocationUpdate = function (lat, lng, accuracy) {
     var fLng = parseFloat(lng);
     if (!fLat || !fLng) return;
 
+    var wasDefault = !MARSEL.firstGpsFix;
     MARSEL.currentLat = fLat;
     MARSEL.currentLng = fLng;
 
     // Update user marker on map
     if (MARSEL.userMarker && MARSEL.leafletMap) {
         MARSEL.userMarker.setLatLng([fLat, fLng]);
+        // Premier vrai fix GPS : recentrer la carte sur la position réelle
+        if (wasDefault) {
+            MARSEL.firstGpsFix = true;
+            MARSEL.leafletMap.setView([fLat, fLng], 15);
+        }
     }
 
-    // If emergency is active, send updated position
+    // Si urgence active : mettre à jour la position locale et la diffuser
     if (MARSEL.emergencyActive && MARSEL.emergencyId) {
         var saved = null;
         try { saved = JSON.parse(localStorage.getItem('marsel_emergency') || 'null'); } catch (e) {}
@@ -245,6 +255,8 @@ window.onLocationUpdate = function (lat, lng, accuracy) {
             saved.lng = fLng;
             localStorage.setItem('marsel_emergency', JSON.stringify(saved));
         }
+        // Diffuser immédiatement la nouvelle position (le tracking interval s'en occupe toutes les 10s)
+        sendPositionUpdate(fLat, fLng);
     }
 };
 
@@ -492,7 +504,7 @@ function updateNetworkBadge(override) {
             label = '📱 Mobile';
             bgColor = '#4CAF50';
         } else {
-            label = '📡 Hors ligne';
+            label = '🔁 Marsel Relay Network';
             bgColor = '#FF5722';
         }
     }
@@ -652,10 +664,16 @@ function activateEmergency() {
     // Route it
     routeEmergency(emergencyData);
 
+    // Démarrer le tracking GPS continu (position toutes les 10s)
+    startEmergencyTracking(emergencyData);
+
     showToast('🚨 Alerte envoyée !');
 }
 
 function deactivateEmergency() {
+    // Stopper le tracking GPS continu
+    stopEmergencyTracking();
+
     MARSEL.emergencyActive = false;
 
     // Stop shield
@@ -665,6 +683,45 @@ function deactivateEmergency() {
         }
         if (typeof AndroidBridge.stopAudioRecord === 'function') {
             try { AndroidBridge.stopAudioRecord(); } catch (e) {}
+        }
+    }
+
+    // Envoyer notification de fin d'alerte aux proches et appareils voisins
+    var savedEmergency = null;
+    try { savedEmergency = JSON.parse(localStorage.getItem('marsel_emergency') || 'null'); } catch (e) {}
+
+    if (savedEmergency) {
+        var pseudo = savedEmergency.pseudo || 'Utilisateur';
+        var lastPos = 'https://maps.google.com/?q=' + MARSEL.currentLat + ',' + MARSEL.currentLng;
+        var finMsg = '✅ FIN D\'ALERTE MARSEL\n' + pseudo + ' est en sécurité.\nDernière position connue : ' + lastPos;
+
+        // SMS de fin aux proches si réseau disponible
+        if (MARSEL.networkType === 'WIFI' || MARSEL.networkType === 'MOBILE') {
+            var contacts = savedEmergency.contacts || [];
+            contacts.forEach(function (c) {
+                if (c.mobile && window.AndroidBridge && typeof AndroidBridge.sendEmergencySMS === 'function') {
+                    try { AndroidBridge.sendEmergencySMS(c.mobile, finMsg); } catch (e) {}
+                }
+            });
+        }
+
+        // Paquet de résolution vers les appareils voisins via relay
+        var resolvedPacket = {
+            type: 'MARSEL_EMERGENCY_RESOLVED',
+            version: 1,
+            messageId: MARSEL.emergencyId + '_resolved_' + Date.now(),
+            emergencyId: MARSEL.emergencyId,
+            userId: savedEmergency.userId,
+            pseudo: pseudo,
+            lat: MARSEL.currentLat,
+            lng: MARSEL.currentLng,
+            timestamp: Date.now(),
+            contacts: savedEmergency.contacts || [],
+            hopCount: 0,
+            maxHops: 5
+        };
+        if (window.AndroidBridge && typeof AndroidBridge.sendEmergencyViaRelay === 'function') {
+            try { AndroidBridge.sendEmergencyViaRelay(JSON.stringify(resolvedPacket)); } catch (e) {}
         }
     }
 
@@ -678,9 +735,7 @@ function deactivateEmergency() {
 
         // Remove from map
         if (MARSEL.incidentMarkers[MARSEL.emergencyId]) {
-            try {
-                MARSEL.leafletMap.removeLayer(MARSEL.incidentMarkers[MARSEL.emergencyId]);
-            } catch (e) {}
+            try { MARSEL.leafletMap.removeLayer(MARSEL.incidentMarkers[MARSEL.emergencyId]); } catch (e) {}
             delete MARSEL.incidentMarkers[MARSEL.emergencyId];
         }
     }
@@ -693,13 +748,11 @@ function deactivateEmergency() {
     if (fillEl) {
         fillEl.style.transition = 'stroke-dashoffset 0.3s ease';
         fillEl.style.strokeDashoffset = RING_CIRCUMFERENCE;
-        setTimeout(function () {
-            fillEl.style.transition = 'stroke-dashoffset 0.05s linear';
-        }, 300);
+        setTimeout(function () { fillEl.style.transition = 'stroke-dashoffset 0.05s linear'; }, 300);
     }
 
     updateEmergencyUI();
-    showToast('Alerte désactivée');
+    showToast('✅ Alerte désactivée – SMS de fin envoyé aux proches');
 }
 
 function updateEmergencyUI() {
@@ -808,7 +861,7 @@ function sendEmergencyViaInternet(emergencyData) {
 }
 
 function sendEmergencyViaRelayNetwork(emergencyData) {
-    showToast('Hors ligne – Marsel Relay Network activé…');
+    showToast('🔁 Marsel Relay Network activé…');
 
     // Store in relay queue DB
     dbPut('relay_queue', {
@@ -819,7 +872,7 @@ function sendEmergencyViaRelayNetwork(emergencyData) {
 
     MARSEL.relayQueue.push(emergencyData);
 
-    updateNetworkBadge('📡 WiFi Direct');
+    updateNetworkBadge('🔁 Marsel Relay Network');
 
     // Trigger Android WiFi Direct
     if (window.AndroidBridge && typeof AndroidBridge.sendEmergencyViaRelay === 'function') {
@@ -903,16 +956,18 @@ window.onPeersDiscovered = function (peers) {
     }
     MARSEL.p2pPeers = peers || [];
     var count = MARSEL.p2pPeers.length;
-    updateNetworkBadge('📡 WiFi Direct (' + count + ')');
+    updateNetworkBadge('🔁 Marsel Relay Network (' + count + ')');
     if (count > 0) {
-        showToast('Relais trouvé : ' + count + ' appareil(s)');
+        showToast('🔁 Marsel Relay Network : ' + count + ' appareil(s) détecté(s)');
+    } else {
+        showToast('🔍 Recherche d\'appareils Marsel…');
     }
 };
 
 /* Called by Android when P2P connection established */
 window.onP2PConnected = function (info) {
     MARSEL.p2pConnected = true;
-    updateNetworkBadge('📡 WiFi Direct');
+    updateNetworkBadge('🔁 Marsel Relay Network ✓');
 
     // Flush relay queue now that we have a peer
     MARSEL.relayQueue.forEach(function (emergencyData) {
@@ -926,14 +981,28 @@ window.onP2PConnected = function (info) {
 window.onRelayMessageReceived = function (jsonStr) {
     var data;
     try { data = JSON.parse(jsonStr); } catch (e) { return; }
-    if (!data || data.type !== 'MARSEL_EMERGENCY') return;
+    if (!data || !data.type) return;
+
+    // ── Mise à jour de position GPS (tracking continu) ──
+    if (data.type === 'MARSEL_POSITION_UPDATE') {
+        handlePositionUpdate(data);
+        return;
+    }
+
+    // ── Fin d'alerte ──
+    if (data.type === 'MARSEL_EMERGENCY_RESOLVED') {
+        handleEmergencyResolved(data);
+        return;
+    }
+
+    // ── Nouvelle alerte ──
+    if (data.type !== 'MARSEL_EMERGENCY') return;
 
     var msgId = data.messageId || data.id;
     if (!msgId) return;
     if (MARSEL.processedMessageIds[msgId]) return;
     MARSEL.processedMessageIds[msgId] = true;
 
-    // Persist
     var record = {
         id: msgId,
         userId: data.userId,
@@ -947,19 +1016,20 @@ window.onRelayMessageReceived = function (jsonStr) {
     };
     dbPut('emergency_events', record).catch(function () {});
 
-    // Show on map
+    // Afficher sur la carte + notification
     if (MARSEL.leafletMap) {
         addIncidentMarker(record);
         MARSEL.leafletMap.setView([data.lat, data.lng], 15);
     }
-
+    if (window.AndroidBridge && typeof AndroidBridge.showNotification === 'function') {
+        try { AndroidBridge.showNotification('🚨 Alerte Marsel', (data.pseudo || 'Utilisateur') + ' a déclenché une alerte à proximité'); } catch (e) {}
+    }
     showToast('🚨 Alerte reçue de ' + escapeHtml(data.pseudo || 'un utilisateur'));
 
-    // Forward if we haven't hit hop limit
+    // Relayer si hop limit pas atteint
     var maxHops = (window.MARSEL_CONFIG && MARSEL_CONFIG.RELAY_HOP_LIMIT) || 10;
     if ((data.hopCount || 0) < maxHops) {
         data.hopCount = (data.hopCount || 0) + 1;
-        // If internet available: forward via internet; else re-broadcast P2P
         if (MARSEL.networkType === 'WIFI' || MARSEL.networkType === 'MOBILE') {
             sendEmergencyViaInternet(data);
         } else if (window.AndroidBridge && typeof AndroidBridge.sendEmergencyViaRelay === 'function') {
@@ -967,6 +1037,135 @@ window.onRelayMessageReceived = function (jsonStr) {
         }
     }
 };
+
+/* ── Tracking GPS continu pendant l'urgence ── */
+
+function startEmergencyTracking(emergencyData) {
+    stopEmergencyTracking(); // reset si déjà actif
+    // Envoyer la position immédiatement, puis toutes les 10s
+    sendPositionUpdate(MARSEL.currentLat, MARSEL.currentLng);
+    MARSEL.trackingInterval = setInterval(function () {
+        if (!MARSEL.emergencyActive) { stopEmergencyTracking(); return; }
+        sendPositionUpdate(MARSEL.currentLat, MARSEL.currentLng);
+    }, 10000);
+}
+
+function stopEmergencyTracking() {
+    if (MARSEL.trackingInterval) {
+        clearInterval(MARSEL.trackingInterval);
+        MARSEL.trackingInterval = null;
+    }
+}
+
+function sendPositionUpdate(lat, lng) {
+    var savedEmergency = null;
+    try { savedEmergency = JSON.parse(localStorage.getItem('marsel_emergency') || 'null'); } catch (e) {}
+    if (!savedEmergency || !MARSEL.emergencyId) return;
+
+    var updatePacket = {
+        type: 'MARSEL_POSITION_UPDATE',
+        version: 1,
+        // messageId unique à chaque envoi pour éviter dedup sur position updates
+        messageId: MARSEL.emergencyId + '_pos_' + Date.now(),
+        emergencyId: MARSEL.emergencyId,
+        userId: savedEmergency.userId,
+        pseudo: savedEmergency.pseudo,
+        lat: lat,
+        lng: lng,
+        timestamp: Date.now(),
+        contacts: savedEmergency.contacts || [],
+        hopCount: 0,
+        maxHops: 10
+    };
+
+    // Mettre à jour DB locale
+    dbPut('emergency_events', Object.assign({}, savedEmergency, {
+        lat: lat, lng: lng, lastPositionUpdate: Date.now()
+    })).catch(function () {});
+
+    // Diffuser via Marsel Relay Network (WiFi Direct)
+    if (window.AndroidBridge && typeof AndroidBridge.sendEmergencyViaRelay === 'function') {
+        try { AndroidBridge.sendEmergencyViaRelay(JSON.stringify(updatePacket)); } catch (e) {}
+    }
+
+    // Si internet dispo : mettre à jour via API
+    if ((MARSEL.networkType === 'WIFI' || MARSEL.networkType === 'MOBILE')
+            && window.MARSEL_CONFIG && MARSEL_CONFIG.API_URL && MARSEL_CONFIG.API_KEY) {
+        fetch(MARSEL_CONFIG.API_URL + '/emergency/' + MARSEL.emergencyId + '/position', {
+            method: 'PUT',
+            headers: { 'Content-Type': 'application/json', 'Authorization': 'Bearer ' + MARSEL_CONFIG.API_KEY },
+            body: JSON.stringify({ lat: lat, lng: lng, timestamp: Date.now() })
+        }).catch(function () {});
+    }
+}
+
+/* Mise à jour de position d'un autre utilisateur reçue via relay */
+function handlePositionUpdate(data) {
+    if (!data.emergencyId || !data.lat || !data.lng) return;
+
+    var eId = data.emergencyId;
+    var timeStr = new Date(data.timestamp || Date.now()).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+
+    // Mettre à jour le marqueur existant
+    if (MARSEL.incidentMarkers[eId] && MARSEL.leafletMap) {
+        MARSEL.incidentMarkers[eId].setLatLng([data.lat, data.lng]);
+        MARSEL.incidentMarkers[eId].setPopupContent(
+            '<b>🚨 ' + escapeHtml(data.pseudo || 'Utilisateur') + '</b><br>' +
+            'Tracking actif – mis à jour ' + timeStr
+        );
+    } else if (MARSEL.mapInitialized && MARSEL.leafletMap) {
+        // Première réception pour cet emergency : créer le marqueur
+        addIncidentMarker({ id: eId, pseudo: data.pseudo, lat: data.lat, lng: data.lng, timestamp: data.timestamp });
+    }
+
+    // Sauvegarder la position mise à jour en DB
+    dbPut('emergency_events', {
+        id: eId,
+        pseudo: data.pseudo,
+        userId: data.userId,
+        lat: data.lat,
+        lng: data.lng,
+        timestamp: data.timestamp,
+        status: 'ACTIVE_TRACKING'
+    }).catch(function () {});
+
+    // Relayer la mise à jour aux autres pairs si nécessaire
+    if ((data.hopCount || 0) < (data.maxHops || 10)) {
+        data.hopCount = (data.hopCount || 0) + 1;
+        if (window.AndroidBridge && typeof AndroidBridge.sendEmergencyViaRelay === 'function') {
+            try { AndroidBridge.sendEmergencyViaRelay(JSON.stringify(data)); } catch (e) {}
+        }
+    }
+}
+
+/* Fin d'alerte reçue via relay d'un autre utilisateur */
+function handleEmergencyResolved(data) {
+    var eId = data.emergencyId;
+    if (!eId) return;
+
+    // Supprimer le marqueur de la carte
+    if (MARSEL.incidentMarkers[eId] && MARSEL.leafletMap) {
+        try { MARSEL.leafletMap.removeLayer(MARSEL.incidentMarkers[eId]); } catch (e) {}
+        delete MARSEL.incidentMarkers[eId];
+    }
+
+    // Mettre à jour la DB
+    dbPut('emergency_events', { id: eId, status: 'RESOLVED', resolvedAt: data.timestamp || Date.now() }).catch(function () {});
+
+    // Notification locale
+    if (window.AndroidBridge && typeof AndroidBridge.showNotification === 'function') {
+        try { AndroidBridge.showNotification('✅ Alerte Marsel résolue', (data.pseudo || 'Utilisateur') + ' est en sécurité'); } catch (e) {}
+    }
+    showToast('✅ ' + escapeHtml(data.pseudo || 'Utilisateur') + ' est en sécurité');
+
+    // Relayer la résolution aux autres pairs
+    if ((data.hopCount || 0) < (data.maxHops || 5)) {
+        data.hopCount = (data.hopCount || 0) + 1;
+        if (window.AndroidBridge && typeof AndroidBridge.sendEmergencyViaRelay === 'function') {
+            try { AndroidBridge.sendEmergencyViaRelay(JSON.stringify(data)); } catch (e) {}
+        }
+    }
+}
 
 /* Legacy WiFi message handler (port 8888 direct send) */
 window.recevoirWifiMessage = function (messageJson) {
