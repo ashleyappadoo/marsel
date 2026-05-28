@@ -130,6 +130,7 @@ class MainActivity : ComponentActivity() {
             permissions.add(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            permissions.add(Manifest.permission.NEARBY_WIFI_DEVICES)
             permissions.add(Manifest.permission.POST_NOTIFICATIONS)
         }
 
@@ -303,7 +304,7 @@ class MainActivity : ComponentActivity() {
                 val acc = location.accuracy
                 runOnUiThread {
                     webView.evaluateJavascript(
-                        "window.onLocationUpdate && window.onLocationUpdate({lat:$lastLat,lng:$lastLng,accuracy:$acc})",
+                        "window.onLocationUpdate && window.onLocationUpdate($lastLat,$lastLng,$acc)",
                         null
                     )
                 }
@@ -337,7 +338,7 @@ class MainActivity : ComponentActivity() {
                 val acc = location.accuracy
                 runOnUiThread {
                     webView.evaluateJavascript(
-                        "window.onLocationUpdate && window.onLocationUpdate({lat:${location.latitude},lng:${location.longitude},accuracy:$acc})",
+                        "window.onLocationUpdate && window.onLocationUpdate(${location.latitude},${location.longitude},$acc)",
                         null
                     )
                 }
@@ -382,6 +383,8 @@ class MainActivity : ComponentActivity() {
                     val state = intent.getIntExtra(WifiP2pManager.EXTRA_WIFI_STATE, -1)
                     wifiP2pEnabled = state == WifiP2pManager.WIFI_P2P_STATE_ENABLED
                     Log.d(TAG, "WiFi P2P state: ${if (wifiP2pEnabled) "ENABLED" else "DISABLED"}")
+                    // Auto-start discovery so we can receive alerts from nearby phones
+                    if (wifiP2pEnabled) startP2PDiscoveryInternal()
                 }
 
                 WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION -> {
@@ -518,8 +521,12 @@ class MainActivity : ComponentActivity() {
                 return
             }
 
-            val pseudo = extractJsonString(json, "pseudo") ?: "Utilisateur"
-            showNotificationDirect("Alerte Marsel", "$pseudo a declenche une alerte d'urgence")
+            // Only notify for actual emergency packets, not position updates or resolved packets
+            val msgType = extractJsonString(json, "type") ?: ""
+            if (msgType == "MARSEL_EMERGENCY") {
+                val pseudo = extractJsonString(json, "pseudo") ?: "Utilisateur"
+                showNotificationDirect("🚨 Alerte Marsel", "$pseudo a declenche une alerte d'urgence a proximite")
+            }
 
             val netType = getNetworkTypeDirect()
             if (netType == "WIFI" || netType == "MOBILE") {
@@ -577,6 +584,23 @@ class MainActivity : ComponentActivity() {
                 Log.e(TAG, "Connect to ${device.deviceName} failed: reason=$reason")
             }
         })
+    }
+
+    // =========================================================================
+    // P2P discovery (internal — safe to call from any thread/context)
+    // =========================================================================
+    private fun startP2PDiscoveryInternal() {
+        if (!wifiP2pEnabled) return
+        try {
+            wifiP2pManager.discoverPeers(wifiP2pChannel, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() { Log.d(TAG, "P2P discovery started") }
+                override fun onFailure(reason: Int) { Log.w(TAG, "P2P discovery failed: $reason") }
+            })
+        } catch (e: SecurityException) {
+            Log.e(TAG, "P2P discovery denied (missing NEARBY_WIFI_DEVICES?): ${e.message}")
+        } catch (e: Exception) {
+            Log.e(TAG, "P2P discovery error: ${e.message}")
+        }
     }
 
     // =========================================================================
@@ -937,18 +961,7 @@ class MainActivity : ComponentActivity() {
 
         @JavascriptInterface
         fun startP2PDiscovery() {
-            if (!wifiP2pEnabled) {
-                Log.w(TAG, "WiFi P2P not enabled, cannot start discovery")
-                return
-            }
-            wifiP2pManager.discoverPeers(wifiP2pChannel, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() {
-                    Log.d(TAG, "P2P peer discovery started")
-                }
-                override fun onFailure(reason: Int) {
-                    Log.e(TAG, "P2P peer discovery failed: reason=$reason")
-                }
-            })
+            startP2PDiscoveryInternal()
         }
 
         @JavascriptInterface
