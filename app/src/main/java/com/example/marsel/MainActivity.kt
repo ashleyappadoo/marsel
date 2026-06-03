@@ -400,8 +400,8 @@ class MainActivity : ComponentActivity() {
                                 null
                             )
                         }
-                        // Auto-connect to first peer if we have relay messages pending
-                        if (pendingRelayMessages.isNotEmpty() && peers.deviceList.isNotEmpty()) {
+                        // Auto-connect to any discovered peer (to send OR receive relay messages)
+                        if (peers.deviceList.isNotEmpty() && groupOwnerAddress == null) {
                             connectToPeer(peers.deviceList.first())
                         }
                     }
@@ -422,18 +422,26 @@ class MainActivity : ComponentActivity() {
 
                             Log.d(TAG, "P2P connected. GO=$isGroupOwner, GOAddr=$address")
 
-                            // Clients send pending relay messages to the GO
                             if (!isGroupOwner) {
-                                val snapshot = pendingRelayMessages.toList()
-                                pendingRelayMessages.clear()
-                                snapshot.forEach { msg ->
-                                    sendRelayToPeer(address, msg)
+                                // Client: send pending messages to GO AND pull any from GO
+                                val snapshot = synchronized(pendingRelayMessages) {
+                                    val s = pendingRelayMessages.toList()
+                                    pendingRelayMessages.clear()
+                                    s
+                                }
+                                if (snapshot.isNotEmpty()) {
+                                    snapshot.forEach { msg -> sendRelayToPeer(address, msg) }
+                                } else {
+                                    // No messages to send — pull any emergency alerts from GO
+                                    sendRelayToPeer(address, "")
                                 }
                             }
+                            // If GO: pending messages will be pushed to clients when they connect
 
+                            val safeAddr = address.replace("'", "")
                             runOnUiThread {
                                 webView.evaluateJavascript(
-                                    "window.onP2PConnected && window.onP2PConnected({isOwner:$isGroupOwner,address:'$address'})",
+                                    "window.onP2PConnected && window.onP2PConnected({isOwner:$isGroupOwner,address:'$safeAddr'})",
                                     null
                                 )
                             }
@@ -466,12 +474,21 @@ class MainActivity : ComponentActivity() {
                     thread {
                         try {
                             val reader = BufferedReader(InputStreamReader(client.getInputStream()))
+                            val writer = OutputStreamWriter(client.getOutputStream())
+
+                            // Read incoming message (blank = pull-only from client)
                             val line = reader.readLine()
-                            if (line != null) processRelayMessage(line)
-                            reader.close()
-                            client.close()
+                            if (!line.isNullOrBlank()) processRelayMessage(line)
+
+                            // Push any pending relay messages back to the connecting peer
+                            // This handles the case where WE are the GO with an emergency
+                            val pending = synchronized(pendingRelayMessages) { pendingRelayMessages.toList() }
+                            pending.forEach { msg -> writer.write(msg + "\n") }
+                            writer.flush()
                         } catch (e: Exception) {
                             Log.e("MARSEL_RELAY", "Client handler error: ${e.message}")
+                        } finally {
+                            try { client.close() } catch (ex: Exception) { Log.v(TAG, "close: ${ex.message}") }
                         }
                     }
                 }
@@ -498,17 +515,17 @@ class MainActivity : ComponentActivity() {
                     return
                 }
                 processedMessageIds.add(messageId)
-                // Prevent unbounded growth
+                // Prevent unbounded growth — trim oldest 100 entries when over 1000
                 if (processedMessageIds.size > 1000) {
-                    processedMessageIds.iterator().let { it.next(); it.remove() }
+                    val it = processedMessageIds.iterator()
+                    repeat(100) { if (it.hasNext()) { it.next(); it.remove() } }
                 }
             }
 
-            // Notify JS to display on map
-            val safeJson = json.replace("'", "\\'")
+            // Notify JS to display on map (use escapeJs for safe double-quoted string)
             runOnUiThread {
                 webView.evaluateJavascript(
-                    "window.onRelayMessageReceived && window.onRelayMessageReceived('$safeJson')",
+                    "window.onRelayMessageReceived && window.onRelayMessageReceived(${escapeJs(json)})",
                     null
                 )
             }
@@ -530,14 +547,16 @@ class MainActivity : ComponentActivity() {
 
             val netType = getNetworkTypeDirect()
             if (netType == "WIFI" || netType == "MOBILE") {
-                // Forward to contacts via SMS
-                forwardEmergencyToContacts(json)
+                // Only forward to contacts via SMS for actual emergency alerts
+                // (not for position updates or resolved messages — that would spam contacts)
+                if (msgType == "MARSEL_EMERGENCY") {
+                    forwardEmergencyToContacts(json)
+                }
             } else {
                 // No internet — increment hop and relay further
-                val updatedJson = json.replace(
-                    "\"hopCount\":$hopCount",
-                    "\"hopCount\":${hopCount + 1}"
-                )
+                // Use a pattern that tolerates spaces around the colon (robustness)
+                val updatedJson = """"hopCount"\s*:\s*$hopCount""".toRegex()
+                    .replace(json, "\"hopCount\":${hopCount + 1}")
                 synchronized(pendingRelayMessages) {
                     pendingRelayMessages.add(updatedJson)
                 }
@@ -556,17 +575,30 @@ class MainActivity : ComponentActivity() {
     // =========================================================================
     private fun sendRelayToPeer(address: String, messageJson: String) {
         thread {
+            var socket: Socket? = null
             try {
-                val socket = Socket(address, 8890)
-                socket.soTimeout = 5000
+                socket = Socket()
+                // Explicit connect timeout prevents indefinite thread block on unreachable hosts
+                socket.connect(java.net.InetSocketAddress(address, 8890), 4000)
+                socket.soTimeout = 10_000
                 val writer = OutputStreamWriter(socket.getOutputStream())
+                val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+
+                // Send our message (empty string = pull-only)
                 writer.write(messageJson + "\n")
                 writer.flush()
-                writer.close()
-                socket.close()
-                Log.d("MARSEL_RELAY", "Relayed to $address")
+
+                // Read any relay messages the peer (GO) sends back
+                var line = reader.readLine()
+                while (line != null) {
+                    if (line.isNotBlank()) processRelayMessage(line)
+                    line = reader.readLine()
+                }
+                Log.d("MARSEL_RELAY", "Relay exchange with $address complete")
             } catch (e: Exception) {
                 Log.e("MARSEL_RELAY", "Relay to $address failed: ${e.message}")
+            } finally {
+                try { socket?.close() } catch (ex: Exception) { Log.v(TAG, "close: ${ex.message}") }
             }
         }
     }
@@ -575,7 +607,10 @@ class MainActivity : ComponentActivity() {
     // Connect to a WiFi P2P peer
     // =========================================================================
     private fun connectToPeer(device: WifiP2pDevice) {
-        val config = WifiP2pConfig().apply { deviceAddress = device.deviceAddress }
+        val config = WifiP2pConfig().apply {
+            deviceAddress = device.deviceAddress
+            groupOwnerIntent = 0  // prefer client role so we reliably send to GO's relay server
+        }
         wifiP2pManager.connect(wifiP2pChannel, config, object : WifiP2pManager.ActionListener {
             override fun onSuccess() {
                 Log.d(TAG, "Connecting to ${device.deviceName}")
@@ -692,6 +727,10 @@ class MainActivity : ComponentActivity() {
             } else {
                 @Suppress("DEPRECATION")
                 SmsManager.getDefault()
+            }
+            if (smsManager == null) {
+                Log.e("MARSEL_SMS", "SmsManager not available on this device")
+                return
             }
             val parts = smsManager.divideMessage(message)
             if (parts.size == 1) {
@@ -923,6 +962,13 @@ class MainActivity : ComponentActivity() {
             thread {
                 sendSMSDirect(phoneNumber, message)
             }
+        }
+
+        @JavascriptInterface
+        fun hasSMSPermission(): Boolean {
+            return ContextCompat.checkSelfPermission(
+                this@MainActivity, Manifest.permission.SEND_SMS
+            ) == PackageManager.PERMISSION_GRANTED
         }
 
         // -----------------------------------------------------------------------

@@ -827,14 +827,35 @@ function routeEmergency(emergencyData) {
 
 function sendEmergencyViaInternet(emergencyData) {
     var contacts = emergencyData.contacts || [];
+    var contactsWithMobile = contacts.filter(function (c) { return c.mobile; });
+
+    // Warn user if no contacts have phone numbers
+    if (contactsWithMobile.length === 0) {
+        showToast('⚠️ Aucun contact avec numéro – ajoutez des contacts pour les SMS');
+    }
+
+    // Check SMS permission
+    if (window.AndroidBridge && typeof AndroidBridge.hasSMSPermission === 'function') {
+        try {
+            if (!AndroidBridge.hasSMSPermission()) {
+                showToast('⚠️ Permission SMS non accordée – activez-la dans les paramètres');
+            }
+        } catch (e) {}
+    }
 
     // Send SMS via Android SmsManager
     contacts.forEach(function (contact) {
         if (!contact.mobile) return;
 
-        var lat = parseFloat(emergencyData.lat).toFixed(6);
-        var lng = parseFloat(emergencyData.lng).toFixed(6);
-        var mapsLink = 'https://maps.google.com/?q=' + lat + ',' + lng;
+        // Validate coordinates before building SMS link
+        var lat = parseFloat(emergencyData.lat);
+        var lng = parseFloat(emergencyData.lng);
+        var mapsLink;
+        if (isNaN(lat) || isNaN(lng)) {
+            mapsLink = 'Position non disponible';
+        } else {
+            mapsLink = 'https://maps.google.com/?q=' + lat.toFixed(6) + ',' + lng.toFixed(6);
+        }
         var msg = '🚨 ALERTE MARSEL\n' +
             (emergencyData.pseudo || 'Un utilisateur') + ' a déclenché une alerte.\n' +
             'Position : ' + mapsLink + '\n' +
@@ -1058,6 +1079,10 @@ function stopEmergencyTracking() {
 }
 
 function sendPositionUpdate(lat, lng) {
+    var fLat = parseFloat(lat);
+    var fLng = parseFloat(lng);
+    if (isNaN(fLat) || isNaN(fLng)) return; // skip if GPS not yet fixed
+
     var savedEmergency = null;
     try { savedEmergency = JSON.parse(localStorage.getItem('marsel_emergency') || 'null'); } catch (e) {}
     if (!savedEmergency || !MARSEL.emergencyId) return;
@@ -1065,13 +1090,12 @@ function sendPositionUpdate(lat, lng) {
     var updatePacket = {
         type: 'MARSEL_POSITION_UPDATE',
         version: 1,
-        // messageId unique à chaque envoi pour éviter dedup sur position updates
         messageId: MARSEL.emergencyId + '_pos_' + Date.now(),
         emergencyId: MARSEL.emergencyId,
         userId: savedEmergency.userId,
         pseudo: savedEmergency.pseudo,
-        lat: lat,
-        lng: lng,
+        lat: fLat,
+        lng: fLng,
         timestamp: Date.now(),
         contacts: savedEmergency.contacts || [],
         hopCount: 0,
@@ -1080,7 +1104,7 @@ function sendPositionUpdate(lat, lng) {
 
     // Mettre à jour DB locale
     dbPut('emergency_events', Object.assign({}, savedEmergency, {
-        lat: lat, lng: lng, lastPositionUpdate: Date.now()
+        lat: fLat, lng: fLng, lastPositionUpdate: Date.now()
     })).catch(function () {});
 
     // Diffuser via Marsel Relay Network (WiFi Direct)
