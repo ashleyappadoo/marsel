@@ -517,8 +517,8 @@ class MainActivity : ComponentActivity() {
                 processedMessageIds.add(messageId)
                 // Prevent unbounded growth — trim oldest 100 entries when over 1000
                 if (processedMessageIds.size > 1000) {
-                    val it = processedMessageIds.iterator()
-                    repeat(100) { if (it.hasNext()) { it.next(); it.remove() } }
+                    val iter = processedMessageIds.iterator()
+                    repeat(100) { if (iter.hasNext()) { iter.next(); iter.remove() } }
                 }
             }
 
