@@ -265,9 +265,12 @@ window.onLocationUpdate = function (lat, lng, accuracy) {
    --------------------------------------------------------- */
 function initMap() {
     if (MARSEL.mapInitialized) {
-        // Already initialized – just refresh size in case screen re-showed
         if (MARSEL.leafletMap) {
-            setTimeout(function () { MARSEL.leafletMap.invalidateSize(); }, 200);
+            setTimeout(function () {
+                MARSEL.leafletMap.invalidateSize();
+                // Recharge les incidents reçus pendant qu'on était sur un autre écran
+                loadIncidentsOnMap();
+            }, 200);
         }
         return;
     }
@@ -1037,15 +1040,27 @@ window.onRelayMessageReceived = function (jsonStr) {
     };
     dbPut('emergency_events', record).catch(function () {});
 
-    // Afficher sur la carte + notification
-    if (MARSEL.leafletMap) {
-        addIncidentMarker(record);
-        MARSEL.leafletMap.setView([data.lat, data.lng], 15);
-    }
+    // Notification système (fonctionne même si l'app est en arrière-plan)
     if (window.AndroidBridge && typeof AndroidBridge.showNotification === 'function') {
         try { AndroidBridge.showNotification('🚨 Alerte Marsel', (data.pseudo || 'Utilisateur') + ' a déclenché une alerte à proximité'); } catch (e) {}
     }
     showToast('🚨 Alerte reçue de ' + escapeHtml(data.pseudo || 'un utilisateur'));
+
+    // Afficher sur la carte — naviguer vers home si nécessaire
+    var validCoords = data.lat && data.lng && !isNaN(parseFloat(data.lat)) && !isNaN(parseFloat(data.lng));
+    if (!MARSEL.mapInitialized) {
+        // Map pas encore initialisée : aller sur home pour l'initialiser
+        showScreen('screen-home');
+        setTimeout(function () {
+            if (MARSEL.leafletMap && validCoords) {
+                addIncidentMarker(record);
+                MARSEL.leafletMap.setView([parseFloat(data.lat), parseFloat(data.lng)], 15);
+            }
+        }, 700);
+    } else if (MARSEL.leafletMap && validCoords) {
+        addIncidentMarker(record);
+        MARSEL.leafletMap.setView([parseFloat(data.lat), parseFloat(data.lng)], 15);
+    }
 
     // Relayer si hop limit pas atteint
     var maxHops = (window.MARSEL_CONFIG && MARSEL_CONFIG.RELAY_HOP_LIMIT) || 10;
@@ -1125,21 +1140,24 @@ function sendPositionUpdate(lat, lng) {
 
 /* Mise à jour de position d'un autre utilisateur reçue via relay */
 function handlePositionUpdate(data) {
-    if (!data.emergencyId || !data.lat || !data.lng) return;
+    if (!data.emergencyId) return;
+    var fLat = parseFloat(data.lat);
+    var fLng = parseFloat(data.lng);
+    if (isNaN(fLat) || isNaN(fLng)) return;
 
     var eId = data.emergencyId;
     var timeStr = new Date(data.timestamp || Date.now()).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
 
     // Mettre à jour le marqueur existant
     if (MARSEL.incidentMarkers[eId] && MARSEL.leafletMap) {
-        MARSEL.incidentMarkers[eId].setLatLng([data.lat, data.lng]);
+        MARSEL.incidentMarkers[eId].setLatLng([fLat, fLng]);
         MARSEL.incidentMarkers[eId].setPopupContent(
             '<b>🚨 ' + escapeHtml(data.pseudo || 'Utilisateur') + '</b><br>' +
             'Tracking actif – mis à jour ' + timeStr
         );
-    } else if (MARSEL.mapInitialized && MARSEL.leafletMap) {
+    } else if (MARSEL.leafletMap) {
         // Première réception pour cet emergency : créer le marqueur
-        addIncidentMarker({ id: eId, pseudo: data.pseudo, lat: data.lat, lng: data.lng, timestamp: data.timestamp });
+        addIncidentMarker({ id: eId, pseudo: data.pseudo, lat: fLat, lng: fLng, timestamp: data.timestamp });
     }
 
     // Sauvegarder la position mise à jour en DB
@@ -1147,8 +1165,8 @@ function handlePositionUpdate(data) {
         id: eId,
         pseudo: data.pseudo,
         userId: data.userId,
-        lat: data.lat,
-        lng: data.lng,
+        lat: fLat,
+        lng: fLng,
         timestamp: data.timestamp,
         status: 'ACTIVE_TRACKING'
     }).catch(function () {});
