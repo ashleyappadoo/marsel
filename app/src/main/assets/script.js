@@ -698,15 +698,13 @@ function deactivateEmergency() {
         var lastPos = 'https://maps.google.com/?q=' + MARSEL.currentLat + ',' + MARSEL.currentLng;
         var finMsg = '✅ FIN D\'ALERTE MARSEL\n' + pseudo + ' est en sécurité.\nDernière position connue : ' + lastPos;
 
-        // SMS de fin aux proches si réseau disponible
-        if (MARSEL.networkType === 'WIFI' || MARSEL.networkType === 'MOBILE') {
-            var contacts = savedEmergency.contacts || [];
-            contacts.forEach(function (c) {
-                if (c.mobile && window.AndroidBridge && typeof AndroidBridge.sendEmergencySMS === 'function') {
-                    try { AndroidBridge.sendEmergencySMS(c.mobile, finMsg); } catch (e) {}
-                }
-            });
-        }
+        // SMS de fin aux proches — SmsManager utilise le réseau cellulaire (pas internet)
+        var contacts = savedEmergency.contacts || [];
+        contacts.forEach(function (c) {
+            if (c.mobile && window.AndroidBridge && typeof AndroidBridge.sendEmergencySMS === 'function') {
+                try { AndroidBridge.sendEmergencySMS(c.mobile, finMsg); } catch (e) {}
+            }
+        });
 
         // Paquet de résolution vers les appareils voisins via relay
         var resolvedPacket = {
@@ -821,11 +819,14 @@ function updateEmergencyUI() {
 function routeEmergency(emergencyData) {
     updateNetworkStatus();
 
-    if (MARSEL.networkType === 'WIFI' || MARSEL.networkType === 'MOBILE') {
-        sendEmergencyViaInternet(emergencyData);
-    } else {
-        sendEmergencyViaRelayNetwork(emergencyData);
-    }
+    // Always relay via WiFi Direct so nearby Marsel phones get a notification + map marker.
+    // Relay works independently of internet: it uses WiFi P2P (no data connection needed).
+    sendEmergencyViaRelayNetwork(emergencyData);
+
+    // Always attempt SMS to contacts: SmsManager uses the cellular baseband (2G/3G/4G
+    // signalling), it does NOT require a mobile-data or WiFi internet connection.
+    // Also calls the cloud API if API_URL is configured and we are online.
+    sendEmergencyViaInternet(emergencyData);
 }
 
 function sendEmergencyViaInternet(emergencyData) {
@@ -885,7 +886,10 @@ function sendEmergencyViaInternet(emergencyData) {
 }
 
 function sendEmergencyViaRelayNetwork(emergencyData) {
-    showToast('🔁 Marsel Relay Network activé…');
+    if (!MARSEL.p2pConnected && typeof AndroidBridge !== 'undefined') {
+        // Give feedback: relay needs WiFi radio on even without internet
+        showToast('🔁 Recherche téléphones Marsel voisins…');
+    }
 
     // Store in relay queue DB
     dbPut('relay_queue', {
@@ -1062,13 +1066,14 @@ window.onRelayMessageReceived = function (jsonStr) {
         MARSEL.leafletMap.setView([parseFloat(data.lat), parseFloat(data.lng)], 15);
     }
 
-    // Relayer si hop limit pas atteint
+    // Relay further to phones out of direct range (hop forwarding).
+    // Never re-send via internet here: the sender's phone already sent SMS to contacts,
+    // and the Kotlin layer (forwardEmergencyToContacts) already handles any SMS forwarding
+    // needed from this device. Sending via internet here would double-SMS the contacts.
     var maxHops = (window.MARSEL_CONFIG && MARSEL_CONFIG.RELAY_HOP_LIMIT) || 10;
     if ((data.hopCount || 0) < maxHops) {
         data.hopCount = (data.hopCount || 0) + 1;
-        if (MARSEL.networkType === 'WIFI' || MARSEL.networkType === 'MOBILE') {
-            sendEmergencyViaInternet(data);
-        } else if (window.AndroidBridge && typeof AndroidBridge.sendEmergencyViaRelay === 'function') {
+        if (window.AndroidBridge && typeof AndroidBridge.sendEmergencyViaRelay === 'function') {
             try { AndroidBridge.sendEmergencyViaRelay(JSON.stringify(data)); } catch (e) {}
         }
     }
