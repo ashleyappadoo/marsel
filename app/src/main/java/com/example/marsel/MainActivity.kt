@@ -21,8 +21,12 @@ import android.net.Uri
 import android.net.wifi.p2p.WifiP2pConfig
 import android.net.wifi.p2p.WifiP2pDevice
 import android.net.wifi.p2p.WifiP2pManager
+import android.net.wifi.p2p.nsd.WifiP2pDnsSdServiceInfo
+import android.net.wifi.p2p.nsd.WifiP2pDnsSdServiceRequest
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.os.VibrationEffect
 import android.os.Vibrator
 import android.os.VibratorManager
@@ -67,6 +71,16 @@ class MainActivity : ComponentActivity() {
     private val pendingRelayMessages = mutableListOf<String>()
     private val processedMessageIds = mutableSetOf<String>()
     private var wifiP2pEnabled = false
+
+    // DNS-SD connection-less relay: periodic re-arm of service discovery
+    // (Android stops discoverServices after a while — it must be re-issued)
+    private val p2pHandler = Handler(Looper.getMainLooper())
+    private val rediscoverRunnable = object : Runnable {
+        override fun run() {
+            restartServiceDiscovery()
+            p2pHandler.postDelayed(this, 20_000)
+        }
+    }
 
     // -------------------------------------------------------------------------
     // Location fields
@@ -144,6 +158,12 @@ class MainActivity : ComponentActivity() {
         wifiP2pChannel = wifiP2pManager.initialize(this, mainLooper, null)
         wifiP2pReceiver = WifiP2pBroadcastReceiver()
 
+        // DNS-SD listeners must be attached once before any discoverServices call.
+        // This is the primary relay transport: TXT records are received from nearby
+        // phones without connection, pairing, or any user dialog.
+        setupDnsSdListeners()
+        p2pHandler.postDelayed(rediscoverRunnable, 3_000)
+
         // --- Location manager ---
         locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
         initLocationManager()
@@ -212,6 +232,7 @@ class MainActivity : ComponentActivity() {
         }
         registerReceiver(wifiP2pReceiver, intentFilter)
         startLocationUpdatesInternal()
+        restartServiceDiscovery()
     }
 
     override fun onPause() {
@@ -226,6 +247,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        p2pHandler.removeCallbacksAndMessages(null)
         stopLocationUpdatesInternal()
         try {
             val cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
@@ -384,7 +406,17 @@ class MainActivity : ComponentActivity() {
                     wifiP2pEnabled = state == WifiP2pManager.WIFI_P2P_STATE_ENABLED
                     Log.d(TAG, "WiFi P2P state: ${if (wifiP2pEnabled) "ENABLED" else "DISABLED"}")
                     // Auto-start discovery so we can receive alerts from nearby phones
-                    if (wifiP2pEnabled) startP2PDiscoveryInternal()
+                    if (wifiP2pEnabled) {
+                        startP2PDiscoveryInternal()
+                        restartServiceDiscovery()
+                    }
+                    // Tell JS so the UI can warn the user (WiFi off = relay impossible)
+                    runOnUiThread {
+                        webView.evaluateJavascript(
+                            "window.onP2PStateChanged && window.onP2PStateChanged($wifiP2pEnabled)",
+                            null
+                        )
+                    }
                 }
 
                 WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION -> {
@@ -400,8 +432,11 @@ class MainActivity : ComponentActivity() {
                                 null
                             )
                         }
-                        // Auto-connect to any discovered peer (to send OR receive relay messages)
-                        if (peers.deviceList.isNotEmpty() && groupOwnerAddress == null) {
+                        // connect() pops an invitation dialog on the other phone, so it is
+                        // only a secondary transport: attempt it solely when we actually
+                        // have a message to deliver. Alerts travel via DNS-SD regardless.
+                        val hasPending = synchronized(pendingRelayMessages) { pendingRelayMessages.isNotEmpty() }
+                        if (hasPending && peers.deviceList.isNotEmpty() && groupOwnerAddress == null) {
                             connectToPeer(peers.deviceList.first())
                         }
                     }
@@ -639,6 +674,153 @@ class MainActivity : ComponentActivity() {
     }
 
     // =========================================================================
+    // DNS-SD connection-less relay transport
+    // -------------------------------------------------------------------------
+    // WifiP2pManager.connect() between two unpaired phones shows a system
+    // invitation dialog that the OTHER user must accept — unusable for an
+    // emergency alert. DNS-SD service discovery broadcasts the emergency packet
+    // inside a TXT record that every nearby Marsel phone receives passively:
+    // no connection, no pairing, no user action.
+    // =========================================================================
+
+    private fun setupDnsSdListeners() {
+        wifiP2pManager.setDnsSdResponseListeners(
+            wifiP2pChannel,
+            { instanceName, _, device ->
+                Log.d(TAG, "DNS-SD service found: $instanceName from ${device.deviceName}")
+            },
+            { fullDomain, txtRecord, device ->
+                if (fullDomain.contains("marsel", ignoreCase = true)) {
+                    Log.d(TAG, "Marsel TXT record from ${device.deviceName}: $txtRecord")
+                    handleServiceTxtRecord(txtRecord)
+                }
+            }
+        )
+    }
+
+    private fun handleServiceTxtRecord(record: Map<String, String?>) {
+        try {
+            val msgId = record["i"] ?: return
+            val type = when (record["y"]) {
+                "E" -> "MARSEL_EMERGENCY"
+                "P" -> "MARSEL_POSITION_UPDATE"
+                "R" -> "MARSEL_EMERGENCY_RESOLVED"
+                else -> return
+            }
+            val pseudo = (record["p"] ?: "Utilisateur").replace("\\", "").replace("\"", "")
+            val lat = record["a"]?.toDoubleOrNull() ?: return
+            val lng = record["o"]?.toDoubleOrNull() ?: return
+            val ts = record["s"]?.toLongOrNull() ?: System.currentTimeMillis()
+            val hop = record["h"]?.toIntOrNull() ?: 0
+            val emergencyId = record["e"] ?: msgId
+
+            // Rebuild a packet compatible with processRelayMessage / the JS layer.
+            // Contacts cannot travel in a TXT record; the sender's own phone is
+            // responsible for SMS, neighbors only display + relay.
+            val json = """{"type":"$type","messageId":"$msgId","id":"$emergencyId","emergencyId":"$emergencyId","pseudo":"$pseudo","lat":$lat,"lng":$lng,"timestamp":$ts,"hopCount":$hop,"maxHops":10,"contacts":[]}"""
+            processRelayMessage(json)
+        } catch (e: Exception) {
+            Log.e(TAG, "handleServiceTxtRecord: ${e.message}")
+        }
+    }
+
+    private fun broadcastViaService(json: String) {
+        if (!wifiP2pEnabled) return
+        try {
+            val shortType = when (extractJsonString(json, "type")) {
+                "MARSEL_EMERGENCY" -> "E"
+                "MARSEL_POSITION_UPDATE" -> "P"
+                "MARSEL_EMERGENCY_RESOLVED" -> "R"
+                else -> return
+            }
+            val msgId = extractJsonString(json, "messageId") ?: return
+            val emergencyId = extractJsonString(json, "emergencyId")
+                ?: extractJsonString(json, "id") ?: msgId
+            val pseudo = (extractJsonString(json, "pseudo") ?: "").take(24)
+            val lat = extractJsonNumber(json, "lat") ?: return
+            val lng = extractJsonNumber(json, "lng") ?: return
+            val ts = extractJsonNumber(json, "timestamp")?.toLong() ?: System.currentTimeMillis()
+            val hop = extractJsonInt(json, "hopCount") ?: 0
+
+            // TXT record must stay tiny (total well under ~900 bytes)
+            val record = mapOf(
+                "y" to shortType,
+                "i" to msgId.take(40),
+                "e" to emergencyId.take(40),
+                "p" to pseudo,
+                "a" to String.format(java.util.Locale.US, "%.5f", lat),
+                "o" to String.format(java.util.Locale.US, "%.5f", lng),
+                "s" to ts.toString(),
+                "h" to hop.toString()
+            )
+            val serviceInfo = WifiP2pDnsSdServiceInfo.newInstance("marsel", "_marsel._tcp", record)
+
+            wifiP2pManager.clearLocalServices(wifiP2pChannel, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() { addLocalServiceSafe(serviceInfo) }
+                override fun onFailure(reason: Int) { addLocalServiceSafe(serviceInfo) }
+            })
+
+            // Resolved packet: keep broadcasting 2 min so neighbors clear their marker,
+            // then stop announcing anything
+            if (shortType == "R") {
+                p2pHandler.postDelayed({
+                    try { wifiP2pManager.clearLocalServices(wifiP2pChannel, null) } catch (e: Exception) {
+                        Log.w(TAG, "clearLocalServices: ${e.message}")
+                    }
+                }, 120_000)
+            }
+        } catch (e: SecurityException) {
+            Log.e(TAG, "broadcastViaService denied (NEARBY_WIFI_DEVICES?): ${e.message}")
+        } catch (e: Exception) {
+            Log.e(TAG, "broadcastViaService: ${e.message}")
+        }
+    }
+
+    private fun addLocalServiceSafe(serviceInfo: WifiP2pDnsSdServiceInfo) {
+        try {
+            wifiP2pManager.addLocalService(wifiP2pChannel, serviceInfo, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() { Log.d(TAG, "Marsel emergency service broadcasting") }
+                override fun onFailure(reason: Int) { Log.e(TAG, "addLocalService failed: reason=$reason") }
+            })
+        } catch (e: SecurityException) {
+            Log.e(TAG, "addLocalService denied: ${e.message}")
+        }
+    }
+
+    private fun restartServiceDiscovery() {
+        if (!wifiP2pEnabled) return
+        try {
+            wifiP2pManager.clearServiceRequests(wifiP2pChannel, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() { addServiceRequestAndDiscover() }
+                override fun onFailure(reason: Int) { addServiceRequestAndDiscover() }
+            })
+        } catch (e: Exception) {
+            Log.e(TAG, "restartServiceDiscovery: ${e.message}")
+        }
+    }
+
+    private fun addServiceRequestAndDiscover() {
+        try {
+            val request = WifiP2pDnsSdServiceRequest.newInstance()
+            wifiP2pManager.addServiceRequest(wifiP2pChannel, request, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {
+                    try {
+                        wifiP2pManager.discoverServices(wifiP2pChannel, object : WifiP2pManager.ActionListener {
+                            override fun onSuccess() { Log.d(TAG, "DNS-SD discovery running") }
+                            override fun onFailure(reason: Int) { Log.w(TAG, "discoverServices failed: reason=$reason") }
+                        })
+                    } catch (e: SecurityException) {
+                        Log.e(TAG, "discoverServices denied (NEARBY_WIFI_DEVICES?): ${e.message}")
+                    }
+                }
+                override fun onFailure(reason: Int) { Log.w(TAG, "addServiceRequest failed: reason=$reason") }
+            })
+        } catch (e: Exception) {
+            Log.e(TAG, "addServiceRequestAndDiscover: ${e.message}")
+        }
+    }
+
+    // =========================================================================
     // Helper: JSON extraction without external library
     // =========================================================================
     private fun extractJsonString(json: String, key: String): String? {
@@ -649,6 +831,11 @@ class MainActivity : ComponentActivity() {
     private fun extractJsonInt(json: String, key: String): Int? {
         val pattern = """"$key"\s*:\s*(\d+)""".toRegex()
         return pattern.find(json)?.groupValues?.getOrNull(1)?.toIntOrNull()
+    }
+
+    private fun extractJsonNumber(json: String, key: String): Double? {
+        val pattern = """"$key"\s*:\s*(-?\d+(?:\.\d+)?)""".toRegex()
+        return pattern.find(json)?.groupValues?.getOrNull(1)?.toDoubleOrNull()
     }
 
     // =========================================================================
@@ -979,11 +1166,19 @@ class MainActivity : ComponentActivity() {
         fun sendEmergencyViaRelay(emergencyJson: String) {
             thread {
                 try {
-                    // Ensure discovery is running
+                    // PRIMARY transport: connection-less DNS-SD broadcast.
+                    // Reaches every nearby Marsel phone with no pairing dialog.
+                    broadcastViaService(emergencyJson)
+                    restartServiceDiscovery()
+
+                    // Ensure peer discovery is also running (secondary socket transport)
                     startP2PDiscovery()
 
                     synchronized(pendingRelayMessages) {
                         pendingRelayMessages.add(emergencyJson)
+                        // Position updates arrive every 10s — cap the queue so a long
+                        // emergency doesn't grow it unboundedly (keep most recent)
+                        while (pendingRelayMessages.size > 50) pendingRelayMessages.removeAt(0)
                     }
 
                     // Send to all known peers if already connected

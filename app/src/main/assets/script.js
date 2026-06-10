@@ -992,6 +992,17 @@ window.onPeersDiscovered = function (peers) {
     }
 };
 
+/* Called by Android when the WiFi P2P radio state changes.
+   WiFi OFF (or airplane mode) = relay physically impossible → warn the user. */
+window.onP2PStateChanged = function (enabled) {
+    if (!enabled) {
+        updateNetworkBadge('⚠️ WiFi désactivé – relay indisponible');
+        showToast('⚠️ Activez le WiFi (même sans internet) pour alerter les Marsel à proximité');
+    } else {
+        updateNetworkBadge();
+    }
+};
+
 /* Called by Android when P2P connection established */
 window.onP2PConnected = function (info) {
     MARSEL.p2pConnected = true;

@@ -354,12 +354,25 @@ window.onP2PDisconnected()                     // Déconnexion P2P
 
 Le Marsel Relay Network permet la transmission d'alertes d'urgence **sans internet**, via WiFi Direct (P2P) entre téléphones à portée (~100m extérieur).
 
-### Architecture WiFi Direct
+⚠️ **Le WiFi doit être activé** sur les deux téléphones (même sans connexion internet). En mode avion, le relay est physiquement impossible sauf si le WiFi est réactivé manuellement.
+
+### Transport principal : DNS-SD service discovery (sans connexion)
+
+`WifiP2pManager.connect()` entre deux téléphones non appairés affiche une **boîte de dialogue d'invitation** que l'autre utilisateur doit accepter — inutilisable en situation d'urgence. Le transport principal est donc le **DNS-SD service discovery** de WiFi Direct :
+
+- Le téléphone en urgence enregistre un service local `_marsel._tcp` dont le **TXT record contient le paquet d'urgence compact** (type, messageId, pseudo, lat, lng, timestamp, hopCount).
+- Tous les téléphones Marsel à portée exécutent `discoverServices()` en continu (ré-armé toutes les 20s) et reçoivent le TXT record **passivement : aucune connexion, aucun appairage, aucune action utilisateur**.
+- Clés du TXT record (compactes, < 900 octets au total) : `y`=type (E/P/R), `i`=messageId, `e`=emergencyId, `p`=pseudo, `a`=lat, `o`=lng, `s`=timestamp, `h`=hopCount.
+- Les contacts ne voyagent pas dans le TXT record : le téléphone émetteur envoie lui-même les SMS ; les voisins affichent et relayent uniquement.
+- La position est ré-enregistrée toutes les 10s (paquet `P`) pour le tracking. Le paquet de résolution (`R`) reste diffusé 2 minutes puis s'efface.
+
+### Transport secondaire : socket TCP (connexion P2P)
 
 - **Group Owner (GO)** : Un téléphone devient GO après `createGroup()` ou négociation P2P.
   Son IP est toujours `192.168.49.1`.
 - **Client** : Les autres téléphones se connectent au GO.
 - **Paramètre `groupOwnerIntent = 0`** : Le téléphone qui déclenche l'urgence préfère être **client**, ce qui lui permet d'envoyer vers `192.168.49.1:8890` de manière fiable.
+- La connexion n'est tentée **que si un message est en attente** (elle déclenche un dialogue d'invitation sur l'autre téléphone). Si l'utilisateur de l'autre téléphone accepte, le paquet complet (avec contacts) transite par socket.
 
 ### Types de paquets
 
