@@ -4,6 +4,78 @@
    ========================================================= */
 
 /* ---------------------------------------------------------
+   IN-APP DEBUG LOG
+   Captured by the LOG overlay (bottom-right button).
+   Also forwarded from Kotlin via window.marselLog().
+   --------------------------------------------------------- */
+var _marselLogEntries = [];
+var _marselLogFilter  = '';
+var _marselLogMaxEntries = 600;
+
+function mLog(src, tag, msg) {
+    var ts = new Date().toLocaleTimeString('fr-FR', {hour:'2-digit',minute:'2-digit',second:'2-digit'});
+    var ms = ('000' + (Date.now() % 1000)).slice(-3);
+    var entry = { ts: ts + '.' + ms, src: src, tag: tag, msg: String(msg) };
+    _marselLogEntries.push(entry);
+    if (_marselLogEntries.length > _marselLogMaxEntries) _marselLogEntries.shift();
+    _marselLogRender();
+}
+
+/* Called by Kotlin: window.marselLog('K', 'DNS-SD', 'msg') */
+window.marselLog = function(src, tag, msg) { mLog(src, tag, msg); };
+
+function _marselLogRender() {
+    var el = document.getElementById('debug-log-content');
+    if (!el) return;
+    var f = _marselLogFilter;
+    var lines = _marselLogEntries
+        .filter(function(e) { return !f || e.tag.indexOf(f) !== -1; })
+        .map(function(e) {
+            var color = e.src === 'K' ? '#7ec8e3'
+                      : e.tag === 'RELAY' ? '#00ff88'
+                      : e.tag === 'GPS'   ? '#f0c040'
+                      : e.tag === 'NET'   ? '#ff8c69'
+                      : '#cccccc';
+            return '<span style="color:#666">' + e.ts + '</span> '
+                 + '<span style="color:' + color + '">[' + e.tag + ']</span> '
+                 + escapeHtml(e.msg);
+        });
+    el.innerHTML = lines.join('\n');
+    el.scrollTop = el.scrollHeight;
+    var cnt = document.getElementById('debug-log-count');
+    if (cnt) cnt.textContent = _marselLogEntries.length + ' lignes';
+}
+
+function marselLogFilter(tag) {
+    _marselLogFilter = tag;
+    document.querySelectorAll('.log-chip').forEach(function(btn) {
+        btn.classList.toggle('active', btn.getAttribute('onclick').indexOf("'" + tag + "'") !== -1 || (tag === '' && btn.id === 'fltr-all'));
+    });
+    _marselLogRender();
+}
+
+function marselCopyLog() {
+    var lines = _marselLogEntries.map(function(e) {
+        return '[' + e.ts + '] [' + e.src + '][' + e.tag + '] ' + e.msg;
+    }).join('\n');
+    if (navigator.clipboard) {
+        navigator.clipboard.writeText(lines).then(function() { showToast('Logs copiés ✓'); });
+    } else {
+        var ta = document.createElement('textarea');
+        ta.value = lines;
+        ta.style.position = 'fixed'; ta.style.top = '-9999px';
+        document.body.appendChild(ta); ta.select();
+        try { document.execCommand('copy'); showToast('Logs copiés ✓'); } catch(e) { showToast('Erreur copie'); }
+        document.body.removeChild(ta);
+    }
+}
+
+function marselClearLog() {
+    _marselLogEntries = [];
+    _marselLogRender();
+}
+
+/* ---------------------------------------------------------
    GLOBAL STATE OBJECT
    --------------------------------------------------------- */
 var MARSEL = {
@@ -230,7 +302,8 @@ function stopGPS() {
 window.onLocationUpdate = function (lat, lng, accuracy) {
     var fLat = parseFloat(lat);
     var fLng = parseFloat(lng);
-    if (!fLat || !fLng) return;
+    if (!fLat || !fLng) { mLog('J','GPS','invalid coords: ' + lat + ',' + lng); return; }
+    mLog('J', 'GPS', 'fix lat=' + fLat.toFixed(5) + ' lng=' + fLng.toFixed(5) + ' acc=' + (accuracy||'?'));
 
     var wasDefault = !MARSEL.firstGpsFix;
     MARSEL.currentLat = fLat;
@@ -484,6 +557,7 @@ function updateNetworkStatus() {
         }
     }
 
+    if (type !== MARSEL.networkType) mLog('J', 'NET', 'network changed → ' + type);
     MARSEL.networkType = type;
     return type;
 }
@@ -818,14 +892,12 @@ function updateEmergencyUI() {
    --------------------------------------------------------- */
 function routeEmergency(emergencyData) {
     updateNetworkStatus();
+    mLog('J', 'NET', 'routeEmergency networkType=' + MARSEL.networkType);
 
-    // Always relay via WiFi Direct so nearby Marsel phones get a notification + map marker.
-    // Relay works independently of internet: it uses WiFi P2P (no data connection needed).
+    // Always relay via WiFi Direct — nearby Marsel phones get notification + map marker.
     sendEmergencyViaRelayNetwork(emergencyData);
 
-    // Always attempt SMS to contacts: SmsManager uses the cellular baseband (2G/3G/4G
-    // signalling), it does NOT require a mobile-data or WiFi internet connection.
-    // Also calls the cloud API if API_URL is configured and we are online.
+    // Always attempt SMS — SmsManager uses cellular baseband, not internet.
     sendEmergencyViaInternet(emergencyData);
 }
 
@@ -886,8 +958,8 @@ function sendEmergencyViaInternet(emergencyData) {
 }
 
 function sendEmergencyViaRelayNetwork(emergencyData) {
+    mLog('J', 'RELAY', 'sendViaRelay type=' + emergencyData.type + ' id=' + (emergencyData.messageId || '?'));
     if (!MARSEL.p2pConnected && typeof AndroidBridge !== 'undefined') {
-        // Give feedback: relay needs WiFi radio on even without internet
         showToast('🔁 Recherche téléphones Marsel voisins…');
     }
 
@@ -992,9 +1064,9 @@ window.onPeersDiscovered = function (peers) {
     }
 };
 
-/* Called by Android when the WiFi P2P radio state changes.
-   WiFi OFF (or airplane mode) = relay physically impossible → warn the user. */
+/* Called by Android when the WiFi P2P radio state changes. */
 window.onP2PStateChanged = function (enabled) {
+    mLog('J', 'NET', 'P2P state changed: ' + (enabled ? 'ENABLED' : 'DISABLED'));
     if (!enabled) {
         updateNetworkBadge('⚠️ WiFi désactivé – relay indisponible');
         showToast('⚠️ Activez le WiFi (même sans internet) pour alerter les Marsel à proximité');
@@ -1006,6 +1078,7 @@ window.onP2PStateChanged = function (enabled) {
 /* Called by Android when P2P connection established */
 window.onP2PConnected = function (info) {
     MARSEL.p2pConnected = true;
+    mLog('J', 'RELAY', 'P2P connected isOwner=' + (info && info.isOwner) + ' addr=' + (info && info.address));
     updateNetworkBadge('🔁 Marsel Relay Network ✓');
 
     // Flush relay queue now that we have a peer
@@ -1019,8 +1092,13 @@ window.onP2PConnected = function (info) {
 /* Called by Android when a relay message arrives from another device */
 window.onRelayMessageReceived = function (jsonStr) {
     var data;
-    try { data = JSON.parse(jsonStr); } catch (e) { return; }
-    if (!data || !data.type) return;
+    try { data = JSON.parse(jsonStr); } catch (e) {
+        mLog('J', 'RELAY', 'JSON parse error: ' + e);
+        return;
+    }
+    if (!data || !data.type) { mLog('J', 'RELAY', 'no type field, drop'); return; }
+
+    mLog('J', 'RELAY', 'JS RX type=' + data.type + ' pseudo=' + (data.pseudo||'?') + ' id=' + (data.messageId||'?'));
 
     // ── Mise à jour de position GPS (tracking continu) ──
     if (data.type === 'MARSEL_POSITION_UPDATE') {
@@ -1159,7 +1237,8 @@ function handlePositionUpdate(data) {
     if (!data.emergencyId) return;
     var fLat = parseFloat(data.lat);
     var fLng = parseFloat(data.lng);
-    if (isNaN(fLat) || isNaN(fLng)) return;
+    if (isNaN(fLat) || isNaN(fLng)) { mLog('J','RELAY','POS_UPDATE bad coords'); return; }
+    mLog('J','RELAY','POS_UPDATE eId=' + data.emergencyId.slice(-8) + ' lat=' + fLat.toFixed(4) + ' lng=' + fLng.toFixed(4));
 
     var eId = data.emergencyId;
     var timeStr = new Date(data.timestamp || Date.now()).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
