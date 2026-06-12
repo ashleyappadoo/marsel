@@ -319,7 +319,10 @@ window.onLocationUpdate = function (lat, lng, accuracy) {
         }
     }
 
-    // Si urgence active : mettre à jour la position locale et la diffuser
+    // Si urgence active : mettre à jour la position locale uniquement.
+    // La diffusion relay est gérée par startEmergencyTracking (toutes les 10s).
+    // NE PAS appeler sendPositionUpdate ici : ça tirerait sendEmergencyViaRelay
+    // à chaque fix GPS (~1 Hz), saturant complètement le stack WiFi P2P.
     if (MARSEL.emergencyActive && MARSEL.emergencyId) {
         var saved = null;
         try { saved = JSON.parse(localStorage.getItem('marsel_emergency') || 'null'); } catch (e) {}
@@ -328,8 +331,6 @@ window.onLocationUpdate = function (lat, lng, accuracy) {
             saved.lng = fLng;
             localStorage.setItem('marsel_emergency', JSON.stringify(saved));
         }
-        // Diffuser immédiatement la nouvelle position (le tracking interval s'en occupe toutes les 10s)
-        sendPositionUpdate(fLat, fLng);
     }
 };
 

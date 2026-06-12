@@ -75,6 +75,12 @@ class MainActivity : ComponentActivity() {
     // DNS-SD service tracking: keep EMERGENCY alive alongside POSITION_UPDATE
     private var activeEmergencyRecord: Map<String, String>? = null
     private var activePositionRecord: Map<String, String>? = null
+    // Keep WifiP2pServiceInfo references so we can removeLocalService for position
+    // without ever touching the alert service (avoids the clear→gap→re-add cycle).
+    private var activeAlertServiceInfo: WifiP2pDnsSdServiceInfo? = null
+    private var activePositionServiceInfo: WifiP2pDnsSdServiceInfo? = null
+    // Rate-limit position broadcasts: max 1 per 8s (interval fires every 10s)
+    private var lastPositionBroadcastMs: Long = 0
 
     // DNS-SD connection-less relay: periodic re-arm of service discovery
     private val p2pHandler = Handler(Looper.getMainLooper())
@@ -770,27 +776,62 @@ class MainActivity : ComponentActivity() {
             runOnUiThread {
                 when (shortType) {
                     "E" -> {
-                        // New emergency: store and refresh. The emergency service
-                        // stays alive until RESOLVED — it is NEVER replaced by P.
+                        // New emergency: clear everything, register fresh alert service.
                         activeEmergencyRecord = record
                         activePositionRecord = null
-                        logToJs("DNS-SD", "EMERGENCY: broadcasting alert service")
-                        refreshLocalServices()
+                        activeAlertServiceInfo = null
+                        activePositionServiceInfo = null
+                        lastPositionBroadcastMs = 0
+                        logToJs("DNS-SD", "EMERGENCY: registering alert service")
+                        val info = WifiP2pDnsSdServiceInfo.newInstance("marsel-alert", "_marsel._tcp", record)
+                        wifiP2pManager.clearLocalServices(wifiP2pChannel, object : WifiP2pManager.ActionListener {
+                            override fun onSuccess() { registerAlertService(info) }
+                            override fun onFailure(r: Int) { registerAlertService(info) }
+                        })
                     }
                     "P" -> {
-                        // Position update: keep emergency service alive, update position alongside
-                        if (activeEmergencyRecord != null) {
-                            activePositionRecord = record
-                            logToJs("DNS-SD", "POSITION: updating pos service (alert still live)")
-                            refreshLocalServices()
-                        } else {
-                            logToJs("DNS-SD", "POSITION: no active emergency, skip broadcast")
+                        // Position update: NEVER touch the alert service.
+                        // Use removeLocalService on the OLD position service then addLocalService
+                        // for the new one. This keeps marsel-alert always visible.
+                        if (activeEmergencyRecord == null) {
+                            logToJs("DNS-SD", "POSITION: no active emergency, skip")
+                            return@runOnUiThread
                         }
+                        // Rate-limit: skip if < 8s since last broadcast
+                        val now = System.currentTimeMillis()
+                        if (now - lastPositionBroadcastMs < 8_000) {
+                            logToJs("DNS-SD", "POSITION: rate-limited, skip (${now - lastPositionBroadcastMs}ms)")
+                            return@runOnUiThread
+                        }
+                        lastPositionBroadcastMs = now
+                        activePositionRecord = record
+                        val newPosInfo = WifiP2pDnsSdServiceInfo.newInstance("marsel-pos", "_marsel._tcp", record)
+                        val oldPosInfo = activePositionServiceInfo
+                        activePositionServiceInfo = newPosInfo
+                        if (oldPosInfo != null) {
+                            try {
+                                wifiP2pManager.removeLocalService(wifiP2pChannel, oldPosInfo, object : WifiP2pManager.ActionListener {
+                                    override fun onSuccess() { addPosServiceSafe(newPosInfo) }
+                                    override fun onFailure(r: Int) {
+                                        logToJs("DNS-SD", "removeLocalService pos failed: $r — adding anyway")
+                                        addPosServiceSafe(newPosInfo)
+                                    }
+                                })
+                            } catch (ex: SecurityException) {
+                                logToJs("DNS-SD", "removeLocalService denied: ${ex.message}")
+                                addPosServiceSafe(newPosInfo)
+                            }
+                        } else {
+                            addPosServiceSafe(newPosInfo)
+                        }
+                        logToJs("DNS-SD", "POSITION: updating marsel-pos (alert untouched)")
                     }
                     "R" -> {
                         // Emergency resolved: stop all active services, broadcast R for 2 min
                         activeEmergencyRecord = null
                         activePositionRecord = null
+                        activeAlertServiceInfo = null
+                        activePositionServiceInfo = null
                         logToJs("DNS-SD", "RESOLVED: clearing emergency services, broadcasting resolved")
                         val resolvedInfo = WifiP2pDnsSdServiceInfo.newInstance(
                             "marsel-resolved", "_marsel._tcp", record
@@ -823,45 +864,30 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    // Re-registers ALL active services (emergency + position) after a clear.
-    // Must be called on the main thread.
-    private fun refreshLocalServices() {
-        val e = activeEmergencyRecord
-        val p = activePositionRecord
-        wifiP2pManager.clearLocalServices(wifiP2pChannel, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() { addActiveServices(e, p) }
-            override fun onFailure(reason: Int) {
-                logToJs("DNS-SD", "clearLocalServices failed $reason — trying addService anyway")
-                addActiveServices(e, p)
-            }
-        })
+    // Register the emergency alert service (called once on EMERGENCY, after clearLocalServices).
+    private fun registerAlertService(info: WifiP2pDnsSdServiceInfo) {
+        try {
+            wifiP2pManager.addLocalService(wifiP2pChannel, info, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {
+                    activeAlertServiceInfo = info
+                    logToJs("DNS-SD", "marsel-alert registered ✓ — broadcasting continuously")
+                }
+                override fun onFailure(r: Int) { logToJs("DNS-SD", "marsel-alert register FAILED: $r") }
+            })
+        } catch (ex: SecurityException) {
+            logToJs("DNS-SD", "registerAlertService denied: ${ex.message}")
+        }
     }
 
-    private fun addActiveServices(e: Map<String, String>?, p: Map<String, String>?) {
-        if (e != null) {
-            try {
-                val eInfo = WifiP2pDnsSdServiceInfo.newInstance("marsel-alert", "_marsel._tcp", e)
-                wifiP2pManager.addLocalService(wifiP2pChannel, eInfo, object : WifiP2pManager.ActionListener {
-                    override fun onSuccess() {
-                        logToJs("DNS-SD", "marsel-alert service registered ✓")
-                        // Chain: add position service after emergency is confirmed
-                        if (p != null) {
-                            try {
-                                val pInfo = WifiP2pDnsSdServiceInfo.newInstance("marsel-pos", "_marsel._tcp", p)
-                                wifiP2pManager.addLocalService(wifiP2pChannel, pInfo, object : WifiP2pManager.ActionListener {
-                                    override fun onSuccess() { logToJs("DNS-SD", "marsel-pos service registered ✓") }
-                                    override fun onFailure(r: Int) { logToJs("DNS-SD", "marsel-pos register FAILED: $r") }
-                                })
-                            } catch (ex: SecurityException) {
-                                logToJs("DNS-SD", "addLocalService pos denied: ${ex.message}")
-                            }
-                        }
-                    }
-                    override fun onFailure(r: Int) { logToJs("DNS-SD", "marsel-alert register FAILED: $r") }
-                })
-            } catch (ex: SecurityException) {
-                logToJs("DNS-SD", "addLocalService alert denied: ${ex.message}")
-            }
+    // Add a position service without touching the alert service.
+    private fun addPosServiceSafe(info: WifiP2pDnsSdServiceInfo) {
+        try {
+            wifiP2pManager.addLocalService(wifiP2pChannel, info, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() { logToJs("DNS-SD", "marsel-pos registered ✓") }
+                override fun onFailure(r: Int) { logToJs("DNS-SD", "marsel-pos register FAILED: $r") }
+            })
+        } catch (ex: SecurityException) {
+            logToJs("DNS-SD", "addPosServiceSafe denied: ${ex.message}")
         }
     }
 
