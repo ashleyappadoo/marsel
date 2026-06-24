@@ -722,11 +722,24 @@ class MainActivity : ComponentActivity() {
             val hop = record["h"]?.toIntOrNull() ?: 0
             val emergencyId = record["e"] ?: msgId
 
-            logToJs("DNS-SD", "RX TXT type=$type pseudo=$pseudo lat=$lat hop=$hop")
+            // Décode le champ "c" : numéros mobiles séparés par virgule pour la chaîne relay hors-ligne.
+            // Le Téléphone B (avec réseau) les utilise pour envoyer SMS aux contacts du Téléphone A
+            // (ex. Téléphone C) même quand A n'a pas d'internet.
+            val contactsJson = record["c"]?.takeIf { it.isNotEmpty() }?.let { encoded ->
+                encoded.split(",")
+                    .map { it.trim() }
+                    .filter { it.isNotEmpty() }
+                    .joinToString(",", "[", "]") { num ->
+                        val safe = num.replace("\\", "\\\\").replace("\"", "\\\"")
+                        """{"mobile":"$safe"}"""
+                    }
+            } ?: "[]"
+
+            val hasContacts = contactsJson != "[]"
+            logToJs("DNS-SD", "RX TXT type=$type pseudo=$pseudo lat=$lat hop=$hop contacts=${if (hasContacts) "yes" else "none"}")
 
             // Rebuild a full packet for processRelayMessage / the JS layer.
-            // Contacts cannot travel in a TXT record; the sender's phone handles SMS.
-            val json = """{"type":"$type","messageId":"$msgId","id":"$emergencyId","emergencyId":"$emergencyId","pseudo":"$pseudo","lat":$lat,"lng":$lng,"timestamp":$ts,"hopCount":$hop,"maxHops":10,"contacts":[]}"""
+            val json = """{"type":"$type","messageId":"$msgId","id":"$emergencyId","emergencyId":"$emergencyId","pseudo":"$pseudo","lat":$lat,"lng":$lng,"timestamp":$ts,"hopCount":$hop,"maxHops":10,"contacts":$contactsJson}"""
             processRelayMessage(json)
         } catch (e: Exception) {
             logToJs("DNS-SD", "handleServiceTxtRecord ERROR: ${e.message}")
@@ -743,7 +756,16 @@ class MainActivity : ComponentActivity() {
         val lng = extractJsonNumber(json, "lng") ?: return null
         val ts = extractJsonNumber(json, "timestamp")?.toLong() ?: System.currentTimeMillis()
         val hop = extractJsonInt(json, "hopCount") ?: 0
-        return mapOf(
+
+        // Extrait jusqu'à 5 numéros mobiles pour la chaîne relay hors-ligne (clé "c")
+        val contactMobiles = """"mobile"\s*:\s*"([^"]+)"""".toRegex()
+            .findAll(json)
+            .mapNotNull { it.groupValues.getOrNull(1) }
+            .filter { it.isNotEmpty() }
+            .take(5)
+            .joinToString(",")
+
+        val record = mutableMapOf(
             "y" to shortType,
             "i" to msgId.take(40),
             "e" to emergencyId.take(40),
@@ -753,6 +775,10 @@ class MainActivity : ComponentActivity() {
             "s" to ts.toString(),
             "h" to hop.toString()
         )
+        if (contactMobiles.isNotEmpty()) {
+            record["c"] = contactMobiles.take(240)
+        }
+        return record
     }
 
     private fun broadcastViaService(json: String) {

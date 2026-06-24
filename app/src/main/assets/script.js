@@ -236,6 +236,19 @@ function seedSafePlaces() {
     } catch (e) {}
 }
 
+// Marque comme RESOLVED les urgences de plus de 2h pour éviter
+// que les marqueurs des sessions précédentes réapparaissent au démarrage.
+function cleanupOldEmergencyEvents() {
+    var cutoff = Date.now() - 2 * 60 * 60 * 1000; // 2h
+    dbGetAll('emergency_events').then(function (events) {
+        events.forEach(function (ev) {
+            if (ev.status !== 'RESOLVED' && ev.timestamp && ev.timestamp < cutoff) {
+                dbPut('emergency_events', { id: ev.id, status: 'RESOLVED', resolvedAt: Date.now() }).catch(function () {});
+            }
+        });
+    }).catch(function () {});
+}
+
 /* ---------------------------------------------------------
    GPS / LOCATION
    --------------------------------------------------------- */
@@ -462,13 +475,16 @@ function addIncidentMarker(ev) {
     });
 
     var timeStr = '';
+    var dateStr = '';
     if (ev.timestamp) {
-        timeStr = new Date(ev.timestamp).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+        var d = new Date(ev.timestamp);
+        timeStr = d.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
+        dateStr = d.toLocaleDateString('fr-FR', { day: '2-digit', month: '2-digit', year: 'numeric' });
     }
 
     var marker = L.marker([ev.lat, ev.lng], { icon: icon })
         .addTo(MARSEL.leafletMap)
-        .bindPopup('<b>🚨 Alerte Marsel</b><br>Utilisateur : ' + escapeHtml(ev.pseudo || '?') + (timeStr ? '<br>Heure : ' + timeStr : ''));
+        .bindPopup('<b>🚨 Alerte Marsel</b><br>Utilisateur : ' + escapeHtml(ev.pseudo || '?') + (dateStr ? '<br>Date : ' + dateStr : '') + (timeStr ? '<br>Heure : ' + timeStr : ''));
 
     MARSEL.incidentMarkers[ev.id] = marker;
 }
@@ -1242,14 +1258,16 @@ function handlePositionUpdate(data) {
     mLog('J','RELAY','POS_UPDATE eId=' + data.emergencyId.slice(-8) + ' lat=' + fLat.toFixed(4) + ' lng=' + fLng.toFixed(4));
 
     var eId = data.emergencyId;
-    var timeStr = new Date(data.timestamp || Date.now()).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    var _d = new Date(data.timestamp || Date.now());
+    var timeStr = _d.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    var dateStr = _d.toLocaleDateString('fr-FR', { day: '2-digit', month: '2-digit', year: 'numeric' });
 
     // Mettre à jour le marqueur existant
     if (MARSEL.incidentMarkers[eId] && MARSEL.leafletMap) {
         MARSEL.incidentMarkers[eId].setLatLng([fLat, fLng]);
         MARSEL.incidentMarkers[eId].setPopupContent(
             '<b>🚨 ' + escapeHtml(data.pseudo || 'Utilisateur') + '</b><br>' +
-            'Tracking actif – mis à jour ' + timeStr
+            'Tracking actif – ' + dateStr + ' ' + timeStr
         );
     } else if (MARSEL.leafletMap) {
         // Première réception pour cet emergency : créer le marqueur
@@ -1961,6 +1979,7 @@ document.addEventListener('DOMContentLoaded', function () {
     // 1. Initialize IndexedDB
     initDB().then(function () {
         console.log('MarselDB ready');
+        cleanupOldEmergencyEvents();
     }).catch(function (e) {
         console.warn('DB init failed:', e);
     });
