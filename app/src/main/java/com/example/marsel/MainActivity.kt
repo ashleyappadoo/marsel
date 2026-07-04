@@ -48,7 +48,18 @@ import java.io.InputStreamReader
 import java.io.OutputStreamWriter
 import java.net.ServerSocket
 import java.net.Socket
+import java.util.concurrent.ConcurrentHashMap
 import kotlin.concurrent.thread
+
+/**
+ * Pair Marsel confirmé : appareil vu via DNS-SD sur _marsel._tcp.
+ * Seuls ces appareils peuvent recevoir un connect() ou apparaître dans l'UI.
+ */
+data class MarselPeer(
+    val deviceAddress: String,
+    val deviceName: String,
+    @Volatile var lastSeenMs: Long
+)
 
 class MainActivity : ComponentActivity() {
 
@@ -66,6 +77,12 @@ class MainActivity : ComponentActivity() {
     private lateinit var wifiP2pChannel: WifiP2pManager.Channel
     private lateinit var wifiP2pReceiver: WifiP2pBroadcastReceiver
     private val peerDevices = mutableListOf<WifiP2pDevice>()
+
+    // Pairs Marsel CONFIRMÉS (vus via DNS-SD _marsel._tcp) — seul filtre autorisé
+    // pour connectToPeer() et pour la liste envoyée à l'UI. Un pair non revu
+    // depuis MARSEL_PEER_TTL_MS est expiré.
+    private val marselPeers = ConcurrentHashMap<String, MarselPeer>()
+
     private var isGroupOwner = false
     private var groupOwnerAddress: String? = null
     private val pendingRelayMessages = mutableListOf<String>()
@@ -86,6 +103,7 @@ class MainActivity : ComponentActivity() {
     private val p2pHandler = Handler(Looper.getMainLooper())
     private val rediscoverRunnable = object : Runnable {
         override fun run() {
+            purgeExpiredMarselPeers()
             restartServiceDiscovery()
             p2pHandler.postDelayed(this, 20_000)
         }
@@ -108,6 +126,7 @@ class MainActivity : ComponentActivity() {
         private const val CHANNEL_ID = "marsel_alerts"
         private const val MARSEL_ALERT_ID = 1001
         private const val TAG = "MARSEL"
+        private const val MARSEL_PEER_TTL_MS = 60_000L
     }
 
     // -------------------------------------------------------------------------
@@ -430,23 +449,28 @@ class MainActivity : ComponentActivity() {
 
                 WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION -> {
                     wifiP2pManager.requestPeers(wifiP2pChannel) { peers ->
-                        peerDevices.clear()
-                        peerDevices.addAll(peers.deviceList)
-                        val peerJson = peers.deviceList.joinToString(",", "[", "]") {
-                            """{"name":"${it.deviceName.replace("\"", "\\\"")}","address":"${it.deviceAddress}"}"""
+                        synchronized(peerDevices) {
+                            peerDevices.clear()
+                            peerDevices.addAll(peers.deviceList)
                         }
-                        runOnUiThread {
-                            webView.evaluateJavascript(
-                                "window.onPeersDiscovered && window.onPeersDiscovered($peerJson)",
-                                null
-                            )
-                        }
+                        // L'UI ne reçoit QUE les pairs Marsel confirmés via DNS-SD,
+                        // jamais la liste brute (TV, imprimantes, téléphones sans Marsel).
+                        notifyMarselPeersToJs()
+
                         // connect() pops an invitation dialog on the other phone, so it is
                         // only a secondary transport: attempt it solely when we actually
                         // have a message to deliver. Alerts travel via DNS-SD regardless.
+                        // FILTRAGE STRICT : jamais de connect() vers un appareil absent
+                        // de marselPeers — un appareil non-Marsel ne répondra jamais et
+                        // bloque le framework P2P (BUSY) pendant toute la négociation.
                         val hasPending = synchronized(pendingRelayMessages) { pendingRelayMessages.isNotEmpty() }
-                        if (hasPending && peers.deviceList.isNotEmpty() && groupOwnerAddress == null) {
-                            connectToPeer(peers.deviceList.first())
+                        if (hasPending && groupOwnerAddress == null) {
+                            val target = peers.deviceList.firstOrNull { marselPeers.containsKey(it.deviceAddress) }
+                            if (target != null) {
+                                connectToPeer(target)
+                            } else if (peers.deviceList.isNotEmpty()) {
+                                Log.d(TAG, "Peers visibles (${peers.deviceList.size}) mais aucun pair Marsel confirmé — pas de connect()")
+                            }
                         }
                     }
                 }
@@ -693,16 +717,69 @@ class MainActivity : ComponentActivity() {
     private fun setupDnsSdListeners() {
         wifiP2pManager.setDnsSdResponseListeners(
             wifiP2pChannel,
-            { instanceName, _, device ->
-                Log.d(TAG, "DNS-SD service found: $instanceName from ${device.deviceName}")
+            { instanceName, registrationType, device ->
+                Log.d(TAG, "DNS-SD service found: $instanceName ($registrationType) from ${device.deviceName}")
+                if (registrationType.contains("_marsel._tcp", ignoreCase = true) ||
+                    instanceName.startsWith("marsel", ignoreCase = true)
+                ) {
+                    markMarselPeer(device)
+                }
             },
             { fullDomain, txtRecord, device ->
                 if (fullDomain.contains("marsel", ignoreCase = true)) {
                     Log.d(TAG, "Marsel TXT record from ${device.deviceName}: $txtRecord")
+                    markMarselPeer(device)
                     handleServiceTxtRecord(txtRecord)
                 }
             }
         )
+    }
+
+    // -------------------------------------------------------------------------
+    // Registre des pairs Marsel (Section 2 — filtrage strict)
+    // -------------------------------------------------------------------------
+    private fun markMarselPeer(device: WifiP2pDevice?) {
+        val addr = device?.deviceAddress ?: return
+        if (addr.isEmpty()) return
+        val existing = marselPeers[addr]
+        if (existing == null) {
+            marselPeers[addr] = MarselPeer(addr, device.deviceName ?: "?", System.currentTimeMillis())
+            logToJs("P2P", "Pair Marsel confirmé: ${device.deviceName} ($addr) — total=${marselPeers.size}")
+            notifyMarselPeersToJs()
+        } else {
+            existing.lastSeenMs = System.currentTimeMillis()
+        }
+    }
+
+    private fun purgeExpiredMarselPeers() {
+        val cutoff = System.currentTimeMillis() - MARSEL_PEER_TTL_MS
+        var removed = false
+        val iter = marselPeers.entries.iterator()
+        while (iter.hasNext()) {
+            val e = iter.next()
+            if (e.value.lastSeenMs < cutoff) {
+                logToJs("P2P", "Pair Marsel expiré: ${e.value.deviceName}")
+                iter.remove()
+                removed = true
+            }
+        }
+        if (removed) notifyMarselPeersToJs()
+    }
+
+    private fun marselPeersJson(): String {
+        return marselPeers.values.joinToString(",", "[", "]") { p ->
+            """{"name":"${p.deviceName.replace("\"", "\\\"")}","address":"${p.deviceAddress}"}"""
+        }
+    }
+
+    private fun notifyMarselPeersToJs() {
+        val json = marselPeersJson()
+        runOnUiThread {
+            webView.evaluateJavascript(
+                "window.onPeersDiscovered && window.onPeersDiscovered($json)",
+                null
+            )
+        }
     }
 
     private fun handleServiceTxtRecord(record: Map<String, String?>) {
@@ -1368,11 +1445,8 @@ class MainActivity : ComponentActivity() {
 
         @JavascriptInterface
         fun getP2PPeers(): String {
-            return synchronized(peerDevices) {
-                peerDevices.joinToString(",", "[", "]") { device ->
-                    """{"name":"${device.deviceName.replace("\"", "\\\"")}","address":"${device.deviceAddress}"}"""
-                }
-            }
+            // Ne retourne que les pairs Marsel confirmés (Section 2)
+            return marselPeersJson()
         }
 
         @JavascriptInterface
