@@ -118,8 +118,14 @@ var MARSEL = {
 
     // GPS tracking during emergency
     trackingInterval: null,    // setInterval handle for continuous position broadcast
-    firstGpsFix: false         // true once real GPS replaces Paris default
+    firstGpsFix: false,        // true once real GPS replaces Paris default
+
+    // Timer 20 minutes (Section 4)
+    timeoutTimer: null         // setTimeout handle for the 20-min still-active alert
 };
+
+/* Durée avant relance SMS "alerte toujours en cours" (20 min) */
+var EMERGENCY_TIMEOUT_MS = 20 * 60 * 1000;
 
 /* Ring circumference for r=78 */
 var RING_CIRCUMFERENCE = 2 * Math.PI * 78; // ≈ 490
@@ -761,12 +767,17 @@ function activateEmergency() {
     // Démarrer le tracking GPS continu (position toutes les 10s)
     startEmergencyTracking(emergencyData);
 
+    // Armer le timer 20 min (Section 4)
+    armEmergencyTimeout(emergencyData);
+
     showToast('🚨 Alerte envoyée !');
 }
 
 function deactivateEmergency() {
     // Stopper le tracking GPS continu
     stopEmergencyTracking();
+    // Annuler le timer 20 min (Section 4)
+    cancelEmergencyTimeout();
 
     MARSEL.emergencyActive = false;
 
@@ -1274,6 +1285,51 @@ function stopEmergencyTracking() {
         clearInterval(MARSEL.trackingInterval);
         MARSEL.trackingInterval = null;
     }
+}
+
+/* ── Timer 20 minutes (Section 4) ── */
+
+// Arme le timer sur le temps RESTANT calculé depuis le timestamp de
+// déclenchement (persisté dans marsel_emergency). Au restart de l'app pendant
+// une alerte active, le temps déjà écoulé est déduit ; si les 20 min sont
+// dépassées, l'échéance se déclenche immédiatement.
+function armEmergencyTimeout(emergencyData) {
+    cancelEmergencyTimeout();
+    var startTs = (emergencyData && emergencyData.timestamp) || Date.now();
+    var remaining = startTs + EMERGENCY_TIMEOUT_MS - Date.now();
+    if (remaining < 0) remaining = 0;
+    mLog('J', 'NET', 'Timer 20min armé, reste ' + Math.round(remaining / 1000) + 's');
+    MARSEL.timeoutTimer = setTimeout(triggerEmergencyTimeout, remaining);
+}
+
+function cancelEmergencyTimeout() {
+    if (MARSEL.timeoutTimer) {
+        clearTimeout(MARSEL.timeoutTimer);
+        MARSEL.timeoutTimer = null;
+    }
+}
+
+// Échéance atteinte : alerte toujours active après 20 min sans fin d'alerte.
+// SMS "toujours en cours" en cascade (mobile → wifi → paquet MRN T relayé).
+function triggerEmergencyTimeout() {
+    MARSEL.timeoutTimer = null;
+    if (!MARSEL.emergencyActive) return;
+
+    var savedEmergency = null;
+    try { savedEmergency = JSON.parse(localStorage.getItem('marsel_emergency') || 'null'); } catch (e) {}
+    if (!savedEmergency) return;
+
+    var pseudo = savedEmergency.pseudo || 'Utilisateur';
+    var mapsLink = 'https://maps.google.com/?q=' + MARSEL.currentLat + ',' + MARSEL.currentLng;
+    var settings = JSON.parse(localStorage.getItem('marsel_settings') || '{}');
+    var hasAudio = !!settings.audio;
+    var audioMention = hasAudio ? '\nUn enregistrement audio est en cours.' : '';
+    var msg = '⚠️ ALERTE MARSEL TOUJOURS EN COURS depuis 20 min. ' +
+        pseudo + ' n\'a pas désactivé son alerte.\nPosition : ' + mapsLink + audioMention;
+
+    mLog('J', 'NET', 'Timer 20min ÉCHU — envoi SMS "toujours en cours"');
+    sendCascadeSms('TIMEOUT', savedEmergency, msg, hasAudio);
+    showToast('⚠️ Alerte toujours active depuis 20 min — proches renotifiés');
 }
 
 function sendPositionUpdate(lat, lng) {
@@ -2065,6 +2121,11 @@ document.addEventListener('DOMContentLoaded', function () {
     if (savedEmergency && savedEmergency.id) {
         MARSEL.emergencyActive = true;
         MARSEL.emergencyId = savedEmergency.id;
+        // Reprendre le tracking et RÉARMER le timer 20 min sur le temps restant
+        // (Section 4 — persistance). Si les 20 min sont dépassées, il se
+        // déclenche immédiatement via armEmergencyTimeout (remaining=0).
+        startEmergencyTracking(savedEmergency);
+        armEmergencyTimeout(savedEmergency);
     }
 
     // 4. After splash delay, check auth and route to correct screen
