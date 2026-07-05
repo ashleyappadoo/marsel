@@ -81,8 +81,11 @@ function marselClearLog() {
 var MARSEL = {
     // User state
     currentUser: null,
-    currentLat: 48.8566,   // default Paris – updated by GPS
-    currentLng: 2.3522,
+    // Position : RIEN par défaut. On n'utilise QUE de vraies coordonnées GPS.
+    // Reste null tant qu'aucun vrai fix (réel) n'est arrivé — jamais de valeur
+    // par défaut / factice qui masquerait l'absence de position.
+    currentLat: null,
+    currentLng: null,
     locationWatchId: null,
 
     // Emergency state
@@ -118,7 +121,7 @@ var MARSEL = {
 
     // GPS tracking during emergency
     trackingInterval: null,    // setInterval handle for continuous position broadcast
-    firstGpsFix: false,        // true once real GPS replaces Paris default
+    firstGpsFix: false,        // true dès qu'un VRAI fix GPS est reçu (jamais avant)
 
     // Timer 20 minutes (Section 4)
     timeoutTimer: null         // setTimeout handle for the 20-min still-active alert
@@ -167,7 +170,8 @@ function initDB() {
 
         request.onsuccess = function (e) {
             MARSEL.db = e.target.result;
-            seedSafePlaces();
+            // Pas de seed factice : les lieux sûrs réels sont récupérés autour
+            // de la position exacte au premier fix GPS (refreshRealSafePlaces).
             resolve(MARSEL.db);
         };
 
@@ -226,20 +230,72 @@ function dbDelete(storeName, key) {
     });
 }
 
-function seedSafePlaces() {
-    if (!MARSEL.db) return;
+/* Récupère les lieux sûrs RÉELS (OpenStreetMap Overpass) autour d'une vraie
+   position, les met en cache local (IndexedDB) et rafraîchit la carte.
+   Aucune donnée factice : hors connexion, on garde les derniers lieux réels
+   déjà mis en cache. Ne re-télécharge pas si on l'a déjà fait récemment et
+   qu'on ne s'est pas éloigné. */
+function refreshRealSafePlaces(lat, lng) {
+    if (!isFinite(lat) || !isFinite(lng)) return;
+    if (getNetworkQuality() === 'NONE') { mLog('J', 'NET', 'safe places: hors ligne, cache local conservé'); return; }
+
+    // Anti-spam : skip si dernier fetch < 1h ET déplacement < 1km
     try {
-        var tx = MARSEL.db.transaction('safe_places', 'readonly');
-        var req = tx.objectStore('safe_places').count();
-        req.onsuccess = function () {
-            if (req.result === 0) {
-                var places = (window.MARSEL_CONFIG && MARSEL_CONFIG.SAFE_PLACES_SEED) || [];
-                places.forEach(function (place) {
-                    dbPut('safe_places', place).catch(function () {});
-                });
-            }
-        };
+        var last = JSON.parse(localStorage.getItem('marsel_sp_fetch') || 'null');
+        if (last && (Date.now() - last.ts) < 3600000 &&
+            distanceMeters(lat, lng, last.lat, last.lng) < 1000) {
+            return;
+        }
     } catch (e) {}
+
+    var cfg = window.MARSEL_CONFIG || {};
+    var url = cfg.OVERPASS_URL || 'https://overpass-api.de/api/interpreter';
+    var r = cfg.SAFE_PLACES_RADIUS_M || 2500;
+    var q = '[out:json][timeout:20];(' +
+        'node["amenity"="police"](around:' + r + ',' + lat + ',' + lng + ');' +
+        'node["amenity"="hospital"](around:' + r + ',' + lat + ',' + lng + ');' +
+        'node["amenity"="townhall"](around:' + r + ',' + lat + ',' + lng + ');' +
+        'node["amenity"="pharmacy"](around:' + r + ',' + lat + ',' + lng + ');' +
+        ');out center 60;';
+
+    fetch(url, { method: 'POST', body: 'data=' + encodeURIComponent(q) })
+        .then(function (res) { return res.ok ? res.json() : null; })
+        .then(function (data) {
+            if (!data || !data.elements) return;
+            var count = 0;
+            data.elements.forEach(function (el) {
+                var elat = el.lat || (el.center && el.center.lat);
+                var elng = el.lon || (el.center && el.center.lon);
+                if (!isFinite(elat) || !isFinite(elng)) return;
+                var tags = el.tags || {};
+                var type = tags.amenity === 'police' ? 'police'
+                         : tags.amenity === 'hospital' ? 'hopital'
+                         : tags.amenity === 'townhall' ? 'mairie'
+                         : 'safe';
+                var place = {
+                    id: 'osm-' + el.type + '-' + el.id,
+                    name: tags.name || (type === 'police' ? 'Police'
+                            : type === 'hopital' ? 'Hôpital'
+                            : type === 'mairie' ? 'Mairie' : 'Pharmacie'),
+                    lat: elat, lng: elng, type: type,
+                    phone: tags.phone || tags['contact:phone'] || ''
+                };
+                dbPut('safe_places', place).catch(function () {});
+                count++;
+            });
+            localStorage.setItem('marsel_sp_fetch', JSON.stringify({ ts: Date.now(), lat: lat, lng: lng }));
+            mLog('J', 'NET', 'safe places réels récupérés: ' + count);
+            loadSafePlacesOnMap();
+        })
+        .catch(function (e) { mLog('J', 'NET', 'safe places fetch échec: ' + e); });
+}
+
+/* Distance approximative en mètres entre deux points (équirectangulaire). */
+function distanceMeters(la1, ln1, la2, ln2) {
+    var R = 6371000, rad = Math.PI / 180;
+    var x = (ln2 - ln1) * rad * Math.cos((la1 + la2) / 2 * rad);
+    var y = (la2 - la1) * rad;
+    return Math.sqrt(x * x + y * y) * R;
 }
 
 // Marque comme RESOLVED les urgences de plus de 2h pour éviter
@@ -317,24 +373,71 @@ function stopGPS() {
     }
 }
 
-/* Called by Android native code AND by the browser geolocation callback */
+/* Retourne une VRAIE position {lat,lng} ou null — jamais de valeur factice.
+   1) le fix courant s'il est réel ; 2) sinon le dernier fix réel connu d'Android
+   (getLocation), qu'on adopte alors comme position courante. */
+function getRealPosition() {
+    if (MARSEL.firstGpsFix && isFinite(MARSEL.currentLat) && isFinite(MARSEL.currentLng)) {
+        return { lat: MARSEL.currentLat, lng: MARSEL.currentLng };
+    }
+    if (window.AndroidBridge && typeof AndroidBridge.getLocation === 'function') {
+        try {
+            var raw = AndroidBridge.getLocation();
+            if (raw) {
+                var loc = JSON.parse(raw);
+                var la = parseFloat(loc && loc.lat), ln = parseFloat(loc && loc.lng);
+                if (isFinite(la) && isFinite(ln)) {
+                    MARSEL.currentLat = la;
+                    MARSEL.currentLng = ln;
+                    MARSEL.firstGpsFix = true;
+                    return { lat: la, lng: ln };
+                }
+            }
+        } catch (e) {}
+    }
+    return null;
+}
+
+/* true si on dispose d'une vraie position exploitable. */
+function hasRealPosition() {
+    return getRealPosition() !== null;
+}
+
+/* Called by Android native code AND by the browser geolocation callback.
+   C'est le SEUL endroit qui écrit MARSEL.currentLat/Lng — et uniquement avec
+   de vraies coordonnées GPS. */
 window.onLocationUpdate = function (lat, lng, accuracy) {
     var fLat = parseFloat(lat);
     var fLng = parseFloat(lng);
-    if (!fLat || !fLng) { mLog('J','GPS','invalid coords: ' + lat + ',' + lng); return; }
+    // Rejeter uniquement les valeurs non numériques (0,0 est une coordonnée valide)
+    if (!isFinite(fLat) || !isFinite(fLng)) { mLog('J','GPS','invalid coords: ' + lat + ',' + lng); return; }
     mLog('J', 'GPS', 'fix lat=' + fLat.toFixed(5) + ' lng=' + fLng.toFixed(5) + ' acc=' + (accuracy||'?'));
 
-    var wasDefault = !MARSEL.firstGpsFix;
+    var wasFirst = !MARSEL.firstGpsFix;
     MARSEL.currentLat = fLat;
     MARSEL.currentLng = fLng;
+    // Vrai fix reçu : marquer IMMÉDIATEMENT, indépendamment de l'état de la carte.
+    // (Avant, ce flag n'était posé que si le marqueur existait déjà → un vrai fix
+    //  arrivé avant l'init de la carte n'était jamais reconnu.)
+    MARSEL.firstGpsFix = true;
 
-    // Update user marker on map
-    if (MARSEL.userMarker && MARSEL.leafletMap) {
-        MARSEL.userMarker.setLatLng([fLat, fLng]);
-        // Premier vrai fix GPS : recentrer la carte sur la position réelle
-        if (wasDefault) {
-            MARSEL.firstGpsFix = true;
+    // Créer / déplacer le marqueur utilisateur — jamais posé tant qu'on n'a pas
+    // de vraie position (donc aucun marqueur « fantôme » à Paris).
+    if (MARSEL.leafletMap) {
+        if (!MARSEL.userMarker) {
+            var uicon = L.divIcon({
+                html: '<div class="user-location-marker"><div class="user-pulse"></div></div>',
+                iconSize: [20, 20], iconAnchor: [10, 10], className: ''
+            });
+            MARSEL.userMarker = L.marker([fLat, fLng], { icon: uicon })
+                .addTo(MARSEL.leafletMap).bindPopup('<b>Ma position</b>');
+        } else {
+            MARSEL.userMarker.setLatLng([fLat, fLng]);
+        }
+        if (wasFirst) {
             MARSEL.leafletMap.setView([fLat, fLng], 15);
+            // Premier vrai fix : charger les lieux sûrs RÉELS autour de la position
+            refreshRealSafePlaces(fLat, fLng);
         }
     }
 
@@ -346,12 +449,39 @@ window.onLocationUpdate = function (lat, lng, accuracy) {
         var saved = null;
         try { saved = JSON.parse(localStorage.getItem('marsel_emergency') || 'null'); } catch (e) {}
         if (saved) {
+            var hadNoPosition = !isFinite(saved.lat) || !isFinite(saved.lng);
             saved.lat = fLat;
             saved.lng = fLng;
             localStorage.setItem('marsel_emergency', JSON.stringify(saved));
+            // L'alerte avait été déclenchée AVANT d'avoir un fix : maintenant qu'on
+            // a la vraie position, on crée le marqueur d'incident et on la diffuse
+            // immédiatement (une seule fois) au réseau + backend.
+            if (hadNoPosition) {
+                addIncidentMarker(saved);
+                if (MARSEL.leafletMap) MARSEL.leafletMap.setView([fLat, fLng], 15);
+                sendPositionUpdate(fLat, fLng);
+            }
         }
     }
 };
+
+/* Demande un fix GPS réel IMMÉDIAT (haute précision), navigateur + Android.
+   Le résultat arrive via onLocationUpdate. Aucune position factice n'est jamais
+   fabriquée : si le GPS ne répond pas, il n'y a simplement pas de position. */
+function acquireImmediateRealFix() {
+    if (navigator.geolocation) {
+        navigator.geolocation.getCurrentPosition(
+            function (p) { onLocationUpdate(p.coords.latitude, p.coords.longitude, p.coords.accuracy); },
+            function () { tryAndroidLocation(); },
+            { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+        );
+    } else {
+        tryAndroidLocation();
+    }
+    if (window.AndroidBridge && typeof AndroidBridge.startLocationUpdates === 'function') {
+        try { AndroidBridge.startLocationUpdates(); } catch (e) {}
+    }
+}
 
 /* ---------------------------------------------------------
    MAP
@@ -382,7 +512,16 @@ function initMap() {
             dragging: true,
             touchZoom: true,
             scrollWheelZoom: false
-        }).setView([MARSEL.currentLat, MARSEL.currentLng], 14);
+        });
+        // Centre initial : la VRAIE position si on en a déjà une (fix courant ou
+        // dernier fix réel connu d'Android), sinon vue monde neutre (aucune
+        // position factice). onLocationUpdate recentrera au premier vrai fix.
+        var realStart = getRealPosition();
+        if (realStart) {
+            MARSEL.leafletMap.setView([realStart.lat, realStart.lng], 15);
+        } else {
+            MARSEL.leafletMap.setView([20, 0], 2);
+        }
 
         // Tile layer: Mapbox if token, else CartoDB light
         if (window.MARSEL_CONFIG && MARSEL_CONFIG.MAPBOX_TOKEN) {
@@ -402,23 +541,29 @@ function initMap() {
             }).addTo(MARSEL.leafletMap);
         }
 
-        // User marker with pulse animation
-        var userIcon = L.divIcon({
-            html: '<div class="user-location-marker"><div class="user-pulse"></div></div>',
-            iconSize: [20, 20],
-            iconAnchor: [10, 10],
-            className: ''
-        });
-        MARSEL.userMarker = L.marker([MARSEL.currentLat, MARSEL.currentLng], { icon: userIcon })
-            .addTo(MARSEL.leafletMap)
-            .bindPopup('<b>Ma position</b>');
+        // Marqueur utilisateur : créé UNIQUEMENT si on a une vraie position.
+        // Sinon il apparaîtra au premier vrai fix (dans onLocationUpdate).
+        if (realStart) {
+            var userIcon = L.divIcon({
+                html: '<div class="user-location-marker"><div class="user-pulse"></div></div>',
+                iconSize: [20, 20],
+                iconAnchor: [10, 10],
+                className: ''
+            });
+            MARSEL.userMarker = L.marker([realStart.lat, realStart.lng], { icon: userIcon })
+                .addTo(MARSEL.leafletMap)
+                .bindPopup('<b>Ma position</b>');
+        }
 
         // Zoom control bottom right
         L.control.zoom({ position: 'bottomright' }).addTo(MARSEL.leafletMap);
 
-        // Load data from DB
+        // Load data from DB (lieux sûrs réels déjà en cache + incidents)
         loadSafePlacesOnMap();
         loadIncidentsOnMap();
+        // Si on a déjà une vraie position au moment de l'init, rafraîchir les
+        // lieux sûrs réels autour (sinon onLocationUpdate le fera au 1er fix).
+        if (realStart) refreshRealSafePlaces(realStart.lat, realStart.lng);
 
         var settings = JSON.parse(localStorage.getItem('marsel_settings') || '{}');
         if (settings.location) {
@@ -442,7 +587,15 @@ function initMap() {
 function loadSafePlacesOnMap() {
     dbGetAll('safe_places').then(function (places) {
         if (!MARSEL.leafletMap) return;
+        // Idempotent : retirer les marqueurs déjà posés avant de re-rendre
+        // (loadSafePlacesOnMap est rappelé après chaque refresh Overpass).
+        MARSEL.safePlaceMarkers.forEach(function (m) {
+            try { MARSEL.leafletMap.removeLayer(m); } catch (e) {}
+        });
+        MARSEL.safePlaceMarkers = [];
+
         places.forEach(function (place) {
+            if (!isFinite(place.lat) || !isFinite(place.lng)) return;
             var color = '#4CAF50';
             if (place.type === 'police') color = '#1A35C8';
             else if (place.type === 'hopital') color = '#E84315';
@@ -451,7 +604,7 @@ function loadSafePlacesOnMap() {
             var icon = createMapMarkerIcon(color, place.type);
             var marker = L.marker([place.lat, place.lng], { icon: icon })
                 .addTo(MARSEL.leafletMap)
-                .bindPopup('<b>' + escapeHtml(place.name) + '</b><br>📞 ' + escapeHtml(place.phone || ''));
+                .bindPopup('<b>' + escapeHtml(place.name) + '</b>' + (place.phone ? '<br>📞 ' + escapeHtml(place.phone) : ''));
             MARSEL.safePlaceMarkers.push(marker);
         });
     }).catch(function () {});
@@ -471,6 +624,7 @@ function loadIncidentsOnMap() {
 
 function addIncidentMarker(ev) {
     if (!MARSEL.leafletMap) return;
+    if (!ev || !isFinite(ev.lat) || !isFinite(ev.lng)) return; // jamais de marqueur sans vraie position
     if (MARSEL.incidentMarkers[ev.id]) return; // already shown
 
     var icon = L.divIcon({
@@ -736,6 +890,17 @@ function activateEmergency() {
     var userData = JSON.parse(localStorage.getItem('marsel_user') || '{}');
     var profileData = JSON.parse(localStorage.getItem('marsel_profile') || '{}');
 
+    // Position RÉELLE uniquement : fix courant, sinon dernier fix réel Android.
+    // Jamais de coordonnées par défaut. Si aucune position réelle n'est encore
+    // disponible, l'alerte part quand même (mieux vaut une alerte sans position
+    // exacte que pas d'alerte), lat/lng restent null → « position non disponible »,
+    // et le tracking diffusera la vraie position dès le premier fix (ci-dessous).
+    var pos = getRealPosition();
+    if (!pos) {
+        mLog('J', 'GPS', 'Alerte sans fix GPS encore — acquisition en cours, position réelle diffusée dès réception');
+        acquireImmediateRealFix();
+    }
+
     var emergencyData = {
         type: 'MARSEL_EMERGENCY',
         version: 1,
@@ -743,8 +908,8 @@ function activateEmergency() {
         messageId: MARSEL.emergencyId,
         userId: userData.userId || userData.email || 'unknown',
         pseudo: profileData.pseudo || userData.pseudo || userData.email || 'Utilisateur',
-        lat: MARSEL.currentLat,
-        lng: MARSEL.currentLng,
+        lat: pos ? pos.lat : null,
+        lng: pos ? pos.lng : null,
         timestamp: Date.now(),
         contacts: contacts,
         mode: MARSEL.mode,
@@ -758,8 +923,8 @@ function activateEmergency() {
     dbPut('emergency_events', emergencyData).catch(function () {});
     localStorage.setItem('marsel_emergency', JSON.stringify(emergencyData));
 
-    // Show own incident on map
-    addIncidentMarker(emergencyData);
+    // Show own incident on map (uniquement si vraie position)
+    if (pos) addIncidentMarker(emergencyData);
 
     // Route it
     routeEmergency(emergencyData);
@@ -797,19 +962,29 @@ function deactivateEmergency() {
 
     if (savedEmergency) {
         var pseudo = savedEmergency.pseudo || 'Utilisateur';
-        var lastPos = 'https://maps.google.com/?q=' + MARSEL.currentLat + ',' + MARSEL.currentLng;
+
+        // Dernière position RÉELLE connue : fix courant sinon dernière position
+        // réelle de l'alerte. Jamais de « null,null » ni de valeur par défaut.
+        var finPos = getRealPosition();
+        if (!finPos && isFinite(savedEmergency.lat) && isFinite(savedEmergency.lng)) {
+            finPos = { lat: savedEmergency.lat, lng: savedEmergency.lng };
+        }
+        var lastPosLine = finPos
+            ? '\nDernière position connue : https://maps.google.com/?q=' + finPos.lat + ',' + finPos.lng
+            : '';
 
         // Enregistrement audio actif ? (shield audio) → mention dans le SMS de fin
         var settingsFin = JSON.parse(localStorage.getItem('marsel_settings') || '{}');
         var hasAudio = !!settingsFin.audio;
         var audioMention = hasAudio ? '\nUn enregistrement audio de l\'alerte est disponible.' : '';
-        var finMsg = '✅ FIN D\'ALERTE MARSEL\n' + pseudo + ' est en sécurité.\nDernière position connue : ' + lastPos + audioMention;
+        var finMsg = '✅ FIN D\'ALERTE MARSEL\n' + pseudo + ' est en sécurité.' + lastPosLine + audioMention;
 
         // ÉTAPE D : SMS de fin via la MÊME cascade que l'étape A
         // (mobile → wifi → paquet MRN MARSEL_RESOLVED_SMS_REQUEST relayé).
         sendCascadeSms('RESOLVED', savedEmergency, finMsg, hasAudio);
 
-        // Paquet de résolution vers les appareils voisins via relay
+        // Paquet de résolution vers les appareils voisins via relay.
+        // Position réelle uniquement (fix courant ou dernière position réelle).
         var resolvedPacket = {
             type: 'MARSEL_EMERGENCY_RESOLVED',
             version: 1,
@@ -817,8 +992,8 @@ function deactivateEmergency() {
             emergencyId: MARSEL.emergencyId,
             userId: savedEmergency.userId,
             pseudo: pseudo,
-            lat: MARSEL.currentLat,
-            lng: MARSEL.currentLng,
+            lat: finPos ? finPos.lat : null,
+            lng: finPos ? finPos.lng : null,
             timestamp: Date.now(),
             contacts: savedEmergency.contacts || [],
             hopCount: 0,
@@ -987,6 +1162,12 @@ function sendCascadeSms(kind, savedEmergency, message, hasAudio) {
     var quality = getNetworkQuality();
     var contacts = (savedEmergency.contacts || []).filter(function (c) { return c.mobile; });
 
+    // Position réelle uniquement pour le paquet relayé (jamais de défaut)
+    var scPos = getRealPosition();
+    if (!scPos && isFinite(savedEmergency.lat) && isFinite(savedEmergency.lng)) {
+        scPos = { lat: savedEmergency.lat, lng: savedEmergency.lng };
+    }
+
     if (quality === 'MOBILE_STABLE' || quality === 'WIFI_STABLE') {
         contacts.forEach(function (c) {
             if (window.AndroidBridge && typeof AndroidBridge.sendEmergencySMS === 'function') {
@@ -1011,8 +1192,8 @@ function sendCascadeSms(kind, savedEmergency, message, hasAudio) {
             emergencyId: eId,
             userId: savedEmergency.userId,
             pseudo: savedEmergency.pseudo || 'Utilisateur',
-            lat: MARSEL.currentLat,
-            lng: MARSEL.currentLng,
+            lat: scPos ? scPos.lat : null,
+            lng: scPos ? scPos.lng : null,
             timestamp: Date.now(),
             contacts: savedEmergency.contacts || [],
             audio: hasAudio ? '1' : '0',
@@ -1345,12 +1526,17 @@ function triggerEmergencyTimeout() {
     if (!savedEmergency) return;
 
     var pseudo = savedEmergency.pseudo || 'Utilisateur';
-    var mapsLink = 'https://maps.google.com/?q=' + MARSEL.currentLat + ',' + MARSEL.currentLng;
+    // Position réelle uniquement (fix courant ou dernière position réelle de l'alerte)
+    var toPos = getRealPosition();
+    if (!toPos && isFinite(savedEmergency.lat) && isFinite(savedEmergency.lng)) {
+        toPos = { lat: savedEmergency.lat, lng: savedEmergency.lng };
+    }
+    var posLine = toPos ? '\nPosition : https://maps.google.com/?q=' + toPos.lat + ',' + toPos.lng : '';
     var settings = JSON.parse(localStorage.getItem('marsel_settings') || '{}');
     var hasAudio = !!settings.audio;
     var audioMention = hasAudio ? '\nUn enregistrement audio est en cours.' : '';
     var msg = '⚠️ ALERTE MARSEL TOUJOURS EN COURS depuis 20 min. ' +
-        pseudo + ' n\'a pas désactivé son alerte.\nPosition : ' + mapsLink + audioMention;
+        pseudo + ' n\'a pas désactivé son alerte.' + posLine + audioMention;
 
     mLog('J', 'NET', 'Timer 20min ÉCHU — envoi SMS "toujours en cours"');
     sendCascadeSms('TIMEOUT', savedEmergency, msg, hasAudio);
