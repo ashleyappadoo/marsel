@@ -177,6 +177,13 @@ object MarselProtocol {
     // ── Expiration des pairs Marsel (Section 2) ─────────────────────────
     fun isPeerExpired(lastSeenMs: Long, nowMs: Long, ttlMs: Long = 60_000L): Boolean =
         nowMs - lastSeenMs > ttlMs
+
+    // Cible de connect() : premier appareil visible qui est AUSSI un pair Marsel
+    // confirmé. Retourne null si aucun (→ pas de connect vers un non-Marsel, B1).
+    fun selectConnectTarget(
+        visibleAddresses: List<String>,
+        marselAddresses: Set<String>
+    ): String? = visibleAddresses.firstOrNull { marselAddresses.contains(it) }
 }
 
 /**
