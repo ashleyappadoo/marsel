@@ -463,6 +463,10 @@ class MainActivity : ComponentActivity() {
             != PackageManager.PERMISSION_GRANTED
         ) return
 
+        // I1 : retirer les listeners précédents avant d'en enregistrer de nouveaux,
+        // sinon chaque onResume empile un LocationListener → N callbacks par fix GPS.
+        stopLocationUpdatesInternal()
+
         val listener = object : LocationListener {
             override fun onLocationChanged(location: Location) {
                 lastLat = location.latitude
@@ -1062,8 +1066,17 @@ class MainActivity : ComponentActivity() {
         kickDiscoveryNow()
     }
 
+    // I3 : purge les paquets en file (positions/alerte) d'une urgence résolue,
+    // pour ne pas rejouer de vieilles positions aux pairs qui se connectent après.
+    private fun purgePendingForEmergency(emergencyId: String) {
+        synchronized(pendingRelayMessages) {
+            pendingRelayMessages.removeAll { it.contains(""""emergencyId":"$emergencyId"""") }
+        }
+    }
+
     /** Retire les services relayés d'une urgence résolue (appelé à la réception d'un R). */
     private fun removeRelayedForEmergency(emergencyId: String) {
+        purgePendingForEmergency(emergencyId)
         val toRemove = relayedEmergencyIds.filterValues { it == emergencyId }.keys
         for (msgId in toRemove) {
             // Ne retirer que les alertes E — la résolution R relayée doit continuer
@@ -1285,6 +1298,7 @@ class MainActivity : ComponentActivity() {
                         // Emergency resolved: retirer NOTRE alerte + position, diffuser R
                         // pendant 2 min. On ne touche PAS aux services relayés (C3).
                         val msgId = record["i"] ?: ""
+                        record["e"]?.let { purgePendingForEmergency(it) }  // I3
                         activeAlertServiceInfo?.let { safeRemoveLocalService(it, "resolved-alert") }
                         activePositionServiceInfo?.let { safeRemoveLocalService(it, "resolved-pos") }
                         activeEmergencyRecord = null
@@ -1379,20 +1393,16 @@ class MainActivity : ComponentActivity() {
     // =========================================================================
     // Helper: JSON extraction without external library
     // =========================================================================
-    private fun extractJsonString(json: String, key: String): String? {
-        val pattern = """"$key"\s*:\s*"([^"]*)"""".toRegex()
-        return pattern.find(json)?.groupValues?.getOrNull(1)
-    }
+    // I4 : délégué au protocole pur, qui tolère les guillemets/antislashs
+    // échappés dans les valeurs (un pseudo contenant " ne corrompt plus l'extraction).
+    private fun extractJsonString(json: String, key: String): String? =
+        MarselProtocol.extractJsonString(json, key)
 
-    private fun extractJsonInt(json: String, key: String): Int? {
-        val pattern = """"$key"\s*:\s*(\d+)""".toRegex()
-        return pattern.find(json)?.groupValues?.getOrNull(1)?.toIntOrNull()
-    }
+    private fun extractJsonInt(json: String, key: String): Int? =
+        MarselProtocol.extractJsonInt(json, key)
 
-    private fun extractJsonNumber(json: String, key: String): Double? {
-        val pattern = """"$key"\s*:\s*(-?\d+(?:\.\d+)?)""".toRegex()
-        return pattern.find(json)?.groupValues?.getOrNull(1)?.toDoubleOrNull()
-    }
+    private fun extractJsonNumber(json: String, key: String): Double? =
+        MarselProtocol.extractJsonNumber(json, key)
 
     // =========================================================================
     // In-app log relay (sends log lines to the JS debug overlay)

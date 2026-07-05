@@ -4,10 +4,10 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no" />
   <title>Marsel</title>
-  <link rel="preconnect" href="https://fonts.googleapis.com" />
-  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
-  <link href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;600;700;800;900&display=swap" rel="stylesheet" />
-  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <!-- I2 : Leaflet embarqué dans assets/ (plus de CDN) — la carte et le
+       marqueur d'alerte fonctionnent hors connexion, cœur du MRN. Les polices
+       distantes sont supprimées : fallback système via style.css. -->
+  <link rel="stylesheet" href="leaflet.css" />
   <link rel="stylesheet" href="style.css" />
   <style>
     /* Mode bar */
@@ -780,7 +780,7 @@
 .log-chip.active { background:#1A35C8;color:white;border-color:#1A35C8; }
 </style>
 
-<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="leaflet.js"></script>
 <script src="config.js"></script>
 <script src="script.js"></script>
 </body>
