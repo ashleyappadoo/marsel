@@ -1172,17 +1172,10 @@ window.onRelayMessageReceived = function (jsonStr) {
         MARSEL.leafletMap.setView([parseFloat(data.lat), parseFloat(data.lng)], 15);
     }
 
-    // Relay further to phones out of direct range (hop forwarding).
-    // Never re-send via internet here: the sender's phone already sent SMS to contacts,
-    // and the Kotlin layer (forwardEmergencyToContacts) already handles any SMS forwarding
-    // needed from this device. Sending via internet here would double-SMS the contacts.
-    var maxHops = (window.MARSEL_CONFIG && MARSEL_CONFIG.RELAY_HOP_LIMIT) || 10;
-    if ((data.hopCount || 0) < maxHops) {
-        data.hopCount = (data.hopCount || 0) + 1;
-        if (window.AndroidBridge && typeof AndroidBridge.sendEmergencyViaRelay === 'function') {
-            try { AndroidBridge.sendEmergencyViaRelay(JSON.stringify(data)); } catch (e) {}
-        }
-    }
+    // C4 : le hop-forwarding est la propriété EXCLUSIVE du Kotlin
+    // (processRelayMessage → registerRelayedService). Le JS ne fait QUE
+    // l'affichage. Re-propager ici créait un double envoi (Kotlin + JS)
+    // avec des hopCount divergents et du churn de services DNS-SD.
 };
 
 /* ── Tracking GPS continu pendant l'urgence ── */
@@ -1285,13 +1278,9 @@ function handlePositionUpdate(data) {
         status: 'ACTIVE_TRACKING'
     }).catch(function () {});
 
-    // Relayer la mise à jour aux autres pairs si nécessaire
-    if ((data.hopCount || 0) < (data.maxHops || 10)) {
-        data.hopCount = (data.hopCount || 0) + 1;
-        if (window.AndroidBridge && typeof AndroidBridge.sendEmergencyViaRelay === 'function') {
-            try { AndroidBridge.sendEmergencyViaRelay(JSON.stringify(data)); } catch (e) {}
-        }
-    }
+    // C4 : pas de re-propagation JS. Les positions relayées ne font qu'un seul
+    // hop DNS-SD côté Kotlin ; re-diffuser le tracking de proche en proche
+    // saturerait le stack WiFi P2P.
 }
 
 /* Fin d'alerte reçue via relay d'un autre utilisateur */
@@ -1314,13 +1303,8 @@ function handleEmergencyResolved(data) {
     }
     showToast('✅ ' + escapeHtml(data.pseudo || 'Utilisateur') + ' est en sécurité');
 
-    // Relayer la résolution aux autres pairs
-    if ((data.hopCount || 0) < (data.maxHops || 5)) {
-        data.hopCount = (data.hopCount || 0) + 1;
-        if (window.AndroidBridge && typeof AndroidBridge.sendEmergencyViaRelay === 'function') {
-            try { AndroidBridge.sendEmergencyViaRelay(JSON.stringify(data)); } catch (e) {}
-        }
-    }
+    // C4 : la re-propagation de la résolution est gérée par le Kotlin
+    // (registerRelayedService sur réception d'un R). Le JS ne fait qu'afficher.
 }
 
 /* Legacy WiFi message handler (port 8888 direct send) */

@@ -99,14 +99,62 @@ class MainActivity : ComponentActivity() {
     // Rate-limit position broadcasts: max 1 per 8s (interval fires every 10s)
     private var lastPositionBroadcastMs: Long = 0
 
-    // DNS-SD connection-less relay: periodic re-arm of service discovery
+    // A2 : runnable différé qui retire le service marsel-res après 2 min.
+    // Tracké pour être annulé/exécuté immédiatement si une nouvelle urgence démarre.
+    private var resolvedClearRunnable: Runnable? = null
+
+    // C3/C4 : alertes RELAYÉES (urgences d'autres téléphones re-diffusées par nous).
+    // Instances de service distinctes (marsel-alert-<suffix>) : elles coexistent
+    // avec notre propre alerte sans jamais l'écraser. Le hop-forwarding est la
+    // propriété EXCLUSIVE du Kotlin (le JS ne fait que l'affichage).
+    private val relayedRecords = ConcurrentHashMap<String, Map<String, String>>()      // messageId → record
+    private val relayedServiceInfos = ConcurrentHashMap<String, WifiP2pDnsSdServiceInfo>() // messageId → info
+    private val relayedEmergencyIds = ConcurrentHashMap<String, String>()              // messageId → emergencyId
+
+    // A3/3f : watchdog — timestamp du dernier événement DNS-SD reçu
+    @Volatile private var lastDnsSdEventMs = System.currentTimeMillis()
+
+    // A4/3a : une alerte distante active (E/P reçu non résolu) force le mode 8s
+    @Volatile private var remoteAlertActiveUntilMs = 0L
+
+    // E1/3c : dédup persistée (SharedPreferences), survit au restart de l'app
+    private val dedupLedger by lazy {
+        DedupLedger(object : DedupLedger.KeyValueStore {
+            private val prefs = getSharedPreferences("marsel_dedup", MODE_PRIVATE)
+            override fun all(): Map<String, Long> =
+                prefs.all.entries.mapNotNull { (k, v) -> (v as? Long)?.let { k to it } }.toMap()
+            override fun put(key: String, value: Long) { prefs.edit().putLong(key, value).apply() }
+            override fun remove(key: String) { prefs.edit().remove(key).apply() }
+        })
+    }
+
+    // D2 : références serveurs pour arrêt propre dans onDestroy
+    @Volatile private var serversRunning = true
+    private var relayServerSocket: ServerSocket? = null
+    private var legacyServerSocket: ServerSocket? = null
+
+    // DNS-SD connection-less relay: re-arm périodique adaptatif (A4/3a)
+    // 8s quand une alerte est active (émise OU reçue non résolue), 25s en veille.
     private val p2pHandler = Handler(Looper.getMainLooper())
     private val rediscoverRunnable = object : Runnable {
         override fun run() {
             purgeExpiredMarselPeers()
+            purgeExpiredRelayedServices()
+            watchdogCheck()
             restartServiceDiscovery()
-            p2pHandler.postDelayed(this, 20_000)
+            p2pHandler.postDelayed(this, if (isAlertActive()) 8_000L else 25_000L)
         }
+    }
+
+    private fun isAlertActive(): Boolean =
+        activeEmergencyRecord != null ||
+            relayedRecords.isNotEmpty() ||
+            System.currentTimeMillis() < remoteAlertActiveUntilMs
+
+    // Bascule veille→actif immédiate (3a) : relance le cycle sans attendre
+    private fun kickDiscoveryNow() {
+        p2pHandler.removeCallbacks(rediscoverRunnable)
+        p2pHandler.post(rediscoverRunnable)
     }
 
     // -------------------------------------------------------------------------
@@ -182,8 +230,10 @@ class MainActivity : ComponentActivity() {
         if (notGranted.isNotEmpty()) requestPermissionLauncher.launch(notGranted.toTypedArray())
 
         // --- WiFi P2P setup ---
+        // A1/3e : ChannelListener obligatoire — un channel mort sans listener
+        // rend le relay sourd ET muet en silence jusqu'au restart de l'app.
         wifiP2pManager = getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager
-        wifiP2pChannel = wifiP2pManager.initialize(this, mainLooper, null)
+        wifiP2pChannel = wifiP2pManager.initialize(this, mainLooper) { onChannelLost() }
         wifiP2pReceiver = WifiP2pBroadcastReceiver()
 
         // DNS-SD listeners must be attached once before any discoverServices call.
@@ -277,6 +327,12 @@ class MainActivity : ComponentActivity() {
         super.onDestroy()
         p2pHandler.removeCallbacksAndMessages(null)
         stopLocationUpdatesInternal()
+        // D2 : arrêt propre des serveurs — sinon la recréation d'activité
+        // laisse un serveur zombie lié à l'ancienne instance (BindException
+        // silencieuse pour le nouveau, fuite mémoire pour l'ancien).
+        serversRunning = false
+        try { relayServerSocket?.close() } catch (e: Exception) { Log.v(TAG, "close relay server: ${e.message}") }
+        try { legacyServerSocket?.close() } catch (e: Exception) { Log.v(TAG, "close legacy server: ${e.message}") }
         try {
             val cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
             val cameraId = cameraManager.cameraIdList.firstOrNull()
@@ -536,9 +592,10 @@ class MainActivity : ComponentActivity() {
         thread {
             try {
                 val server = ServerSocket(8890)
+                relayServerSocket = server
                 Log.d(TAG, "Relay server listening on port 8890")
-                while (true) {
-                    val client = server.accept()
+                while (serversRunning) {
+                    val client = try { server.accept() } catch (e: Exception) { break }
                     thread {
                         try {
                             val reader = BufferedReader(InputStreamReader(client.getInputStream()))
@@ -577,11 +634,10 @@ class MainActivity : ComponentActivity() {
             }
             val msgType = extractJsonString(json, "type") ?: "?"
 
-            // Duplicate prevention
+            // Dédup niveau 1 : set en RAM (rapide, durée de vie de la session)
             synchronized(processedMessageIds) {
                 if (processedMessageIds.contains(messageId)) {
-                    logToJs("RELAY", "DUP $msgType $messageId — dropped")
-                    return
+                    return  // silencieux : les TXT records actifs sont re-reçus à chaque cycle
                 }
                 processedMessageIds.add(messageId)
                 if (processedMessageIds.size > 1000) {
@@ -589,8 +645,27 @@ class MainActivity : ComponentActivity() {
                     repeat(100) { if (iter.hasNext()) { iter.next(); iter.remove() } }
                 }
             }
+            // Dédup niveau 2 (E1/3c) : persistée, survit à un restart de l'app
+            // pendant une alerte — empêche re-notification et re-SMS.
+            if (dedupLedger.checkAndMark("msg", messageId)) {
+                logToJs("RELAY", "DUP (persisté) $msgType $messageId — dropped")
+                return
+            }
 
             logToJs("RELAY", "RECV $msgType id=$messageId")
+
+            val hopCount = extractJsonInt(json, "hopCount") ?: 0
+            val maxHops = extractJsonInt(json, "maxHops") ?: 10
+
+            // Paquets de demande de SMS relayé (F/T) : traités entièrement en
+            // natif, JAMAIS remontés au JS — le téléphone relais ne doit pas
+            // afficher à qui les SMS sont envoyés.
+            if (msgType == MarselProtocol.TYPE_RESOLVED_SMS_REQUEST ||
+                msgType == MarselProtocol.TYPE_TIMEOUT_SMS_REQUEST
+            ) {
+                handleSmsRequestPacket(json, msgType, messageId, hopCount, maxHops)
+                return
+            }
 
             // Notify JS to display on map (use escapeJs for safe double-quoted string)
             runOnUiThread {
@@ -600,43 +675,103 @@ class MainActivity : ComponentActivity() {
                 )
             }
 
-            val hopCount = extractJsonInt(json, "hopCount") ?: 0
-            val maxHops = extractJsonInt(json, "maxHops") ?: 10
-
             if (hopCount >= maxHops) {
                 logToJs("RELAY", "DROP $messageId: maxHops=$maxHops reached")
                 return
             }
 
             // Show system notification only for actual emergency (not position/resolved)
-            if (msgType == "MARSEL_EMERGENCY") {
+            if (msgType == MarselProtocol.TYPE_EMERGENCY) {
                 val pseudo = extractJsonString(json, "pseudo") ?: "Utilisateur"
                 logToJs("RELAY", "NOTIF: showing system notification for $pseudo")
                 showNotificationDirect("🚨 Alerte Marsel", "$pseudo a declenche une alerte d'urgence a proximite")
             }
 
-            val netType = getNetworkTypeDirect()
-            if (netType == "WIFI" || netType == "MOBILE") {
-                // Only forward to contacts via SMS for actual emergency alerts
-                // (not for position updates or resolved messages — that would spam contacts)
-                if (msgType == "MARSEL_EMERGENCY") {
-                    forwardEmergencyToContacts(json)
+            val updatedJson = """"hopCount"\s*:\s*$hopCount""".toRegex()
+                .replace(json, "\"hopCount\":${hopCount + 1}")
+
+            // SMS aux proches : uniquement pour une vraie alerte, avec dédup
+            // persistée smsHandled (F3) — le réseau est vérifié dans la fonction.
+            if (msgType == MarselProtocol.TYPE_EMERGENCY) {
+                forwardEmergencyToContacts(json)
+            }
+
+            // C4 : hop-forwarding — propriété EXCLUSIVE du Kotlin.
+            // E et R sont re-diffusés en DNS-SD (instances distinctes, C3) pour
+            // atteindre les téléphones hors de portée de l'émetteur.
+            // P (position) ne fait qu'un seul hop DNS-SD : re-diffuser le tracking
+            // de proche en proche saturerait le stack sans bénéfice.
+            when (msgType) {
+                MarselProtocol.TYPE_EMERGENCY, MarselProtocol.TYPE_RESOLVED -> {
+                    registerRelayedService(updatedJson)
                 }
-            } else {
-                // No internet — increment hop and relay further
-                // Use a pattern that tolerates spaces around the colon (robustness)
-                val updatedJson = """"hopCount"\s*:\s*$hopCount""".toRegex()
-                    .replace(json, "\"hopCount\":${hopCount + 1}")
-                synchronized(pendingRelayMessages) {
-                    pendingRelayMessages.add(updatedJson)
-                }
-                // Send to GO if we're a client
-                groupOwnerAddress?.let { addr ->
-                    if (!isGroupOwner) sendRelayToPeer(addr, updatedJson)
-                }
+            }
+
+            // Canal socket secondaire (file + push vers le GO si connecté)
+            synchronized(pendingRelayMessages) {
+                pendingRelayMessages.add(updatedJson)
+            }
+            groupOwnerAddress?.let { addr ->
+                if (!isGroupOwner) sendRelayToPeer(addr, updatedJson)
             }
         } catch (e: Exception) {
             Log.e("MARSEL_RELAY", "processRelayMessage: ${e.message}")
+        }
+    }
+
+    // =========================================================================
+    // Paquets F (fin d'alerte) / T (timeout 20 min) — SMS relayé silencieux
+    // =========================================================================
+    // Le téléphone relais avec réseau validé envoie les SMS À LA PLACE de
+    // l'émetteur hors-ligne, puis s'arrête. Sans réseau, il propage plus loin.
+    // Aucune UI, aucun historique : tout reste en natif.
+    private fun handleSmsRequestPacket(
+        json: String,
+        msgType: String,
+        messageId: String,
+        hopCount: Int,
+        maxHops: Int
+    ) {
+        val quality = detectNetworkQuality()
+        if (quality != "NONE") {
+            // Dédup smsHandled persistée : un même paquet ne déclenche les SMS
+            // qu'UNE seule fois, même après restart de l'app.
+            if (dedupLedger.checkAndMark("sms", messageId)) {
+                logToJs("RELAY", "SMS-REQ $messageId déjà traité — skip")
+                return
+            }
+            val pseudo = extractJsonString(json, "pseudo") ?: "Utilisateur"
+            val lat = extractJsonNumber(json, "lat")
+            val lng = extractJsonNumber(json, "lng")
+            val mapsLink = if (lat != null && lng != null) {
+                "https://maps.google.com/?q=$lat,$lng"
+            } else "Position inconnue"
+            val audioMention = if (extractJsonString(json, "audio") == "1") {
+                "\nUn enregistrement audio de l'alerte est disponible."
+            } else ""
+            val smsMsg = if (msgType == MarselProtocol.TYPE_TIMEOUT_SMS_REQUEST) {
+                "⚠️ ALERTE MARSEL TOUJOURS EN COURS depuis 20 min. $pseudo n'a pas désactivé son alerte.\nPosition : $mapsLink" +
+                    (if (extractJsonString(json, "audio") == "1") "\nUn enregistrement audio est en cours." else "")
+            } else {
+                "✅ FIN D'ALERTE MARSEL\n$pseudo est en sécurité.\nDernière position connue : $mapsLink$audioMention"
+            }
+            val mobiles = MarselProtocol.extractContactMobiles(json)
+            logToJs("RELAY", "SMS-REQ $msgType : envoi de ${mobiles.size} SMS à la place de l'émetteur")
+            mobiles.forEach { mobile -> sendSMSDirect(mobile, smsMsg) }
+        } else {
+            // Pas de réseau validé ici non plus : propager plus loin
+            if (hopCount >= maxHops) {
+                logToJs("RELAY", "SMS-REQ $messageId: maxHops atteint, drop")
+                return
+            }
+            val updatedJson = """"hopCount"\s*:\s*$hopCount""".toRegex()
+                .replace(json, "\"hopCount\":${hopCount + 1}")
+            logToJs("RELAY", "SMS-REQ $msgType : pas de réseau ici, propagation hop=${hopCount + 1}")
+            registerRelayedService(updatedJson)
+            synchronized(pendingRelayMessages) { pendingRelayMessages.add(updatedJson) }
+            groupOwnerAddress?.let { addr ->
+                if (!isGroupOwner) sendRelayToPeer(addr, updatedJson)
+            }
         }
     }
 
@@ -645,31 +780,42 @@ class MainActivity : ComponentActivity() {
     // =========================================================================
     private fun sendRelayToPeer(address: String, messageJson: String) {
         thread {
-            var socket: Socket? = null
-            try {
-                socket = Socket()
-                // Explicit connect timeout prevents indefinite thread block on unreachable hosts
-                socket.connect(java.net.InetSocketAddress(address, 8890), 4000)
-                socket.soTimeout = 10_000
-                val writer = OutputStreamWriter(socket.getOutputStream())
-                val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
+            // D1/3d : sur WiFi Direct la première connexion échoue souvent
+            // (ARP pas résolu, GO pas prêt) — 1 essai + 2 retries espacés de 2s.
+            var lastError: Exception? = null
+            for (attempt in 1..3) {
+                var socket: Socket? = null
+                try {
+                    socket = Socket()
+                    // Explicit connect timeout prevents indefinite thread block on unreachable hosts
+                    socket.connect(java.net.InetSocketAddress(address, 8890), 4000)
+                    socket.soTimeout = 10_000
+                    val writer = OutputStreamWriter(socket.getOutputStream())
+                    val reader = BufferedReader(InputStreamReader(socket.getInputStream()))
 
-                // Send our message (empty string = pull-only)
-                writer.write(messageJson + "\n")
-                writer.flush()
+                    // Send our message (empty string = pull-only)
+                    writer.write(messageJson + "\n")
+                    writer.flush()
 
-                // Read any relay messages the peer (GO) sends back
-                var line = reader.readLine()
-                while (line != null) {
-                    if (line.isNotBlank()) processRelayMessage(line)
-                    line = reader.readLine()
+                    // Read any relay messages the peer (GO) sends back
+                    var line = reader.readLine()
+                    while (line != null) {
+                        if (line.isNotBlank()) processRelayMessage(line)
+                        line = reader.readLine()
+                    }
+                    Log.d("MARSEL_RELAY", "Relay exchange with $address complete (attempt $attempt)")
+                    return@thread
+                } catch (e: Exception) {
+                    lastError = e
+                    Log.w("MARSEL_RELAY", "Relay to $address attempt $attempt/3 failed: ${e.message}")
+                    if (attempt < 3) {
+                        try { Thread.sleep(2_000) } catch (ie: InterruptedException) { return@thread }
+                    }
+                } finally {
+                    try { socket?.close() } catch (ex: Exception) { Log.v(TAG, "close: ${ex.message}") }
                 }
-                Log.d("MARSEL_RELAY", "Relay exchange with $address complete")
-            } catch (e: Exception) {
-                Log.e("MARSEL_RELAY", "Relay to $address failed: ${e.message}")
-            } finally {
-                try { socket?.close() } catch (ex: Exception) { Log.v(TAG, "close: ${ex.message}") }
             }
+            Log.e("MARSEL_RELAY", "Relay to $address abandoned after 3 attempts: ${lastError?.message}")
         }
     }
 
@@ -718,6 +864,7 @@ class MainActivity : ComponentActivity() {
         wifiP2pManager.setDnsSdResponseListeners(
             wifiP2pChannel,
             { instanceName, registrationType, device ->
+                lastDnsSdEventMs = System.currentTimeMillis()  // watchdog 3f
                 Log.d(TAG, "DNS-SD service found: $instanceName ($registrationType) from ${device.deviceName}")
                 if (registrationType.contains("_marsel._tcp", ignoreCase = true) ||
                     instanceName.startsWith("marsel", ignoreCase = true)
@@ -726,6 +873,7 @@ class MainActivity : ComponentActivity() {
                 }
             },
             { fullDomain, txtRecord, device ->
+                lastDnsSdEventMs = System.currentTimeMillis()  // watchdog 3f
                 if (fullDomain.contains("marsel", ignoreCase = true)) {
                     Log.d(TAG, "Marsel TXT record from ${device.deviceName}: $txtRecord")
                     markMarselPeer(device)
@@ -733,6 +881,185 @@ class MainActivity : ComponentActivity() {
                 }
             }
         )
+    }
+
+    // =========================================================================
+    // A1/3e — Recovery du channel WiFi P2P
+    // =========================================================================
+    private fun onChannelLost() {
+        logToJs("P2P", "CHANNEL PERDU — réinitialisation complète du WiFi P2P")
+        try {
+            wifiP2pChannel = wifiP2pManager.initialize(this, mainLooper) { onChannelLost() }
+            setupDnsSdListeners()
+            reRegisterActiveServices()
+            kickDiscoveryNow()
+        } catch (e: Exception) {
+            Log.e(TAG, "onChannelLost recovery failed: ${e.message}")
+        }
+    }
+
+    // =========================================================================
+    // A3/3f — Watchdog : silence DNS-SD > 60s alors que le P2P est actif
+    // =========================================================================
+    private fun watchdogCheck() {
+        if (!wifiP2pEnabled) return
+        val silentMs = System.currentTimeMillis() - lastDnsSdEventMs
+        if (silentMs > 60_000) {
+            lastDnsSdEventMs = System.currentTimeMillis()
+            fullServiceRecovery("aucun événement DNS-SD depuis ${silentMs / 1000}s")
+        }
+    }
+
+    private fun fullServiceRecovery(reason: String) {
+        logToJs("DNS-SD", "RECOVERY ($reason)")
+        try {
+            wifiP2pManager.clearServiceRequests(wifiP2pChannel, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() = step2()
+                override fun onFailure(reason: Int) = step2()
+                private fun step2() {
+                    try {
+                        wifiP2pManager.clearLocalServices(wifiP2pChannel, object : WifiP2pManager.ActionListener {
+                            override fun onSuccess() = finish()
+                            override fun onFailure(reason: Int) = finish()
+                            private fun finish() {
+                                reRegisterActiveServices()
+                                addServiceRequestAndDiscover()
+                            }
+                        })
+                    } catch (e: Exception) {
+                        Log.e(TAG, "fullServiceRecovery step2: ${e.message}")
+                    }
+                }
+            })
+        } catch (e: Exception) {
+            Log.e(TAG, "fullServiceRecovery: ${e.message}")
+        }
+    }
+
+    // Ré-enregistre tous les services actifs (après recovery ou channel perdu) :
+    // alerte locale, position, et alertes relayées.
+    private fun reRegisterActiveServices() {
+        activeEmergencyRecord?.let { rec ->
+            val info = WifiP2pDnsSdServiceInfo.newInstance(
+                MarselProtocol.alertInstanceName(rec["i"] ?: "x"), "_marsel._tcp", rec
+            )
+            registerAlertService(info)
+        }
+        activePositionRecord?.let { rec ->
+            val info = WifiP2pDnsSdServiceInfo.newInstance(
+                MarselProtocol.POSITION_INSTANCE_NAME, "_marsel._tcp", rec
+            )
+            activePositionServiceInfo = info
+            addPosServiceSafe(info)
+        }
+        for ((msgId, rec) in relayedRecords) {
+            val info = buildRelayedServiceInfo(msgId, rec) ?: continue
+            relayedServiceInfos[msgId] = info
+            addLocalServiceSafe(info, "relayed-${msgId.takeLast(8)}")
+        }
+    }
+
+    // =========================================================================
+    // C3/C4 — Services relayés (alertes/résolutions d'autres téléphones)
+    // =========================================================================
+    private fun buildRelayedServiceInfo(msgId: String, rec: Map<String, String>): WifiP2pDnsSdServiceInfo? {
+        val instanceName = when (rec["y"]) {
+            MarselProtocol.SHORT_EMERGENCY -> MarselProtocol.alertInstanceName(msgId)
+            MarselProtocol.SHORT_RESOLVED -> MarselProtocol.resolvedInstanceName(msgId)
+            MarselProtocol.SHORT_RESOLVED_SMS_REQUEST,
+            MarselProtocol.SHORT_TIMEOUT_SMS_REQUEST -> MarselProtocol.smsReqInstanceName(msgId)
+            else -> return null
+        }
+        return WifiP2pDnsSdServiceInfo.newInstance(instanceName, "_marsel._tcp", rec)
+    }
+
+    /** Re-diffuse un paquet reçu (hop déjà incrémenté) sous sa propre instance de service. */
+    private fun registerRelayedService(json: String) {
+        val shortType = MarselProtocol.shortTypeOf(
+            MarselProtocol.extractJsonString(json, "type") ?: return
+        ) ?: return
+        val record = buildTxtRecord(shortType, json) ?: return
+        val msgId = record["i"] ?: return
+
+        // Jamais re-diffuser notre propre alerte sous forme relayée
+        if (activeEmergencyRecord?.get("i") == msgId) return
+        if (relayedRecords.containsKey(msgId)) return
+        if (relayedRecords.size >= 5) {
+            logToJs("DNS-SD", "RELAYED: cap de 5 services relayés atteint, skip $msgId")
+            return
+        }
+
+        relayedRecords[msgId] = record
+        record["e"]?.let { relayedEmergencyIds[msgId] = it }
+        val info = buildRelayedServiceInfo(msgId, record) ?: return
+        relayedServiceInfos[msgId] = info
+
+        runOnUiThread {
+            addLocalServiceSafe(info, "relayed-${msgId.takeLast(8)}")
+        }
+        logToJs("DNS-SD", "RELAYED: re-diffusion ${record["y"]} $msgId (hop=${record["h"]})")
+        kickDiscoveryNow()
+    }
+
+    /** Retire les services relayés d'une urgence résolue (appelé à la réception d'un R). */
+    private fun removeRelayedForEmergency(emergencyId: String) {
+        val toRemove = relayedEmergencyIds.filterValues { it == emergencyId }.keys
+        for (msgId in toRemove) {
+            // Ne retirer que les alertes E — la résolution R relayée doit continuer
+            // à se diffuser pour nettoyer les cartes des téléphones distants.
+            if (relayedRecords[msgId]?.get("y") == MarselProtocol.SHORT_EMERGENCY) {
+                dropRelayedService(msgId, "urgence résolue")
+            }
+        }
+    }
+
+    /** Expiration des services relayés : E après 10 min, R/F/T après 3 min. */
+    private fun purgeExpiredRelayedServices() {
+        val now = System.currentTimeMillis()
+        for ((msgId, rec) in relayedRecords) {
+            val ts = rec["s"]?.toLongOrNull() ?: continue
+            val ttl = if (rec["y"] == MarselProtocol.SHORT_EMERGENCY) 10 * 60_000L else 3 * 60_000L
+            if (now - ts > ttl) dropRelayedService(msgId, "expiré")
+        }
+    }
+
+    private fun dropRelayedService(msgId: String, why: String) {
+        relayedRecords.remove(msgId)
+        relayedEmergencyIds.remove(msgId)
+        val info = relayedServiceInfos.remove(msgId) ?: return
+        runOnUiThread { safeRemoveLocalService(info, "relayed-$why") }
+    }
+
+    // =========================================================================
+    // Helpers add/remove service avec log — toujours appelés sur le main thread
+    // =========================================================================
+    private fun addLocalServiceSafe(info: WifiP2pDnsSdServiceInfo, label: String, onOk: (() -> Unit)? = null) {
+        try {
+            wifiP2pManager.addLocalService(wifiP2pChannel, info, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {
+                    logToJs("DNS-SD", "$label registered ✓")
+                    onOk?.invoke()
+                }
+                override fun onFailure(r: Int) { logToJs("DNS-SD", "$label register FAILED: $r") }
+            })
+        } catch (ex: SecurityException) {
+            logToJs("DNS-SD", "$label denied: ${ex.message}")
+        }
+    }
+
+    private fun safeRemoveLocalService(info: WifiP2pDnsSdServiceInfo, label: String, onDone: (() -> Unit)? = null) {
+        try {
+            wifiP2pManager.removeLocalService(wifiP2pChannel, info, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() { onDone?.invoke() }
+                override fun onFailure(r: Int) {
+                    logToJs("DNS-SD", "removeLocalService $label failed: $r")
+                    onDone?.invoke()
+                }
+            })
+        } catch (ex: Exception) {
+            logToJs("DNS-SD", "removeLocalService $label error: ${ex.message}")
+            onDone?.invoke()
+        }
     }
 
     // -------------------------------------------------------------------------
@@ -784,79 +1111,41 @@ class MainActivity : ComponentActivity() {
 
     private fun handleServiceTxtRecord(record: Map<String, String?>) {
         try {
-            val msgId = record["i"] ?: run { logToJs("DNS-SD", "TXT record missing 'i' field"); return }
-            val shortType = record["y"] ?: run { logToJs("DNS-SD", "TXT record missing 'y' field"); return }
-            val type = when (shortType) {
-                "E" -> "MARSEL_EMERGENCY"
-                "P" -> "MARSEL_POSITION_UPDATE"
-                "R" -> "MARSEL_EMERGENCY_RESOLVED"
-                else -> { logToJs("DNS-SD", "TXT record unknown type: $shortType"); return }
+            val json = MarselProtocol.txtRecordToJson(record, System.currentTimeMillis()) ?: run {
+                logToJs("DNS-SD", "TXT record invalide/incomplet: $record")
+                return
             }
-            val pseudo = (record["p"] ?: "Utilisateur").replace("\\", "").replace("\"", "")
-            val lat = record["a"]?.toDoubleOrNull() ?: run { logToJs("DNS-SD", "TXT record missing lat"); return }
-            val lng = record["o"]?.toDoubleOrNull() ?: run { logToJs("DNS-SD", "TXT record missing lng"); return }
-            val ts = record["s"]?.toLongOrNull() ?: System.currentTimeMillis()
-            val hop = record["h"]?.toIntOrNull() ?: 0
-            val emergencyId = record["e"] ?: msgId
+            val type = MarselProtocol.extractJsonString(json, "type") ?: return
+            val pseudo = MarselProtocol.extractJsonString(json, "pseudo") ?: "?"
+            val hop = MarselProtocol.extractJsonInt(json, "hopCount") ?: 0
+            val emergencyId = MarselProtocol.extractJsonString(json, "emergencyId")
+            logToJs("DNS-SD", "RX TXT type=$type pseudo=$pseudo hop=$hop")
 
-            // Décode le champ "c" : numéros mobiles séparés par virgule pour la chaîne relay hors-ligne.
-            // Le Téléphone B (avec réseau) les utilise pour envoyer SMS aux contacts du Téléphone A
-            // (ex. Téléphone C) même quand A n'a pas d'internet.
-            val contactsJson = record["c"]?.takeIf { it.isNotEmpty() }?.let { encoded ->
-                encoded.split(",")
-                    .map { it.trim() }
-                    .filter { it.isNotEmpty() }
-                    .joinToString(",", "[", "]") { num ->
-                        val safe = num.replace("\\", "\\\\").replace("\"", "\\\"")
-                        """{"mobile":"$safe"}"""
-                    }
-            } ?: "[]"
+            // A4/3a : suivi d'alerte distante pour l'intervalle adaptatif.
+            // Bascule immédiate veille→actif à la première réception.
+            when (type) {
+                MarselProtocol.TYPE_EMERGENCY, MarselProtocol.TYPE_POSITION -> {
+                    val wasActive = isAlertActive()
+                    remoteAlertActiveUntilMs = System.currentTimeMillis() + 120_000
+                    if (!wasActive) kickDiscoveryNow()
+                }
+                MarselProtocol.TYPE_RESOLVED -> {
+                    remoteAlertActiveUntilMs = 0
+                    emergencyId?.let { removeRelayedForEmergency(it) }
+                }
+            }
 
-            val hasContacts = contactsJson != "[]"
-            logToJs("DNS-SD", "RX TXT type=$type pseudo=$pseudo lat=$lat hop=$hop contacts=${if (hasContacts) "yes" else "none"}")
-
-            // Rebuild a full packet for processRelayMessage / the JS layer.
-            val json = """{"type":"$type","messageId":"$msgId","id":"$emergencyId","emergencyId":"$emergencyId","pseudo":"$pseudo","lat":$lat,"lng":$lng,"timestamp":$ts,"hopCount":$hop,"maxHops":10,"contacts":$contactsJson}"""
             processRelayMessage(json)
         } catch (e: Exception) {
             logToJs("DNS-SD", "handleServiceTxtRecord ERROR: ${e.message}")
         }
     }
 
-    // Builds a compact TXT record map from a JSON relay packet.
-    private fun buildTxtRecord(shortType: String, json: String): Map<String, String>? {
-        val msgId = extractJsonString(json, "messageId") ?: return null
-        val emergencyId = extractJsonString(json, "emergencyId")
-            ?: extractJsonString(json, "id") ?: msgId
-        val pseudo = (extractJsonString(json, "pseudo") ?: "").take(24)
-        val lat = extractJsonNumber(json, "lat") ?: return null
-        val lng = extractJsonNumber(json, "lng") ?: return null
-        val ts = extractJsonNumber(json, "timestamp")?.toLong() ?: System.currentTimeMillis()
-        val hop = extractJsonInt(json, "hopCount") ?: 0
-
-        // Extrait jusqu'à 5 numéros mobiles pour la chaîne relay hors-ligne (clé "c")
-        val contactMobiles = """"mobile"\s*:\s*"([^"]+)"""".toRegex()
-            .findAll(json)
-            .mapNotNull { it.groupValues.getOrNull(1) }
-            .filter { it.isNotEmpty() }
-            .take(5)
-            .joinToString(",")
-
-        val record = mutableMapOf(
-            "y" to shortType,
-            "i" to msgId.take(40),
-            "e" to emergencyId.take(40),
-            "p" to pseudo,
-            "a" to String.format(java.util.Locale.US, "%.5f", lat),
-            "o" to String.format(java.util.Locale.US, "%.5f", lng),
-            "s" to ts.toString(),
-            "h" to hop.toString()
-        )
-        if (contactMobiles.isNotEmpty()) {
-            record["c"] = contactMobiles.take(240)
-        }
-        return record
-    }
+    // Encodage TXT délégué au protocole pur (testable, Section 7). La clé "c"
+    // transporte les numéros des proches pour la chaîne relay hors-ligne,
+    // "u" le flag enregistrement audio.
+    private fun buildTxtRecord(shortType: String, json: String): Map<String, String>? =
+        MarselProtocol.buildTxtRecord(shortType, json, System.currentTimeMillis())
 
     private fun broadcastViaService(json: String) {
         if (!wifiP2pEnabled) {
@@ -879,23 +1168,34 @@ class MainActivity : ComponentActivity() {
             runOnUiThread {
                 when (shortType) {
                     "E" -> {
-                        // New emergency: clear everything, register fresh alert service.
+                        // A2 : annuler tout clear différé d'une résolution précédente
+                        // AVANT d'enregistrer la nouvelle alerte, sinon le runnable
+                        // de 2 min effacerait le marsel-alert fraîchement posé.
+                        resolvedClearRunnable?.let { p2pHandler.removeCallbacks(it) }
+                        resolvedClearRunnable = null
+
+                        // C3 : instance distincte par urgence (marsel-alert-<suffix>).
+                        // On retire proprement l'ancienne alerte locale (removeLocalService,
+                        // pas clearLocalServices) pour ne pas toucher aux services relayés.
+                        val msgId = record["i"] ?: ""
+                        val oldAlertInfo = activeAlertServiceInfo
                         activeEmergencyRecord = record
                         activePositionRecord = null
-                        activeAlertServiceInfo = null
                         activePositionServiceInfo = null
                         lastPositionBroadcastMs = 0
-                        logToJs("DNS-SD", "EMERGENCY: registering alert service")
-                        val info = WifiP2pDnsSdServiceInfo.newInstance("marsel-alert", "_marsel._tcp", record)
-                        wifiP2pManager.clearLocalServices(wifiP2pChannel, object : WifiP2pManager.ActionListener {
-                            override fun onSuccess() { registerAlertService(info) }
-                            override fun onFailure(r: Int) { registerAlertService(info) }
-                        })
+                        val info = WifiP2pDnsSdServiceInfo.newInstance(
+                            MarselProtocol.alertInstanceName(msgId), "_marsel._tcp", record
+                        )
+                        logToJs("DNS-SD", "EMERGENCY: registering ${MarselProtocol.alertInstanceName(msgId)}")
+                        if (oldAlertInfo != null) {
+                            safeRemoveLocalService(oldAlertInfo, "old-alert") { registerAlertService(info) }
+                        } else {
+                            registerAlertService(info)
+                        }
+                        kickDiscoveryNow()  // 3b : découverte relancée immédiatement
                     }
                     "P" -> {
                         // Position update: NEVER touch the alert service.
-                        // Use removeLocalService on the OLD position service then addLocalService
-                        // for the new one. This keeps marsel-alert always visible.
                         if (activeEmergencyRecord == null) {
                             logToJs("DNS-SD", "POSITION: no active emergency, skip")
                             return@runOnUiThread
@@ -908,55 +1208,43 @@ class MainActivity : ComponentActivity() {
                         }
                         lastPositionBroadcastMs = now
                         activePositionRecord = record
-                        val newPosInfo = WifiP2pDnsSdServiceInfo.newInstance("marsel-pos", "_marsel._tcp", record)
+                        val newPosInfo = WifiP2pDnsSdServiceInfo.newInstance(
+                            MarselProtocol.POSITION_INSTANCE_NAME, "_marsel._tcp", record
+                        )
                         val oldPosInfo = activePositionServiceInfo
                         activePositionServiceInfo = newPosInfo
                         if (oldPosInfo != null) {
-                            try {
-                                wifiP2pManager.removeLocalService(wifiP2pChannel, oldPosInfo, object : WifiP2pManager.ActionListener {
-                                    override fun onSuccess() { addPosServiceSafe(newPosInfo) }
-                                    override fun onFailure(r: Int) {
-                                        logToJs("DNS-SD", "removeLocalService pos failed: $r — adding anyway")
-                                        addPosServiceSafe(newPosInfo)
-                                    }
-                                })
-                            } catch (ex: SecurityException) {
-                                logToJs("DNS-SD", "removeLocalService denied: ${ex.message}")
-                                addPosServiceSafe(newPosInfo)
-                            }
+                            safeRemoveLocalService(oldPosInfo, "old-pos") { addPosServiceSafe(newPosInfo) }
                         } else {
                             addPosServiceSafe(newPosInfo)
                         }
                         logToJs("DNS-SD", "POSITION: updating marsel-pos (alert untouched)")
                     }
                     "R" -> {
-                        // Emergency resolved: stop all active services, broadcast R for 2 min
+                        // Emergency resolved: retirer NOTRE alerte + position, diffuser R
+                        // pendant 2 min. On ne touche PAS aux services relayés (C3).
+                        val msgId = record["i"] ?: ""
+                        activeAlertServiceInfo?.let { safeRemoveLocalService(it, "resolved-alert") }
+                        activePositionServiceInfo?.let { safeRemoveLocalService(it, "resolved-pos") }
                         activeEmergencyRecord = null
                         activePositionRecord = null
                         activeAlertServiceInfo = null
                         activePositionServiceInfo = null
-                        logToJs("DNS-SD", "RESOLVED: clearing emergency services, broadcasting resolved")
+                        logToJs("DNS-SD", "RESOLVED: broadcasting ${MarselProtocol.resolvedInstanceName(msgId)}")
                         val resolvedInfo = WifiP2pDnsSdServiceInfo.newInstance(
-                            "marsel-resolved", "_marsel._tcp", record
+                            MarselProtocol.resolvedInstanceName(msgId), "_marsel._tcp", record
                         )
-                        wifiP2pManager.clearLocalServices(wifiP2pChannel, object : WifiP2pManager.ActionListener {
-                            override fun onSuccess() {
-                                try {
-                                    wifiP2pManager.addLocalService(wifiP2pChannel, resolvedInfo, object : WifiP2pManager.ActionListener {
-                                        override fun onSuccess() { logToJs("DNS-SD", "Resolved service broadcasting OK") }
-                                        override fun onFailure(r: Int) { logToJs("DNS-SD", "Resolved service broadcast FAILED: $r") }
-                                    })
-                                } catch (e: SecurityException) {
-                                    logToJs("DNS-SD", "addLocalService denied: ${e.message}")
-                                }
-                            }
-                            override fun onFailure(reason: Int) { logToJs("DNS-SD", "clearLocalServices failed: $reason") }
-                        })
-                        p2pHandler.postDelayed({
-                            try { wifiP2pManager.clearLocalServices(wifiP2pChannel, null) } catch (e: Exception) {
-                                Log.w(TAG, "clearLocalServices resolved: ${e.message}")
-                            }
-                        }, 120_000)
+                        val resInfoRef = resolvedInfo
+                        addLocalServiceSafe(resolvedInfo, "marsel-resolved")
+                        kickDiscoveryNow()
+                        // A2 : clear ciblé du SEUL service resolved après 2 min,
+                        // tracké pour annulation si une nouvelle urgence démarre avant.
+                        val runnable = Runnable {
+                            safeRemoveLocalService(resInfoRef, "resolved-expiry")
+                            resolvedClearRunnable = null
+                        }
+                        resolvedClearRunnable = runnable
+                        p2pHandler.postDelayed(runnable, 120_000)
                     }
                 }
             }
@@ -1092,6 +1380,46 @@ class MainActivity : ComponentActivity() {
     }
 
     // =========================================================================
+    // F1 / Section 1 — Qualité réseau avec NET_CAPABILITY_VALIDATED
+    // =========================================================================
+    // Un WiFi/mobile connecté mais SANS accès internet réel (portail captif,
+    // box sans ligne) est traité comme NONE : le relais ne croit pas à tort
+    // pouvoir envoyer le SMS, et le paquet continue de se propager dans le MRN.
+    private fun detectNetworkQuality(): String {
+        return try {
+            val cm = getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                val network = cm.activeNetwork ?: return "NONE"
+                val caps = cm.getNetworkCapabilities(network) ?: return "NONE"
+                val validated = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                val internet = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                MarselProtocol.classifyNetworkQuality(
+                    hasCellular = caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR),
+                    hasWifi = caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI),
+                    hasEthernet = caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET),
+                    validated = validated,
+                    hasInternet = internet
+                )
+            } else {
+                // API < 23 : pas de NET_CAPABILITY_VALIDATED, on se rabat sur
+                // la connectivité déclarée (best effort).
+                @Suppress("DEPRECATION")
+                val info = cm.activeNetworkInfo
+                @Suppress("DEPRECATION")
+                if (info?.isConnected != true) "NONE"
+                else when (info.type) {
+                    ConnectivityManager.TYPE_MOBILE -> "MOBILE_STABLE"
+                    ConnectivityManager.TYPE_WIFI, ConnectivityManager.TYPE_ETHERNET -> "WIFI_STABLE"
+                    else -> "NONE"
+                }
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "detectNetworkQuality: ${e.message}")
+            "NONE"
+        }
+    }
+
+    // =========================================================================
     // Notification helper (callable from any thread)
     // =========================================================================
     private fun showNotificationDirect(title: String, body: String) {
@@ -1158,30 +1486,35 @@ class MainActivity : ComponentActivity() {
     }
 
     // =========================================================================
-    // Forward emergency to contacts via SMS
+    // Forward emergency to contacts via SMS (relais avec réseau, chaîne hors-ligne)
     // =========================================================================
+    // Le relais n'envoie les SMS que s'il a un réseau VALIDÉ (F1) et une seule
+    // fois par messageId (dédup smsHandled persistée, F3). Sans réseau, il ne
+    // fait rien ici : le hop-forwarding DNS-SD (registerRelayedService) propage
+    // le paquet plus loin jusqu'à un téléphone connecté.
     private fun forwardEmergencyToContacts(json: String) {
         try {
-            val contactsMatch = """"contacts"\s*:\s*\[([^\]]*)\]""".toRegex().find(json)
-            contactsMatch?.groupValues?.getOrNull(1)?.let { contactsJson ->
-                val mobilePattern = """"mobile"\s*:\s*"([^"]+)"""".toRegex()
-                val pseudo = extractJsonString(json, "pseudo") ?: "Utilisateur"
-                val lat = """"lat"\s*:\s*([\d.eE+\-]+)""".toRegex().find(json)?.groupValues?.getOrNull(1) ?: ""
-                val lng = """"lng"\s*:\s*([\d.eE+\-]+)""".toRegex().find(json)?.groupValues?.getOrNull(1) ?: ""
-                val mapsLink = if (lat.isNotEmpty() && lng.isNotEmpty()) {
-                    "https://maps.google.com/maps?q=$lat,$lng"
-                } else {
-                    "Position inconnue"
-                }
-                val smsMsg = "ALERTE MARSEL\n$pseudo a declenche une alerte d'urgence.\nPosition: $mapsLink"
-
-                mobilePattern.findAll(contactsJson).forEach { match ->
-                    val mobile = match.groupValues[1]
-                    if (mobile.isNotEmpty()) {
-                        sendSMSDirect(mobile, smsMsg)
-                    }
-                }
+            val quality = detectNetworkQuality()
+            if (quality == "NONE") {
+                logToJs("RELAY", "SMS relais : pas de réseau validé ici, propagation MRN uniquement")
+                return
             }
+            val messageId = extractJsonString(json, "messageId") ?: return
+            if (dedupLedger.checkAndMark("sms", messageId)) {
+                logToJs("RELAY", "SMS relais $messageId déjà envoyé — skip (dédup)")
+                return
+            }
+            val mobiles = MarselProtocol.extractContactMobiles(json)
+            if (mobiles.isEmpty()) return
+            val pseudo = extractJsonString(json, "pseudo") ?: "Utilisateur"
+            val lat = extractJsonNumber(json, "lat")
+            val lng = extractJsonNumber(json, "lng")
+            val mapsLink = if (lat != null && lng != null) {
+                "https://maps.google.com/maps?q=$lat,$lng"
+            } else "Position inconnue"
+            val smsMsg = "ALERTE MARSEL\n$pseudo a declenche une alerte d'urgence.\nPosition: $mapsLink"
+            logToJs("RELAY", "SMS relais ($quality) : envoi à ${mobiles.size} proche(s) à la place de l'émetteur")
+            mobiles.forEach { mobile -> sendSMSDirect(mobile, smsMsg) }
         } catch (e: Exception) {
             Log.e(TAG, "forwardEmergencyToContacts: ${e.message}")
         }
@@ -1194,9 +1527,10 @@ class MainActivity : ComponentActivity() {
         thread {
             try {
                 val serverSocket = ServerSocket(8888)
+                legacyServerSocket = serverSocket
                 Log.d(TAG, "WiFi server listening on port 8888")
-                while (true) {
-                    val client = serverSocket.accept()
+                while (serversRunning) {
+                    val client = try { serverSocket.accept() } catch (e: Exception) { break }
                     thread {
                         try {
                             val reader = BufferedReader(InputStreamReader(client.getInputStream()))
@@ -1364,6 +1698,12 @@ class MainActivity : ComponentActivity() {
             return getNetworkTypeDirect()
         }
 
+        // F1 / Section 1 : qualité réseau validée (MOBILE_STABLE / WIFI_STABLE / NONE)
+        @JavascriptInterface
+        fun detectNetworkQuality(): String {
+            return this@MainActivity.detectNetworkQuality()
+        }
+
         // -----------------------------------------------------------------------
         // SMS
         // -----------------------------------------------------------------------
@@ -1394,11 +1734,10 @@ class MainActivity : ComponentActivity() {
                     logToJs("RELAY", "SEND $t via DNS-SD + socket transport")
 
                     // PRIMARY transport: connection-less DNS-SD broadcast.
+                    // broadcastViaService enchaîne register→kickDiscoveryNow (3b) :
+                    // pas de restartServiceDiscovery() en plus ici, qui créerait une
+                    // contention pendant le clear/add en cours (C1).
                     broadcastViaService(emergencyJson)
-                    restartServiceDiscovery()
-
-                    // Ensure peer discovery is also running (secondary socket transport)
-                    startP2PDiscovery()
 
                     synchronized(pendingRelayMessages) {
                         pendingRelayMessages.add(emergencyJson)
