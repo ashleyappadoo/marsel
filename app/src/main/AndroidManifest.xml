@@ -34,6 +34,9 @@
 
     <!-- Audio -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Écriture Music/Marsel sur API<=28 uniquement (MediaStore gère API 29+) -->
+    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
+        android:maxSdkVersion="28" />
 
     <!-- Bluetooth (for mesh/proximity features) -->
     <uses-permission android:name="android.permission.BLUETOOTH" />

@@ -980,6 +980,12 @@ function sendCascadeSms(kind, savedEmergency, message, hasAudio) {
             if (window.AndroidBridge && typeof AndroidBridge.sendEmergencySMS === 'function') {
                 try { AndroidBridge.sendEmergencySMS(c.mobile, message); } catch (e) {}
             }
+            // 5b : à la fin d'alerte, si audio + 4G validée → MMS du dernier
+            // enregistrement (best-effort, le SMS texte est déjà parti).
+            if (kind === 'RESOLVED' && hasAudio && quality === 'MOBILE_STABLE'
+                    && window.AndroidBridge && typeof AndroidBridge.sendRecordingMms === 'function') {
+                try { AndroidBridge.sendRecordingMms(c.mobile); } catch (e) {}
+            }
         });
         mLog('J', 'NET', kind + ' SMS direct (' + quality + ') → ' + contacts.length + ' proche(s)');
     } else {
@@ -1168,6 +1174,14 @@ window.onPeersDiscovered = function (peers) {
         showToast('🔁 Marsel Relay Network : ' + count + ' appareil(s) détecté(s)');
     } else {
         showToast('🔍 Recherche d\'appareils Marsel…');
+    }
+};
+
+/* Appelé par Android quand l'état de l'enregistrement audio change (Section 5). */
+window.onRecordingStateChanged = function (recording, reason) {
+    mLog('J', 'NET', 'audio recording=' + recording + ' reason=' + reason);
+    if (!recording && reason === 'permission_refusee') {
+        showToast('🎙️ Micro non autorisé — enregistrement de protection indisponible');
     }
 };
 

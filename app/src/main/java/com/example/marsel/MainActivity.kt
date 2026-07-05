@@ -11,12 +11,16 @@ import android.content.Intent
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.hardware.camera2.CameraManager
+import android.content.ContentValues
 import android.location.Location
 import android.location.LocationListener
 import android.location.LocationManager
 import android.media.MediaRecorder
 import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
+import android.os.Environment
+import android.os.ParcelFileDescriptor
+import android.provider.MediaStore
 import android.net.Uri
 import android.net.wifi.p2p.WifiP2pConfig
 import android.net.wifi.p2p.WifiP2pDevice
@@ -69,6 +73,17 @@ class MainActivity : ComponentActivity() {
     private lateinit var webView: WebView
     private var mediaRecorder: MediaRecorder? = null
     private var isRecording = false
+
+    // Audio recording (Section 5) — emplacement pérenne, segments de 5 min.
+    // Un crash entre deux segments ne rend jamais l'enregistrement illisible :
+    // chaque segment est finalisé (moov écrit) avant de démarrer le suivant.
+    private var audioActive = false
+    private var audioSegmentIndex = 0
+    private var audioBaseName = ""              // marsel_alerte_yyyyMMdd_HHmm
+    private var currentAudioUri: Uri? = null    // API29+ : item MediaStore en attente
+    private var currentAudioFile: File? = null  // API<29 : fichier public Music/Marsel
+    private var currentAudioPfd: ParcelFileDescriptor? = null
+    private var lastFinalizedAudioFile: File? = null  // dernier segment (API<29) pour MMS
 
     // -------------------------------------------------------------------------
     // WiFi P2P fields
@@ -175,6 +190,9 @@ class MainActivity : ComponentActivity() {
         private const val MARSEL_ALERT_ID = 1001
         private const val TAG = "MARSEL"
         private const val MARSEL_PEER_TTL_MS = 60_000L
+        private const val AUDIO_SEGMENT_MS = 5 * 60 * 1000       // rotation 5 min
+        private const val AUDIO_MMS_MAX_BYTES = 1_000_000L       // 1 Mo (spec 5b)
+        private const val AUDIO_DIR = "Marsel"
     }
 
     // -------------------------------------------------------------------------
@@ -338,10 +356,15 @@ class MainActivity : ComponentActivity() {
             val cameraId = cameraManager.cameraIdList.firstOrNull()
             if (cameraId != null) cameraManager.setTorchMode(cameraId, false)
         } catch (e: Exception) { /* ignore */ }
+        // 5c/D2 : recréation d'activité pendant l'enregistrement — finaliser
+        // le segment courant pour qu'il reste lisible (moov écrit), sans perdre
+        // le fichier. audioActive reste false ici (l'instance est détruite) ;
+        // le JS relancera l'enregistrement si l'alerte est toujours active.
         try {
-            mediaRecorder?.apply { stop(); release() }
-            mediaRecorder = null
-            isRecording = false
+            if (audioActive || mediaRecorder != null) {
+                audioActive = false
+                finalizeCurrentSegment()
+            }
         } catch (e: Exception) { /* ignore */ }
     }
 
@@ -1486,6 +1509,253 @@ class MainActivity : ComponentActivity() {
     }
 
     // =========================================================================
+    // Enregistrement audio (Section 5) — emplacement pérenne + segments 5 min
+    // =========================================================================
+    // Doit tourner sur le main thread (setOnInfoListener + rotation).
+    private fun startAudioRecordingInternal() {
+        if (audioActive) { logToJs("AUDIO", "déjà actif — double-start ignoré"); return }
+        // H3 : vérifier la permission RECORD_AUDIO avant de démarrer
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
+            != PackageManager.PERMISSION_GRANTED
+        ) {
+            logToJs("AUDIO", "permission RECORD_AUDIO refusée — pas d'enregistrement")
+            notifyRecordingState(false, "permission_refusee")
+            return
+        }
+        audioBaseName = "marsel_alerte_" + formatNow("yyyyMMdd_HHmm")
+        audioSegmentIndex = 0
+        audioActive = true
+        val ok = startAudioSegment()
+        notifyRecordingState(ok, if (ok) "" else "erreur_demarrage")
+    }
+
+    // Démarre un nouveau segment. Retourne false en cas d'échec.
+    private fun startAudioSegment(): Boolean {
+        return try {
+            val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                MediaRecorder(this)
+            } else {
+                @Suppress("DEPRECATION") MediaRecorder()
+            }
+            val name = if (audioSegmentIndex == 0) "$audioBaseName.m4a"
+                       else "${audioBaseName}_part${audioSegmentIndex + 1}.m4a"
+
+            recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
+            recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                // MediaStore : visible dans l'app Musique/Fichiers, pas de permission stockage
+                val values = ContentValues().apply {
+                    put(MediaStore.Audio.Media.DISPLAY_NAME, name)
+                    put(MediaStore.Audio.Media.MIME_TYPE, "audio/mp4")
+                    put(MediaStore.Audio.Media.RELATIVE_PATH, Environment.DIRECTORY_MUSIC + "/" + AUDIO_DIR)
+                    put(MediaStore.Audio.Media.IS_PENDING, 1)
+                }
+                val uri = contentResolver.insert(MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, values)
+                    ?: run { logToJs("AUDIO", "MediaStore insert échoué"); return false }
+                currentAudioUri = uri
+                val pfd = contentResolver.openFileDescriptor(uri, "w")
+                    ?: run { logToJs("AUDIO", "openFileDescriptor null"); return false }
+                currentAudioPfd = pfd
+                recorder.setOutputFile(pfd.fileDescriptor)
+            } else {
+                // API<29 : fichier dans Music/Marsel public (WRITE_EXTERNAL_STORAGE, maxSdk 28)
+                @Suppress("DEPRECATION")
+                val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC), AUDIO_DIR)
+                if (!dir.exists()) dir.mkdirs()
+                val file = File(dir, name)
+                currentAudioFile = file
+                recorder.setOutputFile(file.absolutePath)
+            }
+
+            // H2 : rotation par segments — un segment finalisé reste toujours lisible
+            recorder.setMaxDuration(AUDIO_SEGMENT_MS)
+            recorder.setOnInfoListener { _, what, _ ->
+                if (what == MediaRecorder.MEDIA_RECORDER_INFO_MAX_DURATION_REACHED) {
+                    runOnUiThread { rotateAudioSegment() }
+                }
+            }
+            recorder.prepare()
+            recorder.start()
+            mediaRecorder = recorder
+            isRecording = true
+            logToJs("AUDIO", "segment ${audioSegmentIndex + 1} démarré: $name")
+            true
+        } catch (e: Exception) {
+            logToJs("AUDIO", "startAudioSegment ERROR: ${e.message}")
+            cleanupFailedSegment()
+            false
+        }
+    }
+
+    private fun rotateAudioSegment() {
+        if (!audioActive) return
+        finalizeCurrentSegment()
+        audioSegmentIndex += 1
+        startAudioSegment()
+    }
+
+    // Finalise le segment courant (stop + release + publie MediaStore).
+    private fun finalizeCurrentSegment() {
+        try {
+            mediaRecorder?.apply {
+                try { stop() } catch (e: Exception) { Log.w(TAG, "recorder stop: ${e.message}") }
+                release()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "finalizeCurrentSegment: ${e.message}")
+        }
+        mediaRecorder = null
+        isRecording = false
+
+        // Publier l'item MediaStore (IS_PENDING=0) → visible dans Musique
+        currentAudioUri?.let { uri ->
+            try {
+                currentAudioPfd?.close()
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    val values = ContentValues().apply { put(MediaStore.Audio.Media.IS_PENDING, 0) }
+                    contentResolver.update(uri, values, null, null)
+                }
+            } catch (e: Exception) { Log.w(TAG, "publish MediaStore: ${e.message}") }
+        }
+        currentAudioPfd = null
+        currentAudioUri = null
+        currentAudioFile?.let { lastFinalizedAudioFile = it }
+        currentAudioFile = null
+    }
+
+    private fun cleanupFailedSegment() {
+        try { currentAudioPfd?.close() } catch (e: Exception) { Log.v(TAG, "pfd close: ${e.message}") }
+        currentAudioPfd = null
+        currentAudioUri?.let { try { contentResolver.delete(it, null, null) } catch (e: Exception) {} }
+        currentAudioUri = null
+        currentAudioFile = null
+    }
+
+    private fun stopAudioRecordingInternal() {
+        if (!audioActive) { logToJs("AUDIO", "stop sans enregistrement actif — ignoré"); return }
+        audioActive = false
+        finalizeCurrentSegment()
+        logToJs("AUDIO", "enregistrement arrêté ($audioBaseName)")
+        notifyRecordingState(false, "arret_normal")
+    }
+
+    private fun notifyRecordingState(recording: Boolean, reason: String) {
+        runOnUiThread {
+            webView.evaluateJavascript(
+                "window.onRecordingStateChanged && window.onRecordingStateChanged($recording,'$reason')",
+                null
+            )
+        }
+    }
+
+    private fun formatNow(pattern: String): String =
+        java.text.SimpleDateFormat(pattern, java.util.Locale.US).format(java.util.Date())
+
+    // Liste JSON des enregistrements Marsel (nom, date, durée ms, taille octets).
+    private fun listRecordingsJson(): String {
+        val items = mutableListOf<String>()
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val proj = arrayOf(
+                    MediaStore.Audio.Media.DISPLAY_NAME,
+                    MediaStore.Audio.Media.DATE_ADDED,
+                    MediaStore.Audio.Media.DURATION,
+                    MediaStore.Audio.Media.SIZE
+                )
+                val sel = "${MediaStore.Audio.Media.RELATIVE_PATH} LIKE ?"
+                val args = arrayOf("%${AUDIO_DIR}%")
+                contentResolver.query(
+                    MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, proj, sel, args,
+                    "${MediaStore.Audio.Media.DATE_ADDED} DESC"
+                )?.use { c ->
+                    val ni = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DISPLAY_NAME)
+                    val di = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DATE_ADDED)
+                    val du = c.getColumnIndexOrThrow(MediaStore.Audio.Media.DURATION)
+                    val si = c.getColumnIndexOrThrow(MediaStore.Audio.Media.SIZE)
+                    while (c.moveToNext()) {
+                        val name = c.getString(ni).replace("\"", "")
+                        items.add("""{"name":"$name","date":${c.getLong(di) * 1000},"duration":${c.getLong(du)},"size":${c.getLong(si)}}""")
+                    }
+                }
+            } else {
+                @Suppress("DEPRECATION")
+                val dir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_MUSIC), AUDIO_DIR)
+                dir.listFiles()?.sortedByDescending { it.lastModified() }?.forEach { f ->
+                    items.add("""{"name":"${f.name.replace("\"", "")}","date":${f.lastModified()},"duration":0,"size":${f.length()}}""")
+                }
+            }
+        } catch (e: Exception) {
+            logToJs("AUDIO", "listRecordings ERROR: ${e.message}")
+        }
+        return items.joinToString(",", "[", "]")
+    }
+
+    // URI + taille du dernier enregistrement Marsel (le plus récent), ou null.
+    private fun lastRecordingUriAndSize(): Pair<Uri, Long>? {
+        return try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val proj = arrayOf(MediaStore.Audio.Media._ID, MediaStore.Audio.Media.SIZE)
+                val sel = "${MediaStore.Audio.Media.RELATIVE_PATH} LIKE ?"
+                contentResolver.query(
+                    MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, proj, sel, arrayOf("%${AUDIO_DIR}%"),
+                    "${MediaStore.Audio.Media.DATE_ADDED} DESC"
+                )?.use { c ->
+                    if (c.moveToFirst()) {
+                        val id = c.getLong(c.getColumnIndexOrThrow(MediaStore.Audio.Media._ID))
+                        val size = c.getLong(c.getColumnIndexOrThrow(MediaStore.Audio.Media.SIZE))
+                        val uri = android.content.ContentUris.withAppendedId(
+                            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, id
+                        )
+                        return Pair(uri, size)
+                    }
+                }
+                null
+            } else {
+                lastFinalizedAudioFile?.takeIf { it.exists() }?.let {
+                    Pair(Uri.fromFile(it), it.length())
+                }
+            }
+        } catch (e: Exception) {
+            logToJs("AUDIO", "lastRecordingUriAndSize: ${e.message}"); null
+        }
+    }
+
+    // 5b (best-effort) : MMS du dernier enregistrement si ≤ 1 Mo. L'envoi MMS
+    // dépend du réseau opérateur et peut échouer silencieusement — le SMS texte
+    // de fin (avec mention audio) part de toute façon via la cascade JS.
+    private fun sendLastRecordingMms(phoneNumber: String) {
+        try {
+            if (detectNetworkQuality() != "MOBILE_STABLE") return
+            val (uri, size) = lastRecordingUriAndSize() ?: return
+            if (size > AUDIO_MMS_MAX_BYTES) {
+                logToJs("AUDIO", "MMS ignoré: segment ${size / 1024}Ko > 1Mo (mention texte seule)")
+                return
+            }
+            val smsManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                getSystemService(SmsManager::class.java)
+            } else {
+                @Suppress("DEPRECATION") SmsManager.getDefault()
+            } ?: return
+            try { grantUriPermission("com.android.mms", uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (e: Exception) {}
+            val sentPi = PendingIntent.getBroadcast(
+                this, 0, Intent("com.example.marsel.MMS_SENT"),
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                else PendingIntent.FLAG_UPDATE_CURRENT
+            )
+            val configOverrides = Bundle().apply {
+                putString("to", phoneNumber)  // certains OEM lisent le destinataire ici
+            }
+            smsManager.sendMultimediaMessage(this, uri, null, configOverrides, sentPi)
+            logToJs("AUDIO", "MMS audio tenté vers $phoneNumber (${size / 1024}Ko)")
+        } catch (e: Exception) {
+            logToJs("AUDIO", "sendLastRecordingMms ERROR: ${e.message}")
+        }
+    }
+
+    // =========================================================================
     // Forward emergency to contacts via SMS (relais avec réseau, chaîne hors-ligne)
     // =========================================================================
     // Le relais n'envoie les SMS que s'il a un réseau VALIDÉ (F1) et une seule
@@ -1618,47 +1888,22 @@ class MainActivity : ComponentActivity() {
 
         @JavascriptInterface
         fun startAudioRecord() {
-            if (isRecording) return
-            try {
-                val outputFile = File(externalCacheDir, "marsel_record_${System.currentTimeMillis()}.m4a")
-                val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    MediaRecorder(this@MainActivity)
-                } else {
-                    @Suppress("DEPRECATION")
-                    MediaRecorder()
-                }
-                recorder.apply {
-                    setAudioSource(MediaRecorder.AudioSource.MIC)
-                    setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-                    setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                    setOutputFile(outputFile.absolutePath)
-                    prepare()
-                    start()
-                }
-                mediaRecorder = recorder
-                isRecording = true
-                Log.d("MARSEL_BRIDGE", "Enregistrement audio demarre: ${outputFile.absolutePath}")
-            } catch (e: Exception) {
-                Log.e("MARSEL_BRIDGE", "startAudioRecord error: ${e.message}")
-            }
+            runOnUiThread { startAudioRecordingInternal() }
         }
 
         @JavascriptInterface
         fun stopAudioRecord() {
-            if (!isRecording) return
-            try {
-                mediaRecorder?.apply {
-                    stop()
-                    release()
-                }
-                mediaRecorder = null
-                isRecording = false
-                Log.d("MARSEL_BRIDGE", "Enregistrement audio arrete")
-            } catch (e: Exception) {
-                Log.e("MARSEL_BRIDGE", "stopAudioRecord error: ${e.message}")
-                mediaRecorder = null
-                isRecording = false
-            }
+            runOnUiThread { stopAudioRecordingInternal() }
+        }
+
+        // Liste des enregistrements pour l'UI (nom, date, durée, taille).
+        @JavascriptInterface
+        fun getRecordings(): String = listRecordingsJson()
+
+        // 5b : MMS best-effort du dernier enregistrement (fin d'alerte, MOBILE_STABLE)
+        @JavascriptInterface
+        fun sendRecordingMms(phoneNumber: String) {
+            thread { sendLastRecordingMms(phoneNumber) }
         }
 
         // -----------------------------------------------------------------------
