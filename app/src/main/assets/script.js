@@ -934,6 +934,18 @@ function routeEmergency(emergencyData) {
     updateNetworkStatus();
     mLog('J', 'NET', 'routeEmergency quality=' + quality);
 
+    // AUDIT-FIX 2 : relaySms indique si un relais doit envoyer les SMS à ma place.
+    // Vrai UNIQUEMENT si je suis hors réseau validé (sinon j'envoie moi-même les
+    // SMS en ÉTAPE A, et un relais ne doit pas les renvoyer → anti double-SMS).
+    // Doit être positionné AVANT la diffusion MRN (ÉTAPE B) pour voyager dans le TXT.
+    emergencyData.relaySms = (quality === 'NONE') ? '1' : '0';
+    // AUDIT-FIX 3 : persister relaySms pour qu'un redémarrage de l'app préserve
+    // le flag lors de la re-diffusion de l'alerte.
+    try {
+        var savedRoute = JSON.parse(localStorage.getItem('marsel_emergency') || 'null');
+        if (savedRoute) { savedRoute.relaySms = emergencyData.relaySms; localStorage.setItem('marsel_emergency', JSON.stringify(savedRoute)); }
+    } catch (e) {}
+
     // ── ÉTAPE B (TOUJOURS) : diffusion MRN ──
     // Notification système + marqueur GPS chez les téléphones Marsel voisins,
     // quel que soit l'état réseau. Le paquet transporte les numéros des proches
@@ -1254,10 +1266,9 @@ window.onRelayMessageReceived = function (jsonStr) {
     };
     dbPut('emergency_events', record).catch(function () {});
 
-    // Notification système (fonctionne même si l'app est en arrière-plan)
-    if (window.AndroidBridge && typeof AndroidBridge.showNotification === 'function') {
-        try { AndroidBridge.showNotification('🚨 Alerte Marsel', (data.pseudo || 'Utilisateur') + ' a déclenché une alerte à proximité'); } catch (e) {}
-    }
+    // AUDIT-FIX 4 : la notification système est déjà émise côté Kotlin
+    // (processRelayMessage → showNotificationDirect) AVANT l'appel à ce handler.
+    // Ne pas la ré-émettre ici (même canal/ID) pour éviter double vibration.
     showToast('🚨 Alerte reçue de ' + escapeHtml(data.pseudo || 'un utilisateur'));
 
     // Afficher sur la carte — naviguer vers home si nécessaire
@@ -2273,6 +2284,13 @@ document.addEventListener('DOMContentLoaded', function () {
     if (savedEmergency && savedEmergency.id) {
         MARSEL.emergencyActive = true;
         MARSEL.emergencyId = savedEmergency.id;
+        // AUDIT-FIX 3 : re-diffuser l'ALERTE (E) après un redémarrage, sinon le
+        // service DNS-SD marsel-alert n'est jamais ré-enregistré et les nouveaux
+        // téléphones à proximité ne reçoivent plus la notification (seules les
+        // mises à jour de position continueraient). Ne renvoie PAS de SMS.
+        if (!savedEmergency.type) savedEmergency.type = 'MARSEL_EMERGENCY';
+        if (typeof savedEmergency.relaySms === 'undefined') savedEmergency.relaySms = '0';
+        sendEmergencyViaRelayNetwork(savedEmergency);
         // Reprendre le tracking et RÉARMER le timer 20 min sur le temps restant
         // (Section 4 — persistance). Si les 20 min sont dépassées, il se
         // déclenche immédiatement via armEmergencyTimeout (remaining=0).

@@ -198,6 +198,21 @@ class MarselProtocolTest {
     }
 
     @Test
+    fun txtRecord_relaySmsFlagRoundTrip() {
+        // AUDIT-FIX 2 : le flag relaySms voyage dans le TXT (clé "m")
+        val offlineJson = """{"type":"MARSEL_EMERGENCY","messageId":"m","emergencyId":"e","pseudo":"Bob","lat":1.0,"lng":2.0,"timestamp":10,"hopCount":0,"relaySms":"1","contacts":[{"mobile":"+33600"}]}"""
+        val recOffline = MarselProtocol.buildTxtRecord("E", offlineJson, 0)!!
+        assertEquals("1", recOffline["m"])
+        assertEquals("1", MarselProtocol.extractJsonString(MarselProtocol.txtRecordToJson(recOffline, 0)!!, "relaySms"))
+
+        // Émetteur en réseau → relaySms="0" → pas de clé "m" → décodé "0"
+        val onlineJson = """{"type":"MARSEL_EMERGENCY","messageId":"m","emergencyId":"e","pseudo":"Bob","lat":1.0,"lng":2.0,"timestamp":10,"hopCount":0,"relaySms":"0","contacts":[{"mobile":"+33600"}]}"""
+        val recOnline = MarselProtocol.buildTxtRecord("E", onlineJson, 0)!!
+        assertNull(recOnline["m"])
+        assertEquals("0", MarselProtocol.extractJsonString(MarselProtocol.txtRecordToJson(recOnline, 0)!!, "relaySms"))
+    }
+
+    @Test
     fun extractJsonString_toleratesEscapedQuotes() {
         // I4 : un pseudo contenant un guillemet échappé ne casse pas l'extraction
         val json = """{"pseudo":"Al \" ice","lat":1.0}"""

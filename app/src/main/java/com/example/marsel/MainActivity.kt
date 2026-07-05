@@ -698,6 +698,20 @@ class MainActivity : ComponentActivity() {
                 return
             }
             val msgType = extractJsonString(json, "type") ?: "?"
+            val hopCount = extractJsonInt(json, "hopCount") ?: 0
+            val maxHops = extractJsonInt(json, "maxHops") ?: 10
+
+            // AUDIT-FIX 1 : les paquets F/T (demande de SMS relayé) sont dispatchés
+            // AVANT toute déduplication. Sinon un téléphone qui voit la demande
+            // pendant qu'il est hors-réseau la marque comme « vue » et ne pourra
+            // JAMAIS envoyer le SMS une fois le réseau revenu. handleSmsRequestPacket
+            // porte sa propre idempotence (dédup « sms » à l'envoi + propagation unique).
+            if (msgType == MarselProtocol.TYPE_RESOLVED_SMS_REQUEST ||
+                msgType == MarselProtocol.TYPE_TIMEOUT_SMS_REQUEST
+            ) {
+                handleSmsRequestPacket(json, msgType, messageId, hopCount, maxHops)
+                return
+            }
 
             // Dédup niveau 1 : set en RAM (rapide, durée de vie de la session)
             synchronized(processedMessageIds) {
@@ -718,19 +732,6 @@ class MainActivity : ComponentActivity() {
             }
 
             logToJs("RELAY", "RECV $msgType id=$messageId")
-
-            val hopCount = extractJsonInt(json, "hopCount") ?: 0
-            val maxHops = extractJsonInt(json, "maxHops") ?: 10
-
-            // Paquets de demande de SMS relayé (F/T) : traités entièrement en
-            // natif, JAMAIS remontés au JS — le téléphone relais ne doit pas
-            // afficher à qui les SMS sont envoyés.
-            if (msgType == MarselProtocol.TYPE_RESOLVED_SMS_REQUEST ||
-                msgType == MarselProtocol.TYPE_TIMEOUT_SMS_REQUEST
-            ) {
-                handleSmsRequestPacket(json, msgType, messageId, hopCount, maxHops)
-                return
-            }
 
             // Notify JS to display on map (use escapeJs for safe double-quoted string)
             runOnUiThread {
@@ -824,7 +825,12 @@ class MainActivity : ComponentActivity() {
             logToJs("RELAY", "SMS-REQ $msgType : envoi de ${mobiles.size} SMS à la place de l'émetteur")
             mobiles.forEach { mobile -> sendSMSDirect(mobile, smsMsg) }
         } else {
-            // Pas de réseau validé ici non plus : propager plus loin
+            // Pas de réseau validé ici non plus : propager plus loin.
+            // AUDIT-FIX 1 : propagation UNIQUE. Le paquet F/T n'est pas dédupliqué
+            // (pour permettre l'envoi si le réseau revient), donc il est re-délivré
+            // à chaque cycle DNS-SD. On ne le remet en file/re-diffuse qu'une seule
+            // fois (relayedRecords fait foi) pour ne pas saturer pendingRelayMessages.
+            if (relayedRecords.containsKey(messageId)) return
             if (hopCount >= maxHops) {
                 logToJs("RELAY", "SMS-REQ $messageId: maxHops atteint, drop")
                 return
@@ -1812,6 +1818,13 @@ class MainActivity : ComponentActivity() {
     // le paquet plus loin jusqu'à un téléphone connecté.
     private fun forwardEmergencyToContacts(json: String) {
         try {
+            // AUDIT-FIX 2 : ne relayer les SMS QUE si l'émetteur a demandé le relais
+            // (relaySms="1" = il était hors réseau). Si l'émetteur avait du réseau,
+            // il a déjà SMS-é ses proches → un relais ne doit pas renvoyer (sinon
+            // double SMS, cas Test-1 : A a la data ET B a la data).
+            if (extractJsonString(json, "relaySms") != "1") {
+                return
+            }
             val quality = detectNetworkQuality()
             if (quality == "NONE") {
                 logToJs("RELAY", "SMS relais : pas de réseau validé ici, propagation MRN uniquement")

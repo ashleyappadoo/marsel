@@ -92,6 +92,10 @@ object MarselProtocol {
         val hop = extractJsonInt(json, "hopCount") ?: 0
         val contacts = extractContactMobiles(json).take(5).joinToString(",")
         val audio = extractJsonString(json, "audio") == "1"
+        // relaySms="1" : l'émetteur n'a PAS pu envoyer les SMS lui-même (hors réseau)
+        // → un relais avec réseau doit les envoyer à sa place. "0"/absent : l'émetteur
+        // a déjà SMS-é ses proches, le relais ne doit PAS renvoyer (anti double-SMS).
+        val relaySms = extractJsonString(json, "relaySms") == "1"
 
         val record = mutableMapOf(
             "y" to shortType,
@@ -105,6 +109,7 @@ object MarselProtocol {
         )
         if (contacts.isNotEmpty()) record["c"] = contacts.take(240)
         if (audio) record["u"] = "1"
+        if (relaySms) record["m"] = "1"
         return record
     }
 
@@ -120,6 +125,7 @@ object MarselProtocol {
         val hop = record["h"]?.toIntOrNull() ?: 0
         val emergencyId = record["e"] ?: msgId
         val audio = if (record["u"] == "1") "1" else "0"
+        val relaySms = if (record["m"] == "1") "1" else "0"
 
         val contactsJson = (record["c"] ?: "")
             .split(",")
@@ -129,7 +135,7 @@ object MarselProtocol {
                 """{"mobile":"${sanitizeTxtValue(num, 20)}"}"""
             }
 
-        return """{"type":"$type","messageId":"$msgId","id":"$emergencyId","emergencyId":"$emergencyId","pseudo":"$pseudo","lat":$lat,"lng":$lng,"timestamp":$ts,"hopCount":$hop,"maxHops":10,"audio":"$audio","contacts":$contactsJson}"""
+        return """{"type":"$type","messageId":"$msgId","id":"$emergencyId","emergencyId":"$emergencyId","pseudo":"$pseudo","lat":$lat,"lng":$lng,"timestamp":$ts,"hopCount":$hop,"maxHops":10,"audio":"$audio","relaySms":"$relaySms","contacts":$contactsJson}"""
     }
 
     // ── Noms d'instance de service DNS-SD ───────────────────────────────

@@ -33,6 +33,33 @@ La permission `RECEIVE_BOOT_COMPLETED` a été retirée (aucun redémarrage au b
 prévu). Si un jour on veut relancer un service après reboot, il faudra la
 réintroduire avec un `BroadcastReceiver` `BOOT_COMPLETED`.
 
+### Deux rôles du ForegroundService (décidé avec l'utilisateur)
+
+Le service doit couvrir **deux cas**, pas seulement l'émetteur :
+
+1. **Téléphone ÉMETTEUR (en alerte)** — cf. ci-dessus : garder le MRN, le
+   tracking GPS et le timer 20 min vivants écran éteint.
+
+2. **Téléphone RELAIS / à proximité (pas en alerte lui-même)** — le
+   **Marsel Relay Network doit rester actif en permanence, app fermée**, pour :
+   - **relayer** les paquets (E/P/R/F/T) des alertes voisines même quand
+     l'utilisateur n'a pas l'app ouverte ;
+   - servir de **point de sortie réseau** : envoyer les SMS d'un appel à l'aide
+     **de façon masquée** (aucune UI, aucun historique visible — déjà le cas via
+     `sendSMSDirect`, à confirmer app fermée) au nom d'un émetteur hors-réseau ;
+   - afficher les **notifications système** des appels à l'aide à proximité
+     ET des fins de danger, même app fermée.
+
+   Cela implique un ForegroundService « veille MRN » à **basse conso**, toujours
+   actif (ou redémarré au boot → réintroduire `RECEIVE_BOOT_COMPLETED`), qui
+   maintient les listeners DNS-SD et le `rediscoverRunnable` en mode veille
+   (25 s), et bascule en mode actif (8 s) à la réception d'un paquet.
+
+   ⚠️ Arbitrages à cadrer : impact batterie d'un scan WiFi P2P permanent,
+   type de foreground service (`connectedDevice` ?), acceptabilité Play Store
+   d'un service always-on, et consentement utilisateur explicite (opt-in) pour
+   « prêter » son téléphone comme relais/point de sortie SMS.
+
 ## MMS audio (5b) — best-effort à fiabiliser
 
 `sendLastRecordingMms` est un envoi best-effort : `SmsManager.sendMultimediaMessage`
