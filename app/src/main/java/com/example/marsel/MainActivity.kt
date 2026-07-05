@@ -196,17 +196,75 @@ class MainActivity : ComponentActivity() {
     }
 
     // -------------------------------------------------------------------------
-    // Permission launcher
+    // Permission launcher — flow d'onboarding groupe par groupe (Section 6)
     // -------------------------------------------------------------------------
-    private val requestPermissionLauncher = registerForActivityResult(
+    private var pendingPermGroup: String = ""
+    private var pendingPermList: List<String> = emptyList()
+
+    private val permissionGroupLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
-    ) { granted ->
-        // After permissions resolved, initialise location if newly granted
-        if (granted[Manifest.permission.ACCESS_FINE_LOCATION] == true ||
-            granted[Manifest.permission.ACCESS_COARSE_LOCATION] == true
-        ) {
-            initLocationManager()
+    ) { _ ->
+        val group = pendingPermGroup
+        val list = pendingPermList
+        val granted = list.isNotEmpty() && list.all {
+            ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
         }
+        // Refus définitif : non accordé ET plus de rationale à montrer (G1/G2)
+        val permanentlyDenied = list.any {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED &&
+                !shouldShowRequestPermissionRationale(it)
+        }
+        if (granted && (group == "location")) initLocationManager()
+        runOnUiThread {
+            webView.evaluateJavascript(
+                "window.onPermissionResult && window.onPermissionResult('$group',$granted,$permanentlyDenied)",
+                null
+            )
+        }
+    }
+
+    private fun hasLocationPermission(): Boolean =
+        ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) == PackageManager.PERMISSION_GRANTED ||
+            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_COARSE_LOCATION) == PackageManager.PERMISSION_GRANTED
+
+    // Mappe un nom de groupe → permissions runtime applicables à l'OS courant.
+    private fun permissionsForGroup(group: String): List<String> = when (group) {
+        "location" -> listOf(Manifest.permission.ACCESS_FINE_LOCATION, Manifest.permission.ACCESS_COARSE_LOCATION)
+        "nearby" -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+            listOf(Manifest.permission.NEARBY_WIFI_DEVICES) else emptyList()
+        "sms" -> listOf(Manifest.permission.SEND_SMS)
+        "notifications" -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU)
+            listOf(Manifest.permission.POST_NOTIFICATIONS) else emptyList()
+        "microphone" -> listOf(Manifest.permission.RECORD_AUDIO)
+        "camera" -> listOf(Manifest.permission.CAMERA)
+        "background_location" -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
+            listOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION) else emptyList()
+        else -> emptyList()
+    }
+
+    private fun launchPermissionGroup(group: String) {
+        val perms = permissionsForGroup(group)
+        // Groupe sans permission applicable sur cet OS (ex. notifications < API33)
+        // ou déjà accordé → succès immédiat, l'onboarding avance.
+        val notGranted = perms.filter {
+            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+        }
+        if (perms.isEmpty() || notGranted.isEmpty()) {
+            webView.evaluateJavascript(
+                "window.onPermissionResult && window.onPermissionResult('$group',true,false)", null
+            )
+            return
+        }
+        // G1 : background location seulement si la localisation fine est accordée
+        if (group == "background_location" && !hasLocationPermission()) {
+            webView.evaluateJavascript(
+                "window.onPermissionResult && window.onPermissionResult('$group',false,false)", null
+            )
+            return
+        }
+        pendingPermGroup = group
+        pendingPermList = perms
+        permissionGroupLauncher.launch(notGranted.toTypedArray())
     }
 
     // =========================================================================
@@ -219,33 +277,13 @@ class MainActivity : ComponentActivity() {
         // --- Notification channel (must be created before any notification) ---
         createNotificationChannel()
 
-        // --- Request permissions ---
-        val permissions = mutableListOf(
-            Manifest.permission.ACCESS_FINE_LOCATION,
-            Manifest.permission.ACCESS_COARSE_LOCATION,
-            Manifest.permission.CAMERA,
-            Manifest.permission.RECORD_AUDIO,
-            Manifest.permission.VIBRATE,
-            Manifest.permission.SEND_SMS,
-            Manifest.permission.CHANGE_NETWORK_STATE
-        )
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-            permissions.add(Manifest.permission.BLUETOOTH_SCAN)
-            permissions.add(Manifest.permission.BLUETOOTH_CONNECT)
-            permissions.add(Manifest.permission.BLUETOOTH_ADVERTISE)
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            permissions.add(Manifest.permission.ACCESS_BACKGROUND_LOCATION)
-        }
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            permissions.add(Manifest.permission.NEARBY_WIFI_DEVICES)
-            permissions.add(Manifest.permission.POST_NOTIFICATIONS)
-        }
-
-        val notGranted = permissions.filter {
-            ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
-        }
-        if (notGranted.isNotEmpty()) requestPermissionLauncher.launch(notGranted.toTypedArray())
+        // Section 6 : les permissions ne sont PLUS demandées en un bloc ici.
+        // Le flow d'onboarding JS (window) les demande groupe par groupe, dans
+        // l'ordre, avec explication, via MarselBridge.requestPermissionGroup().
+        // ACCESS_BACKGROUND_LOCATION est demandée séparément et en dernier (G1) ;
+        // plus aucune permission Bluetooth (G3). On initialise juste la
+        // localisation si elle est déjà accordée (utilisateur existant).
+        if (hasLocationPermission()) initLocationManager()
 
         // --- WiFi P2P setup ---
         // A1/3e : ChannelListener obligatoire — un channel mort sans listener
@@ -1947,6 +1985,39 @@ class MainActivity : ComponentActivity() {
         @JavascriptInterface
         fun detectNetworkQuality(): String {
             return this@MainActivity.detectNetworkQuality()
+        }
+
+        // -----------------------------------------------------------------------
+        // Permissions (Section 6) — flow d'onboarding groupe par groupe
+        // -----------------------------------------------------------------------
+
+        // Demande un groupe ; résultat via window.onPermissionResult(group, granted, permanentlyDenied)
+        @JavascriptInterface
+        fun requestPermissionGroup(group: String) {
+            runOnUiThread { launchPermissionGroup(group) }
+        }
+
+        @JavascriptInterface
+        fun hasPermissionGroup(group: String): Boolean {
+            val perms = permissionsForGroup(group)
+            if (perms.isEmpty()) return true // rien à demander sur cet OS
+            return perms.all {
+                ContextCompat.checkSelfPermission(this@MainActivity, it) == PackageManager.PERMISSION_GRANTED
+            }
+        }
+
+        // Ouvre les réglages système de l'app (cas refus définitif)
+        @JavascriptInterface
+        fun openAppSettings() {
+            try {
+                val intent = Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS).apply {
+                    data = Uri.fromParts("package", packageName, null)
+                    addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                }
+                startActivity(intent)
+            } catch (e: Exception) {
+                Log.e(TAG, "openAppSettings: ${e.message}")
+            }
         }
 
         // -----------------------------------------------------------------------

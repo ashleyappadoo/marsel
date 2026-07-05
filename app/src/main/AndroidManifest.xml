@@ -13,10 +13,11 @@
     <!-- WiFi -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
     <uses-permission android:name="android.permission.CHANGE_WIFI_STATE" />
-    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES" />
+    <!-- neverForLocation : le scan Marsel ne sert pas à déduire la localisation (G4) -->
+    <uses-permission android:name="android.permission.NEARBY_WIFI_DEVICES"
+        android:usesPermissionFlags="neverForLocation" />
 
-    <!-- WiFi Direct / P2P -->
-    <uses-permission android:name="android.permission.WIFI_P2P" android:maxSdkVersion="32" />
+    <!-- WiFi Direct / P2P (android.permission.WIFI_P2P n'existe pas dans le SDK public — retiré, G4) -->
     <uses-permission android:name="android.permission.CHANGE_WIFI_P2P_STATE" />
 
     <!-- SMS -->
@@ -25,7 +26,8 @@
     <!-- Notifications -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- Foreground service -->
+    <!-- Foreground service — conservé pour le ForegroundService d'alerte à venir
+         (chantier séparé, voir TODO.md). Aucun service déclaré pour l'instant. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
 
     <!-- Camera / Flash -->
@@ -38,17 +40,11 @@
     <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE"
         android:maxSdkVersion="28" />
 
-    <!-- Bluetooth (for mesh/proximity features) -->
-    <uses-permission android:name="android.permission.BLUETOOTH" />
-    <uses-permission android:name="android.permission.BLUETOOTH_ADMIN" />
-    <uses-permission android:name="android.permission.BLUETOOTH_SCAN" />
-    <uses-permission android:name="android.permission.BLUETOOTH_CONNECT" />
-    <uses-permission android:name="android.permission.BLUETOOTH_ADVERTISE" />
+    <!-- Bluetooth retiré (G3) : le MRN utilise uniquement le WiFi Direct/DNS-SD -->
 
-    <!-- Misc -->
+    <!-- Misc (RECEIVE_BOOT_COMPLETED retiré, G5 : aucun receiver de boot) -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.VIBRATE" />
-    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
         android:allowBackup="true"

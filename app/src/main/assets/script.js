@@ -1977,6 +1977,8 @@ function showScreen(id, isBack) {
         setTimeout(function () { initMap(); }, 200);
         updateEmergencyUI();
         updateProfileMenu();
+        // Onboarding permissions au premier accès à l'accueil (Section 6)
+        setTimeout(maybeStartOnboarding, 600);
     }
     if (id === 'screen-profile-menu') {
         updateProfileMenu();
@@ -2085,6 +2087,142 @@ function escapeHtml(str) {
         .replace(/>/g, '&gt;')
         .replace(/"/g, '&quot;')
         .replace(/'/g, '&#39;');
+}
+
+/* ---------------------------------------------------------
+   ONBOARDING PERMISSIONS (Section 6)
+   Flow séquencé : explique PUIS demande chaque groupe, dans l'ordre.
+   La position en arrière-plan est demandée SEULE et en dernier (G1).
+   Un refus ne bloque pas l'app : on affiche l'impact fonctionnel.
+   --------------------------------------------------------- */
+var MARSEL_PERM_GROUPS = [
+    { key: 'location',            icon: '📍', title: 'Position',
+      desc: 'Pour partager ta position en cas d\'alerte',
+      impact: 'Sans position, tes proches ne sauront pas où te trouver.' },
+    { key: 'nearby',              icon: '📶', title: 'Appareils à proximité',
+      desc: 'Pour le réseau Marsel entre téléphones',
+      impact: 'Sans ça, l\'alerte ne peut pas transiter par les téléphones voisins hors réseau.' },
+    { key: 'sms',                 icon: '✉️', title: 'SMS',
+      desc: 'Pour alerter tes proches même sans internet',
+      impact: 'Sans SMS, tes proches ne seront pas alertés hors internet.' },
+    { key: 'notifications',       icon: '🔔', title: 'Notifications',
+      desc: 'Pour être prévenu·e d\'une alerte à proximité',
+      impact: 'Sans notifications, tu ne verras pas les alertes des personnes autour de toi.' },
+    { key: 'microphone',          icon: '🎙️', title: 'Microphone',
+      desc: 'Pour l\'enregistrement de protection (shield)',
+      impact: 'Sans micro, l\'enregistrement de protection est indisponible.' },
+    { key: 'camera',              icon: '💡', title: 'Caméra',
+      desc: 'Pour le flash SOS',
+      impact: 'Sans caméra, le flash SOS est indisponible.' },
+    { key: 'background_location', icon: '🗺️', title: 'Position en arrière-plan',
+      desc: 'Pour continuer à partager ta position même écran éteint',
+      impact: 'Sans ça, le partage de position s\'arrête quand l\'écran s\'éteint.', last: true }
+];
+var _onbIndex = 0;
+var _onbStarted = false;
+
+function maybeStartOnboarding() {
+    if (_onbStarted) return;
+    if (localStorage.getItem('marsel_onboarded') === '1') return;
+    if (!window.AndroidBridge || typeof AndroidBridge.requestPermissionGroup !== 'function') {
+        // Pas de bridge natif (test navigateur) : rien à demander
+        localStorage.setItem('marsel_onboarded', '1');
+        return;
+    }
+    _onbStarted = true;
+    _onbIndex = 0;
+    _renderOnboarding();
+}
+
+function _onbEnsureOverlay() {
+    var ov = document.getElementById('marsel-onboarding');
+    if (ov) return ov;
+    ov = document.createElement('div');
+    ov.id = 'marsel-onboarding';
+    ov.style.cssText = [
+        'position:fixed;inset:0;z-index:10000;display:flex;flex-direction:column;',
+        'align-items:center;justify-content:center;padding:32px 24px;text-align:center;',
+        'background:#1A35C8;color:white;font-family:Nunito,sans-serif;'
+    ].join('');
+    document.body.appendChild(ov);
+    return ov;
+}
+
+function _renderOnboarding() {
+    // Sauter la position en arrière-plan si la localisation n'a pas été accordée (G1)
+    var g = MARSEL_PERM_GROUPS[_onbIndex];
+    if (g && g.key === 'background_location' &&
+        window.AndroidBridge && typeof AndroidBridge.hasPermissionGroup === 'function') {
+        try {
+            if (!AndroidBridge.hasPermissionGroup('location')) { _onbNext(); return; }
+        } catch (e) {}
+    }
+    if (_onbIndex >= MARSEL_PERM_GROUPS.length) { _finishOnboarding(); return; }
+    g = MARSEL_PERM_GROUPS[_onbIndex];
+    var ov = _onbEnsureOverlay();
+    var step = (_onbIndex + 1) + ' / ' + MARSEL_PERM_GROUPS.length;
+    ov.innerHTML = [
+        '<div style="font-size:13px;opacity:0.7;margin-bottom:24px;">' + step + '</div>',
+        '<div style="font-size:64px;margin-bottom:16px;">' + g.icon + '</div>',
+        '<div style="font-size:24px;font-weight:800;margin-bottom:12px;">' + escapeHtml(g.title) + '</div>',
+        '<div style="font-size:16px;opacity:0.9;max-width:320px;margin-bottom:28px;line-height:1.4;">' + escapeHtml(g.desc) + '</div>',
+        '<button id="onb-allow" style="background:white;color:#1A35C8;border:none;border-radius:24px;padding:14px 40px;font-size:16px;font-weight:800;font-family:Nunito,sans-serif;cursor:pointer;margin-bottom:14px;">Autoriser</button>',
+        '<button id="onb-skip" style="background:transparent;color:white;border:none;font-size:14px;opacity:0.75;cursor:pointer;font-family:Nunito,sans-serif;text-decoration:underline;">Plus tard</button>',
+        '<div id="onb-impact" style="font-size:13px;opacity:0;margin-top:20px;max-width:300px;line-height:1.4;color:#FFD9CC;"></div>'
+    ].join('');
+    document.getElementById('onb-allow').onclick = _onbRequest;
+    document.getElementById('onb-skip').onclick = function () {
+        var imp = document.getElementById('onb-impact');
+        if (imp) { imp.textContent = g.impact; imp.style.opacity = '1'; }
+        setTimeout(_onbNext, 900);
+    };
+}
+
+function _onbRequest() {
+    var g = MARSEL_PERM_GROUPS[_onbIndex];
+    if (window.AndroidBridge && typeof AndroidBridge.requestPermissionGroup === 'function') {
+        try { AndroidBridge.requestPermissionGroup(g.key); } catch (e) { _onbNext(); }
+    } else {
+        _onbNext();
+    }
+}
+
+// Callback natif (Section 6)
+window.onPermissionResult = function (group, granted, permanentlyDenied) {
+    mLog('J', 'NET', 'perm ' + group + ' granted=' + granted + ' permDenied=' + permanentlyDenied);
+    if (!_onbStarted) return;
+    var g = MARSEL_PERM_GROUPS[_onbIndex];
+    if (!g || g.key !== group) return;
+    if (!granted && permanentlyDenied) {
+        // Refus définitif : proposer l'ouverture des réglages
+        var ov = _onbEnsureOverlay();
+        var imp = document.getElementById('onb-impact');
+        if (imp) { imp.textContent = g.impact + ' Tu peux l\'activer dans les réglages.'; imp.style.opacity = '1'; }
+        var allow = document.getElementById('onb-allow');
+        if (allow) {
+            allow.textContent = 'Ouvrir les réglages';
+            allow.onclick = function () {
+                if (window.AndroidBridge && typeof AndroidBridge.openAppSettings === 'function') {
+                    try { AndroidBridge.openAppSettings(); } catch (e) {}
+                }
+                setTimeout(_onbNext, 400);
+            };
+        }
+        return;
+    }
+    _onbNext();
+};
+
+function _onbNext() {
+    _onbIndex++;
+    _renderOnboarding();
+}
+
+function _finishOnboarding() {
+    localStorage.setItem('marsel_onboarded', '1');
+    var ov = document.getElementById('marsel-onboarding');
+    if (ov && ov.parentNode) ov.parentNode.removeChild(ov);
+    showToast('Configuration terminée ✓');
 }
 
 /* ---------------------------------------------------------
