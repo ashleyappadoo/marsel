@@ -787,15 +787,16 @@ function deactivateEmergency() {
     if (savedEmergency) {
         var pseudo = savedEmergency.pseudo || 'Utilisateur';
         var lastPos = 'https://maps.google.com/?q=' + MARSEL.currentLat + ',' + MARSEL.currentLng;
-        var finMsg = '✅ FIN D\'ALERTE MARSEL\n' + pseudo + ' est en sécurité.\nDernière position connue : ' + lastPos;
 
-        // SMS de fin aux proches — SmsManager utilise le réseau cellulaire (pas internet)
-        var contacts = savedEmergency.contacts || [];
-        contacts.forEach(function (c) {
-            if (c.mobile && window.AndroidBridge && typeof AndroidBridge.sendEmergencySMS === 'function') {
-                try { AndroidBridge.sendEmergencySMS(c.mobile, finMsg); } catch (e) {}
-            }
-        });
+        // Enregistrement audio actif ? (shield audio) → mention dans le SMS de fin
+        var settingsFin = JSON.parse(localStorage.getItem('marsel_settings') || '{}');
+        var hasAudio = !!settingsFin.audio;
+        var audioMention = hasAudio ? '\nUn enregistrement audio de l\'alerte est disponible.' : '';
+        var finMsg = '✅ FIN D\'ALERTE MARSEL\n' + pseudo + ' est en sécurité.\nDernière position connue : ' + lastPos + audioMention;
+
+        // ÉTAPE D : SMS de fin via la MÊME cascade que l'étape A
+        // (mobile → wifi → paquet MRN MARSEL_RESOLVED_SMS_REQUEST relayé).
+        sendCascadeSms('RESOLVED', savedEmergency, finMsg, hasAudio);
 
         // Paquet de résolution vers les appareils voisins via relay
         var resolvedPacket = {
@@ -905,17 +906,95 @@ function updateEmergencyUI() {
 }
 
 /* ---------------------------------------------------------
-   EMERGENCY ROUTING
+   EMERGENCY ROUTING — cascade réseau (Section 1)
    --------------------------------------------------------- */
-function routeEmergency(emergencyData) {
-    updateNetworkStatus();
-    mLog('J', 'NET', 'routeEmergency networkType=' + MARSEL.networkType);
 
-    // Always relay via WiFi Direct — nearby Marsel phones get notification + map marker.
+// Qualité réseau VALIDÉE via le bridge natif (F1). Fallback navigator si
+// le bridge est absent (test navigateur).
+function getNetworkQuality() {
+    if (window.AndroidBridge && typeof AndroidBridge.detectNetworkQuality === 'function') {
+        try { return AndroidBridge.detectNetworkQuality() || 'NONE'; } catch (e) {}
+    }
+    return navigator.onLine ? 'WIFI_STABLE' : 'NONE';
+}
+
+function routeEmergency(emergencyData) {
+    var quality = getNetworkQuality();
+    updateNetworkStatus();
+    mLog('J', 'NET', 'routeEmergency quality=' + quality);
+
+    // ── ÉTAPE B (TOUJOURS) : diffusion MRN ──
+    // Notification système + marqueur GPS chez les téléphones Marsel voisins,
+    // quel que soit l'état réseau. Le paquet transporte les numéros des proches
+    // (champ "c" du TXT record) pour la chaîne relay hors-ligne.
     sendEmergencyViaRelayNetwork(emergencyData);
 
-    // Always attempt SMS — SmsManager uses cellular baseband, not internet.
-    sendEmergencyViaInternet(emergencyData);
+    // ── ÉTAPE A : alerte aux proches selon la cascade ──
+    if (quality === 'MOBILE_STABLE') {
+        // 3G/4G/5G validé → SMS immédiat
+        sendEmergencyViaInternet(emergencyData);
+        emergencyData.smsSent = true;
+    } else if (quality === 'WIFI_STABLE') {
+        // WiFi validé → API backend si configurée + tenter le SMS (la baseband
+        // peut passer même sans data mobile)
+        if (window.MARSEL_CONFIG && MARSEL_CONFIG.API_URL) sendToAPI(emergencyData);
+        sendEmergencyViaInternet(emergencyData);
+        emergencyData.smsSent = true;
+    } else {
+        // NONE → aucun réseau validé : le SMS est délégué au réseau Marsel.
+        // Le paquet se propage de téléphone en téléphone jusqu'à un relais
+        // ayant du réseau qui enverra le SMS aux proches À LA PLACE de l'émetteur.
+        emergencyData.smsSent = false;
+        mLog('J', 'NET', 'Hors réseau validé — SMS délégué au relais MRN');
+        showToast('🔁 Hors réseau : alerte transmise via le réseau Marsel');
+        // Persister le flag pour éviter un double-envoi au flush (F2)
+        try {
+            var saved = JSON.parse(localStorage.getItem('marsel_emergency') || 'null');
+            if (saved) { saved.smsSent = false; localStorage.setItem('marsel_emergency', JSON.stringify(saved)); }
+        } catch (e) {}
+    }
+}
+
+// Cascade SMS pour les messages de fin/timeout (Section 1 ÉTAPE D + Section 4).
+// kind = 'RESOLVED' | 'TIMEOUT'. Réseau validé → SMS direct via SmsManager ;
+// sinon paquet MRN (F/T) relayé jusqu'à un téléphone connecté, dédup smsHandled
+// gérée côté Kotlin. Le fichier audio ne transite JAMAIS par le MRN (flag "audio"
+// seulement, pour que le SMS relayé mentionne l'enregistrement).
+function sendCascadeSms(kind, savedEmergency, message, hasAudio) {
+    var quality = getNetworkQuality();
+    var contacts = (savedEmergency.contacts || []).filter(function (c) { return c.mobile; });
+
+    if (quality === 'MOBILE_STABLE' || quality === 'WIFI_STABLE') {
+        contacts.forEach(function (c) {
+            if (window.AndroidBridge && typeof AndroidBridge.sendEmergencySMS === 'function') {
+                try { AndroidBridge.sendEmergencySMS(c.mobile, message); } catch (e) {}
+            }
+        });
+        mLog('J', 'NET', kind + ' SMS direct (' + quality + ') → ' + contacts.length + ' proche(s)');
+    } else {
+        var type = (kind === 'TIMEOUT') ? 'MARSEL_TIMEOUT_SMS_REQUEST' : 'MARSEL_RESOLVED_SMS_REQUEST';
+        var tag = (kind === 'TIMEOUT') ? 'timeout' : 'ressms';
+        var eId = savedEmergency.id || savedEmergency.emergencyId || MARSEL.emergencyId;
+        var reqPacket = {
+            type: type,
+            version: 1,
+            messageId: eId + '_' + tag + '_' + Date.now(),
+            emergencyId: eId,
+            userId: savedEmergency.userId,
+            pseudo: savedEmergency.pseudo || 'Utilisateur',
+            lat: MARSEL.currentLat,
+            lng: MARSEL.currentLng,
+            timestamp: Date.now(),
+            contacts: savedEmergency.contacts || [],
+            audio: hasAudio ? '1' : '0',
+            hopCount: 0,
+            maxHops: 10
+        };
+        if (window.AndroidBridge && typeof AndroidBridge.sendEmergencyViaRelay === 'function') {
+            try { AndroidBridge.sendEmergencyViaRelay(JSON.stringify(reqPacket)); } catch (e) {}
+        }
+        mLog('J', 'NET', kind + ' SMS délégué au MRN (' + type + ')');
+    }
 }
 
 function sendEmergencyViaInternet(emergencyData) {
@@ -1231,8 +1310,11 @@ function sendPositionUpdate(lat, lng) {
         try { AndroidBridge.sendEmergencyViaRelay(JSON.stringify(updatePacket)); } catch (e) {}
     }
 
-    // Si internet dispo : mettre à jour via API
-    if ((MARSEL.networkType === 'WIFI' || MARSEL.networkType === 'MOBILE')
+    // ÉTAPE C : tracking temps réel proches/sécurité via backend.
+    // Si l'émetteur a (ou retrouve) du réseau VALIDÉ pendant l'alerte, pousser
+    // la position au backend à chaque cycle (10s). Vérifié à chaque appel.
+    var quality = getNetworkQuality();
+    if ((quality === 'WIFI_STABLE' || quality === 'MOBILE_STABLE')
             && window.MARSEL_CONFIG && MARSEL_CONFIG.API_URL && MARSEL_CONFIG.API_KEY) {
         fetch(MARSEL_CONFIG.API_URL + '/emergency/' + MARSEL.emergencyId + '/position', {
             method: 'PUT',
@@ -1939,14 +2021,20 @@ function escapeHtml(str) {
    RELAY QUEUE FLUSH (periodic)
    --------------------------------------------------------- */
 function flushRelayQueueIfOnline() {
-    if (MARSEL.networkType !== 'WIFI' && MARSEL.networkType !== 'MOBILE') return;
+    var quality = getNetworkQuality();
+    if (quality === 'NONE') return;
     if (!MARSEL.relayQueue.length) return;
 
     var queue = MARSEL.relayQueue.slice();
     MARSEL.relayQueue = [];
 
     queue.forEach(function (data) {
+        // F2 : ne (re)envoyer le SMS que si l'alerte n'a PAS déjà été SMS-ée.
+        // Sans ce garde, une urgence déclenchée avec réseau était re-SMS-ée à
+        // chaque event 'online' / cycle 30s → salves de SMS dupliqués.
+        if (data && data.smsSent === true) return;
         sendEmergencyViaInternet(data);
+        data.smsSent = true;
     });
 
     // Clear DB queue
