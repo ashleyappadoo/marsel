@@ -1961,6 +1961,19 @@ class MainActivity : ComponentActivity() {
         @JavascriptInterface
         fun getRecordings(): String = listRecordingsJson()
 
+        // Lieux sûrs : contenu brut de assets/safeplace.csv
+        // (format : nom_emplacement, lat, long). Lu via le bridge car la WebView
+        // bloque fetch() sur file:// — le JS filtre ensuite selon la position réelle.
+        @JavascriptInterface
+        fun getSafePlacesCsv(): String {
+            return try {
+                assets.open("safeplace.csv").bufferedReader(Charsets.UTF_8).use { it.readText() }
+            } catch (e: Exception) {
+                Log.w(TAG, "getSafePlacesCsv: ${e.message}")
+                ""
+            }
+        }
+
         // 5b : MMS best-effort du dernier enregistrement (fin d'alerte, MOBILE_STABLE)
         @JavascriptInterface
         fun sendRecordingMms(phoneNumber: String) {

@@ -230,64 +230,76 @@ function dbDelete(storeName, key) {
     });
 }
 
-/* Récupère les lieux sûrs RÉELS (OpenStreetMap Overpass) autour d'une vraie
-   position, les met en cache local (IndexedDB) et rafraîchit la carte.
-   Aucune donnée factice : hors connexion, on garde les derniers lieux réels
-   déjà mis en cache. Ne re-télécharge pas si on l'a déjà fait récemment et
-   qu'on ne s'est pas éloigné. */
+/* ---------------------------------------------------------
+   SAFE PLACES — source : assets/safeplace.csv (dans le git)
+   Format : nom_emplacement, lat, long (avec ligne d'en-tête).
+   Les lieux s'affichent SELON NOTRE POSITION RÉELLE : uniquement
+   ceux dans SAFE_PLACES_RADIUS_M autour du vrai fix GPS.
+   --------------------------------------------------------- */
+var _safePlacesAll = null;      // contenu parsé du CSV (cache mémoire)
+var _spLastRenderPos = null;    // dernière position de rendu (re-filtre si >500m)
+
+function loadSafePlacesCsv() {
+    if (_safePlacesAll !== null) return _safePlacesAll;
+    var text = '';
+    if (window.AndroidBridge && typeof AndroidBridge.getSafePlacesCsv === 'function') {
+        try { text = AndroidBridge.getSafePlacesCsv() || ''; } catch (e) {}
+    }
+    _safePlacesAll = [];
+    if (!text) { mLog('J', 'NET', 'safeplace.csv introuvable ou vide'); return _safePlacesAll; }
+
+    var lines = text.split(/\r?\n/);
+    for (var i = 0; i < lines.length; i++) {
+        var line = lines[i].trim();
+        if (!line) continue;
+        // Séparateur : virgule, ou point-virgule si pas de virgule (export Excel FR)
+        var sep = (line.indexOf(',') === -1 && line.indexOf(';') !== -1) ? ';' : ',';
+        var parts = line.split(sep);
+        if (parts.length < 3) continue;
+        // Format nom_emplacement, lat, long : lat/long lues depuis la DROITE,
+        // le nom peut donc contenir des virgules.
+        var lng = parseFloat(parts[parts.length - 1]);
+        var lat = parseFloat(parts[parts.length - 2]);
+        var name = parts.slice(0, parts.length - 2).join(sep).trim();
+        if (!isFinite(lat) || !isFinite(lng)) continue; // saute l'en-tête / lignes invalides
+        if (!name) continue;
+        _safePlacesAll.push({ id: 'csv-' + i, name: name, lat: lat, lng: lng, type: 'safe' });
+    }
+    mLog('J', 'NET', 'safeplace.csv chargé : ' + _safePlacesAll.length + ' lieu(x)');
+    return _safePlacesAll;
+}
+
+/* Rafraîchit l'affichage des lieux sûrs autour de la position réelle donnée.
+   Idempotent : ne re-rend que si on a bougé de plus de 500 m. */
 function refreshRealSafePlaces(lat, lng) {
     if (!isFinite(lat) || !isFinite(lng)) return;
-    if (getNetworkQuality() === 'NONE') { mLog('J', 'NET', 'safe places: hors ligne, cache local conservé'); return; }
+    if (_spLastRenderPos && distanceMeters(lat, lng, _spLastRenderPos.lat, _spLastRenderPos.lng) < 500) return;
+    _spLastRenderPos = { lat: lat, lng: lng };
+    renderSafePlaces(lat, lng);
+}
 
-    // Anti-spam : skip si dernier fetch < 1h ET déplacement < 1km
-    try {
-        var last = JSON.parse(localStorage.getItem('marsel_sp_fetch') || 'null');
-        if (last && (Date.now() - last.ts) < 3600000 &&
-            distanceMeters(lat, lng, last.lat, last.lng) < 1000) {
-            return;
-        }
-    } catch (e) {}
+function renderSafePlaces(lat, lng) {
+    if (!MARSEL.leafletMap) return;
+    var all = loadSafePlacesCsv();
+    var radius = (window.MARSEL_CONFIG && MARSEL_CONFIG.SAFE_PLACES_RADIUS_M) || 2500;
 
-    var cfg = window.MARSEL_CONFIG || {};
-    var url = cfg.OVERPASS_URL || 'https://overpass-api.de/api/interpreter';
-    var r = cfg.SAFE_PLACES_RADIUS_M || 2500;
-    var q = '[out:json][timeout:20];(' +
-        'node["amenity"="police"](around:' + r + ',' + lat + ',' + lng + ');' +
-        'node["amenity"="hospital"](around:' + r + ',' + lat + ',' + lng + ');' +
-        'node["amenity"="townhall"](around:' + r + ',' + lat + ',' + lng + ');' +
-        'node["amenity"="pharmacy"](around:' + r + ',' + lat + ',' + lng + ');' +
-        ');out center 60;';
+    // Retirer les marqueurs précédents avant de re-filtrer
+    MARSEL.safePlaceMarkers.forEach(function (m) {
+        try { MARSEL.leafletMap.removeLayer(m); } catch (e) {}
+    });
+    MARSEL.safePlaceMarkers = [];
 
-    fetch(url, { method: 'POST', body: 'data=' + encodeURIComponent(q) })
-        .then(function (res) { return res.ok ? res.json() : null; })
-        .then(function (data) {
-            if (!data || !data.elements) return;
-            var count = 0;
-            data.elements.forEach(function (el) {
-                var elat = el.lat || (el.center && el.center.lat);
-                var elng = el.lon || (el.center && el.center.lon);
-                if (!isFinite(elat) || !isFinite(elng)) return;
-                var tags = el.tags || {};
-                var type = tags.amenity === 'police' ? 'police'
-                         : tags.amenity === 'hospital' ? 'hopital'
-                         : tags.amenity === 'townhall' ? 'mairie'
-                         : 'safe';
-                var place = {
-                    id: 'osm-' + el.type + '-' + el.id,
-                    name: tags.name || (type === 'police' ? 'Police'
-                            : type === 'hopital' ? 'Hôpital'
-                            : type === 'mairie' ? 'Mairie' : 'Pharmacie'),
-                    lat: elat, lng: elng, type: type,
-                    phone: tags.phone || tags['contact:phone'] || ''
-                };
-                dbPut('safe_places', place).catch(function () {});
-                count++;
-            });
-            localStorage.setItem('marsel_sp_fetch', JSON.stringify({ ts: Date.now(), lat: lat, lng: lng }));
-            mLog('J', 'NET', 'safe places réels récupérés: ' + count);
-            loadSafePlacesOnMap();
-        })
-        .catch(function (e) { mLog('J', 'NET', 'safe places fetch échec: ' + e); });
+    var shown = 0;
+    all.forEach(function (place) {
+        if (distanceMeters(lat, lng, place.lat, place.lng) > radius) return;
+        var icon = createMapMarkerIcon('#4CAF50', 'safe');
+        var marker = L.marker([place.lat, place.lng], { icon: icon })
+            .addTo(MARSEL.leafletMap)
+            .bindPopup('<b>' + escapeHtml(place.name) + '</b>');
+        MARSEL.safePlaceMarkers.push(marker);
+        shown++;
+    });
+    mLog('J', 'NET', 'safe places affichés : ' + shown + '/' + all.length + ' (rayon ' + radius + 'm)');
 }
 
 /* Distance approximative en mètres entre deux points (équirectangulaire). */
@@ -436,9 +448,11 @@ window.onLocationUpdate = function (lat, lng, accuracy) {
         }
         if (wasFirst) {
             MARSEL.leafletMap.setView([fLat, fLng], 15);
-            // Premier vrai fix : charger les lieux sûrs RÉELS autour de la position
-            refreshRealSafePlaces(fLat, fLng);
         }
+        // Lieux sûrs du CSV selon la position réelle — appelé à chaque fix,
+        // le garde interne (>500 m) évite tout re-rendu inutile ; les lieux
+        // suivent donc l'utilisateur quand il se déplace.
+        refreshRealSafePlaces(fLat, fLng);
     }
 
     // Si urgence active : mettre à jour la position locale uniquement.
@@ -585,29 +599,11 @@ function initMap() {
 }
 
 function loadSafePlacesOnMap() {
-    dbGetAll('safe_places').then(function (places) {
-        if (!MARSEL.leafletMap) return;
-        // Idempotent : retirer les marqueurs déjà posés avant de re-rendre
-        // (loadSafePlacesOnMap est rappelé après chaque refresh Overpass).
-        MARSEL.safePlaceMarkers.forEach(function (m) {
-            try { MARSEL.leafletMap.removeLayer(m); } catch (e) {}
-        });
-        MARSEL.safePlaceMarkers = [];
-
-        places.forEach(function (place) {
-            if (!isFinite(place.lat) || !isFinite(place.lng)) return;
-            var color = '#4CAF50';
-            if (place.type === 'police') color = '#1A35C8';
-            else if (place.type === 'hopital') color = '#E84315';
-            else if (place.type === 'mairie') color = '#9C27B0';
-
-            var icon = createMapMarkerIcon(color, place.type);
-            var marker = L.marker([place.lat, place.lng], { icon: icon })
-                .addTo(MARSEL.leafletMap)
-                .bindPopup('<b>' + escapeHtml(place.name) + '</b>' + (place.phone ? '<br>📞 ' + escapeHtml(place.phone) : ''));
-            MARSEL.safePlaceMarkers.push(marker);
-        });
-    }).catch(function () {});
+    // Source : safeplace.csv, affiché selon la position RÉELLE uniquement.
+    // Sans vrai fix GPS, rien n'est affiché — les lieux apparaîtront au
+    // premier fix via refreshRealSafePlaces (onLocationUpdate).
+    var pos = getRealPosition();
+    if (pos) renderSafePlaces(pos.lat, pos.lng);
 }
 
 function loadIncidentsOnMap() {

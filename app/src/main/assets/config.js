@@ -32,10 +32,9 @@ var MARSEL_CONFIG = {
     EMERGENCY_HOLD_DURATION: 5000,  // 5s hold to trigger emergency
 
     // === SAFE PLACES ===
-    // Aucune donnée factice. Les lieux sûrs (police, hôpital, mairie, pharmacie)
-    // sont récupérés en TEMPS RÉEL autour de la position exacte de l'utilisateur
-    // via OpenStreetMap Overpass (voir refreshRealSafePlaces dans script.js),
-    // puis mis en cache local pour rester disponibles hors connexion.
-    OVERPASS_URL: 'https://overpass-api.de/api/interpreter',
-    SAFE_PLACES_RADIUS_M: 2500      // rayon de recherche autour de la position réelle
+    // Source : le fichier assets/safeplace.csv, versionné dans le git.
+    // Format : nom_emplacement, lat, long (une ligne par lieu, en-tête inclus).
+    // Les lieux s'affichent SELON LA POSITION RÉELLE de l'utilisateur :
+    // uniquement ceux situés dans SAFE_PLACES_RADIUS_M autour du vrai fix GPS.
+    SAFE_PLACES_RADIUS_M: 2500      // rayon d'affichage autour de la position réelle
 };
