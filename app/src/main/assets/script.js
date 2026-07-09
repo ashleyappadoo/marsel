@@ -1100,16 +1100,26 @@ function getNetworkQuality() {
     return navigator.onLine ? 'WIFI_STABLE' : 'NONE';
 }
 
+// Capacité SMS réelle (SIM prête). Le réseau ne dit RIEN de la capacité SMS :
+// un téléphone en WiFi sans SIM doit déléguer ses SMS au réseau Marsel.
+function deviceCanSendSms() {
+    if (window.AndroidBridge && typeof AndroidBridge.canSendSms === 'function') {
+        try { return !!AndroidBridge.canSendSms(); } catch (e) {}
+    }
+    return false;
+}
+
 function routeEmergency(emergencyData) {
     var quality = getNetworkQuality();
+    var canSms = deviceCanSendSms();
     updateNetworkStatus();
-    mLog('J', 'NET', 'routeEmergency quality=' + quality);
+    mLog('J', 'NET', 'routeEmergency quality=' + quality + ' canSms=' + canSms);
 
-    // AUDIT-FIX 2 : relaySms indique si un relais doit envoyer les SMS à ma place.
-    // Vrai UNIQUEMENT si je suis hors réseau validé (sinon j'envoie moi-même les
-    // SMS en ÉTAPE A, et un relais ne doit pas les renvoyer → anti double-SMS).
+    // AUDIT-FIX 2 + TEST-FIX : relaySms indique si un relais doit envoyer les SMS
+    // à ma place. Vrai si je suis hors réseau validé OU si je ne peux pas envoyer
+    // de SMS moi-même (PAS DE SIM — cas terrain : WiFi sans SIM).
     // Doit être positionné AVANT la diffusion MRN (ÉTAPE B) pour voyager dans le TXT.
-    emergencyData.relaySms = (quality === 'NONE') ? '1' : '0';
+    emergencyData.relaySms = (quality === 'NONE' || !canSms) ? '1' : '0';
     // AUDIT-FIX 3 : persister relaySms pour qu'un redémarrage de l'app préserve
     // le flag lors de la re-diffusion de l'alerte.
     try {
@@ -1124,7 +1134,19 @@ function routeEmergency(emergencyData) {
     sendEmergencyViaRelayNetwork(emergencyData);
 
     // ── ÉTAPE A : alerte aux proches selon la cascade ──
-    if (quality === 'MOBILE_STABLE') {
+    if (!canSms) {
+        // TEST-FIX : pas de SIM — impossible d'envoyer les SMS nous-mêmes, même
+        // avec du réseau. Les numéros voyagent dans le paquet MRN (relaySms=1) :
+        // un relais avec SIM les enverra à notre place. API backend si dispo.
+        emergencyData.smsSent = false;
+        if (quality !== 'NONE' && window.MARSEL_CONFIG && MARSEL_CONFIG.API_URL) sendToAPI(emergencyData);
+        mLog('J', 'NET', 'Pas de SIM — SMS délégués au relais MRN (relaySms=1)');
+        showToast('🔁 Pas de SIM : SMS aux proches délégués au réseau Marsel');
+        try {
+            var savedNoSim = JSON.parse(localStorage.getItem('marsel_emergency') || 'null');
+            if (savedNoSim) { savedNoSim.smsSent = false; localStorage.setItem('marsel_emergency', JSON.stringify(savedNoSim)); }
+        } catch (e) {}
+    } else if (quality === 'MOBILE_STABLE') {
         // 3G/4G/5G validé → SMS immédiat
         sendEmergencyViaInternet(emergencyData);
         emergencyData.smsSent = true;
@@ -1156,6 +1178,7 @@ function routeEmergency(emergencyData) {
 // seulement, pour que le SMS relayé mentionne l'enregistrement).
 function sendCascadeSms(kind, savedEmergency, message, hasAudio) {
     var quality = getNetworkQuality();
+    var canSms = deviceCanSendSms();
     var contacts = (savedEmergency.contacts || []).filter(function (c) { return c.mobile; });
 
     // Position réelle uniquement pour le paquet relayé (jamais de défaut)
@@ -1164,7 +1187,9 @@ function sendCascadeSms(kind, savedEmergency, message, hasAudio) {
         scPos = { lat: savedEmergency.lat, lng: savedEmergency.lng };
     }
 
-    if (quality === 'MOBILE_STABLE' || quality === 'WIFI_STABLE') {
+    // TEST-FIX : le SMS direct exige réseau validé ET SIM prête. Sans SIM
+    // (cas terrain : WiFi seul), on délègue au réseau Marsel (paquet F/T).
+    if ((quality === 'MOBILE_STABLE' || quality === 'WIFI_STABLE') && canSms) {
         contacts.forEach(function (c) {
             if (window.AndroidBridge && typeof AndroidBridge.sendEmergencySMS === 'function') {
                 try { AndroidBridge.sendEmergencySMS(c.mobile, message); } catch (e) {}
@@ -2424,6 +2449,9 @@ function _finishOnboarding() {
 function flushRelayQueueIfOnline() {
     var quality = getNetworkQuality();
     if (quality === 'NONE') return;
+    // TEST-FIX : sans SIM, aucun SMS ne peut partir d'ici — les paquets MRN
+    // (relaySms=1) sont déjà en diffusion, un relais avec SIM s'en charge.
+    if (!deviceCanSendSms()) return;
     if (!MARSEL.relayQueue.length) return;
 
     var queue = MARSEL.relayQueue.slice();

@@ -554,10 +554,15 @@ class MainActivity : ComponentActivity() {
                     val state = intent.getIntExtra(WifiP2pManager.EXTRA_WIFI_STATE, -1)
                     wifiP2pEnabled = state == WifiP2pManager.WIFI_P2P_STATE_ENABLED
                     Log.d(TAG, "WiFi P2P state: ${if (wifiP2pEnabled) "ENABLED" else "DISABLED"}")
-                    // Auto-start discovery so we can receive alerts from nearby phones
                     if (wifiP2pEnabled) {
-                        startP2PDiscoveryInternal()
-                        restartServiceDiscovery()
+                        // TEST-FIX : un rebond DISABLED→ENABLED du framework P2P
+                        // (fréquent, vu dans les logs terrain) EFFACE les services
+                        // locaux — sans ré-enregistrement, l'alerte cesse d'émettre
+                        // en silence. On ré-enregistre tout + relance la découverte.
+                        logToJs("P2P", "P2P ré-activé — ré-enregistrement des services actifs")
+                        lastServiceRequestResetMs = 0  // force un re-arm complet
+                        reRegisterActiveServices()
+                        kickDiscoveryNow()
                     }
                     // Tell JS so the UI can warn the user (WiFi off = relay impossible)
                     runOnUiThread {
@@ -733,6 +738,20 @@ class MainActivity : ComponentActivity() {
 
             logToJs("RELAY", "RECV $msgType id=$messageId")
 
+            // TEST-FIX : ne jamais re-notifier une urgence DÉJÀ RÉSOLUE.
+            // Vu en terrain : une vieille E rejouée par le canal socket après la
+            // fin d'alerte déclenchait une nouvelle notification. On mémorise les
+            // résolutions (dédup persistée « res ») et on ignore les E correspondantes.
+            val emergencyKey = extractJsonString(json, "emergencyId")
+                ?: extractJsonString(json, "id") ?: messageId
+            if (msgType == MarselProtocol.TYPE_RESOLVED) {
+                dedupLedger.checkAndMark("res", emergencyKey)
+            }
+            if (msgType == MarselProtocol.TYPE_EMERGENCY && dedupLedger.isSeen("res", emergencyKey)) {
+                logToJs("RELAY", "E $messageId ignorée : urgence déjà résolue")
+                return
+            }
+
             // Notify JS to display on map (use escapeJs for safe double-quoted string)
             runOnUiThread {
                 webView.evaluateJavascript(
@@ -799,7 +818,9 @@ class MainActivity : ComponentActivity() {
         maxHops: Int
     ) {
         val quality = detectNetworkQuality()
-        if (quality != "NONE") {
+        // TEST-FIX : réseau validé ET SIM prête — un relais en WiFi sans SIM
+        // aurait marqué smsHandled sans jamais pouvoir envoyer (paquet mort).
+        if (quality != "NONE" && canSendSmsDirect()) {
             // Dédup smsHandled persistée : un même paquet ne déclenche les SMS
             // qu'UNE seule fois, même après restart de l'app.
             if (dedupLedger.checkAndMark("sms", messageId)) {
@@ -837,7 +858,7 @@ class MainActivity : ComponentActivity() {
             }
             val updatedJson = """"hopCount"\s*:\s*$hopCount""".toRegex()
                 .replace(json, "\"hopCount\":${hopCount + 1}")
-            logToJs("RELAY", "SMS-REQ $msgType : pas de réseau ici, propagation hop=${hopCount + 1}")
+            logToJs("RELAY", "SMS-REQ $msgType : pas de réseau/SIM ici, propagation hop=${hopCount + 1}")
             registerRelayedService(updatedJson)
             synchronized(pendingRelayMessages) { pendingRelayMessages.add(updatedJson) }
             groupOwnerAddress?.let { addr ->
@@ -983,6 +1004,7 @@ class MainActivity : ComponentActivity() {
 
     private fun fullServiceRecovery(reason: String) {
         logToJs("DNS-SD", "RECOVERY ($reason)")
+        lastServiceRequestResetMs = System.currentTimeMillis()
         try {
             wifiP2pManager.clearServiceRequests(wifiP2pChannel, object : WifiP2pManager.ActionListener {
                 override fun onSuccess() = step2()
@@ -1074,9 +1096,13 @@ class MainActivity : ComponentActivity() {
 
     // I3 : purge les paquets en file (positions/alerte) d'une urgence résolue,
     // pour ne pas rejouer de vieilles positions aux pairs qui se connectent après.
+    // TEST-FIX : match par VALEUR d'identifiant (couvre id / messageId /
+    // emergencyId) — les paquets E d'origine ne portent pas de champ emergencyId
+    // et échappaient à la purge, d'où une vieille E rejouée par socket en test.
     private fun purgePendingForEmergency(emergencyId: String) {
+        if (emergencyId.isEmpty()) return
         synchronized(pendingRelayMessages) {
-            pendingRelayMessages.removeAll { it.contains(""""emergencyId":"$emergencyId"""") }
+            pendingRelayMessages.removeAll { it.contains("\"$emergencyId\"") }
         }
     }
 
@@ -1363,15 +1389,27 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    // TEST-FIX latence : le cycle complet clear→add→discover à CHAQUE période
+    // (8s) provoque du throttling framework — trous de réception de 30s+
+    // observés en test terrain. On ne ré-arme la requête de service que toutes
+    // les 2 min (ou sur échec/recovery) ; entre-temps, simple discoverServices.
+    @Volatile private var lastServiceRequestResetMs = 0L
+
     private fun restartServiceDiscovery() {
         if (!wifiP2pEnabled) return
-        try {
-            wifiP2pManager.clearServiceRequests(wifiP2pChannel, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() { addServiceRequestAndDiscover() }
-                override fun onFailure(reason: Int) { addServiceRequestAndDiscover() }
-            })
-        } catch (e: Exception) {
-            Log.e(TAG, "restartServiceDiscovery: ${e.message}")
+        val now = System.currentTimeMillis()
+        if (now - lastServiceRequestResetMs > 120_000) {
+            lastServiceRequestResetMs = now
+            try {
+                wifiP2pManager.clearServiceRequests(wifiP2pChannel, object : WifiP2pManager.ActionListener {
+                    override fun onSuccess() { addServiceRequestAndDiscover() }
+                    override fun onFailure(reason: Int) { addServiceRequestAndDiscover() }
+                })
+            } catch (e: Exception) {
+                Log.e(TAG, "restartServiceDiscovery: ${e.message}")
+            }
+        } else {
+            discoverServicesOnly()
         }
     }
 
@@ -1379,20 +1417,32 @@ class MainActivity : ComponentActivity() {
         try {
             val request = WifiP2pDnsSdServiceRequest.newInstance()
             wifiP2pManager.addServiceRequest(wifiP2pChannel, request, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() {
-                    try {
-                        wifiP2pManager.discoverServices(wifiP2pChannel, object : WifiP2pManager.ActionListener {
-                            override fun onSuccess() { Log.d(TAG, "DNS-SD discovery running") }
-                            override fun onFailure(reason: Int) { Log.w(TAG, "discoverServices failed: reason=$reason") }
-                        })
-                    } catch (e: SecurityException) {
-                        Log.e(TAG, "discoverServices denied (NEARBY_WIFI_DEVICES?): ${e.message}")
-                    }
+                override fun onSuccess() { discoverServicesOnly() }
+                override fun onFailure(reason: Int) {
+                    logToJs("DNS-SD", "addServiceRequest ÉCHEC reason=$reason")
+                    lastServiceRequestResetMs = 0  // re-arm complet au prochain cycle
                 }
-                override fun onFailure(reason: Int) { Log.w(TAG, "addServiceRequest failed: reason=$reason") }
             })
         } catch (e: Exception) {
             Log.e(TAG, "addServiceRequestAndDiscover: ${e.message}")
+        }
+    }
+
+    private fun discoverServicesOnly() {
+        try {
+            wifiP2pManager.discoverServices(wifiP2pChannel, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() { Log.d(TAG, "DNS-SD discovery running") }
+                override fun onFailure(reason: Int) {
+                    // Échec visible dans l'overlay (avant : Log.w invisible en test
+                    // mobile) + re-arm complet au prochain cycle.
+                    logToJs("DNS-SD", "discoverServices ÉCHEC reason=$reason — re-arm au prochain cycle")
+                    lastServiceRequestResetMs = 0
+                }
+            })
+        } catch (e: SecurityException) {
+            logToJs("DNS-SD", "discoverServices refusé (NEARBY_WIFI_DEVICES?): ${e.message}")
+        } catch (e: Exception) {
+            Log.e(TAG, "discoverServicesOnly: ${e.message}")
         }
     }
 
@@ -1453,6 +1503,26 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) {
             Log.e(TAG, "getNetworkTypeDirect: ${e.message}")
             "NONE"
+        }
+    }
+
+    // =========================================================================
+    // TEST-FIX — Capacité SMS réelle (SIM présente et prête)
+    // =========================================================================
+    // Le check réseau (WiFi validé) ne dit RIEN de la capacité à envoyer un SMS :
+    // un téléphone en WiFi SANS SIM croyait pouvoir SMS-er ses proches lui-même
+    // (relaySms=0) → échec silencieux ET aucun relais. Vu en test terrain.
+    private fun canSendSmsDirect(): Boolean {
+        return try {
+            if (!packageManager.hasSystemFeature(PackageManager.FEATURE_TELEPHONY)) return false
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.SEND_SMS)
+                != PackageManager.PERMISSION_GRANTED
+            ) return false
+            val tm = getSystemService(Context.TELEPHONY_SERVICE) as android.telephony.TelephonyManager
+            tm.simState == android.telephony.TelephonyManager.SIM_STATE_READY
+        } catch (e: Exception) {
+            Log.w(TAG, "canSendSmsDirect: ${e.message}")
+            false
         }
     }
 
@@ -1830,6 +1900,13 @@ class MainActivity : ComponentActivity() {
                 logToJs("RELAY", "SMS relais : pas de réseau validé ici, propagation MRN uniquement")
                 return
             }
+            // TEST-FIX : un relais SANS SIM ne peut pas envoyer — il ne doit ni
+            // marquer smsHandled ni s'arrêter là (la propagation MRN continue
+            // dans processRelayMessage jusqu'à un téléphone avec SIM).
+            if (!canSendSmsDirect()) {
+                logToJs("RELAY", "SMS relais : pas de SIM ici, propagation MRN uniquement")
+                return
+            }
             val messageId = extractJsonString(json, "messageId") ?: return
             if (dedupLedger.checkAndMark("sms", messageId)) {
                 logToJs("RELAY", "SMS relais $messageId déjà envoyé — skip (dédup)")
@@ -2021,6 +2098,13 @@ class MainActivity : ComponentActivity() {
         @JavascriptInterface
         fun detectNetworkQuality(): String {
             return this@MainActivity.detectNetworkQuality()
+        }
+
+        // TEST-FIX : capacité SMS réelle (SIM prête + permission). Un téléphone
+        // en WiFi sans SIM doit déléguer ses SMS au réseau Marsel (relaySms=1).
+        @JavascriptInterface
+        fun canSendSms(): Boolean {
+            return canSendSmsDirect()
         }
 
         // -----------------------------------------------------------------------
