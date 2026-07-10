@@ -26,7 +26,9 @@ var MARSEL_CONFIG = {
 
     // === APP SETTINGS ===
     EMERGENCY_RELAY_PORT: 8890,     // WiFi Direct relay port (must match Android)
-    RELAY_HOP_LIMIT: 10,            // Max relay hops before dropping
+    RELAY_HOP_LIMIT: 5,             // Max 5 sauts : borne la propagation ET le délai
+                                    // avant le verdict « SMS impossibles » chez l'émetteur
+    SMS_ACK_TIMEOUT_MS: 120000,     // 2 min sans accusé relais → notification d'échec
     P2P_DISCOVERY_TIMEOUT: 30000,   // 30s WiFi Direct discovery timeout
     LOCATION_UPDATE_INTERVAL: 10000, // 10s GPS update interval
     EMERGENCY_HOLD_DURATION: 5000,  // 5s hold to trigger emergency

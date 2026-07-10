@@ -16,6 +16,9 @@ object MarselProtocol {
     const val TYPE_RESOLVED = "MARSEL_EMERGENCY_RESOLVED"
     const val TYPE_RESOLVED_SMS_REQUEST = "MARSEL_RESOLVED_SMS_REQUEST"
     const val TYPE_TIMEOUT_SMS_REQUEST = "MARSEL_TIMEOUT_SMS_REQUEST"
+    // ACK : un relais a RÉELLEMENT envoyé les SMS (accusé système Android) —
+    // remonte de proche en proche jusqu'à l'émetteur pour l'informer.
+    const val TYPE_SMS_ACK = "MARSEL_SMS_ACK"
 
     // TXT short types (clé "y" du record)
     const val SHORT_EMERGENCY = "E"
@@ -23,8 +26,13 @@ object MarselProtocol {
     const val SHORT_RESOLVED = "R"
     const val SHORT_RESOLVED_SMS_REQUEST = "F"
     const val SHORT_TIMEOUT_SMS_REQUEST = "T"
+    const val SHORT_SMS_ACK = "S"
 
     const val EMERGENCY_TIMEOUT_MS = 20 * 60_000L
+
+    // Plafond de sauts du maillage : borne la propagation ET le délai avant
+    // que l'émetteur conclue à l'échec (notification « SMS impossibles »).
+    const val MAX_HOPS = 5
 
     fun shortTypeOf(type: String): String? = when (type) {
         TYPE_EMERGENCY -> SHORT_EMERGENCY
@@ -32,6 +40,7 @@ object MarselProtocol {
         TYPE_RESOLVED -> SHORT_RESOLVED
         TYPE_RESOLVED_SMS_REQUEST -> SHORT_RESOLVED_SMS_REQUEST
         TYPE_TIMEOUT_SMS_REQUEST -> SHORT_TIMEOUT_SMS_REQUEST
+        TYPE_SMS_ACK -> SHORT_SMS_ACK
         else -> null
     }
 
@@ -41,6 +50,7 @@ object MarselProtocol {
         SHORT_RESOLVED -> TYPE_RESOLVED
         SHORT_RESOLVED_SMS_REQUEST -> TYPE_RESOLVED_SMS_REQUEST
         SHORT_TIMEOUT_SMS_REQUEST -> TYPE_TIMEOUT_SMS_REQUEST
+        SHORT_SMS_ACK -> TYPE_SMS_ACK
         else -> null
     }
 
@@ -135,7 +145,7 @@ object MarselProtocol {
                 """{"mobile":"${sanitizeTxtValue(num, 20)}"}"""
             }
 
-        return """{"type":"$type","messageId":"$msgId","id":"$emergencyId","emergencyId":"$emergencyId","pseudo":"$pseudo","lat":$lat,"lng":$lng,"timestamp":$ts,"hopCount":$hop,"maxHops":10,"audio":"$audio","relaySms":"$relaySms","contacts":$contactsJson}"""
+        return """{"type":"$type","messageId":"$msgId","id":"$emergencyId","emergencyId":"$emergencyId","pseudo":"$pseudo","lat":$lat,"lng":$lng,"timestamp":$ts,"hopCount":$hop,"maxHops":$MAX_HOPS,"audio":"$audio","relaySms":"$relaySms","contacts":$contactsJson}"""
     }
 
     // ── Noms d'instance de service DNS-SD ───────────────────────────────
@@ -149,6 +159,7 @@ object MarselProtocol {
     fun alertInstanceName(messageId: String) = "marsel-alert-" + instanceSuffix(messageId)
     fun resolvedInstanceName(messageId: String) = "marsel-res-" + instanceSuffix(messageId)
     fun smsReqInstanceName(messageId: String) = "marsel-req-" + instanceSuffix(messageId)
+    fun ackInstanceName(messageId: String) = "marsel-ack-" + instanceSuffix(messageId)
     const val POSITION_INSTANCE_NAME = "marsel-pos"
 
     // C2 : faut-il remplacer le service d'alerte local déjà enregistré ?

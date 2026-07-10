@@ -177,7 +177,8 @@ class MarselProtocolTest {
             "MARSEL_POSITION_UPDATE" to "P",
             "MARSEL_EMERGENCY_RESOLVED" to "R",
             "MARSEL_RESOLVED_SMS_REQUEST" to "F",
-            "MARSEL_TIMEOUT_SMS_REQUEST" to "T"
+            "MARSEL_TIMEOUT_SMS_REQUEST" to "T",
+            "MARSEL_SMS_ACK" to "S"
         )
         for ((type, short) in types) {
             val json = """{"type":"$type","messageId":"m","emergencyId":"e","pseudo":"Bob","lat":1.0,"lng":2.0,"timestamp":10,"hopCount":1,"contacts":[]}"""
@@ -186,6 +187,29 @@ class MarselProtocolTest {
             val back = MarselProtocol.txtRecordToJson(rec, 0)!!
             assertEquals(type, MarselProtocol.extractJsonString(back, "type"))
         }
+    }
+
+    @Test
+    fun maxHopsIsBoundedToFive() {
+        // Le plafond de 5 sauts borne la propagation ET le délai avant le
+        // verdict « SMS impossibles » chez l'émetteur.
+        assertEquals(5, MarselProtocol.MAX_HOPS)
+        val json = """{"type":"MARSEL_EMERGENCY","messageId":"m","emergencyId":"e","pseudo":"Bob","lat":1.0,"lng":2.0,"timestamp":10,"hopCount":0,"contacts":[]}"""
+        val rec = MarselProtocol.buildTxtRecord("E", json, 0)!!
+        val back = MarselProtocol.txtRecordToJson(rec, 0)!!
+        assertEquals(5, MarselProtocol.extractJsonInt(back, "maxHops"))
+    }
+
+    @Test
+    fun ackPacket_preservesAckedRequestId() {
+        // L'ACK transporte l'id de la demande traitée dans emergencyId ;
+        // l'émetteur le compare à ses propres demandes en attente.
+        val ackJson = """{"type":"MARSEL_SMS_ACK","messageId":"req-42_ack","emergencyId":"req-42","pseudo":"Relais","lat":1.0,"lng":2.0,"timestamp":10,"hopCount":0,"contacts":[]}"""
+        val rec = MarselProtocol.buildTxtRecord("S", ackJson, 0)!!
+        val back = MarselProtocol.txtRecordToJson(rec, 0)!!
+        assertEquals("MARSEL_SMS_ACK", MarselProtocol.extractJsonString(back, "type"))
+        assertEquals("req-42", MarselProtocol.extractJsonString(back, "emergencyId"))
+        assertTrue(MarselProtocol.ackInstanceName("req-42_ack").startsWith("marsel-ack-"))
     }
 
     @Test

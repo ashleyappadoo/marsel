@@ -910,7 +910,7 @@ function activateEmergency() {
         contacts: contacts,
         mode: MARSEL.mode,
         hopCount: 0,
-        maxHops: (window.MARSEL_CONFIG && MARSEL_CONFIG.RELAY_HOP_LIMIT) || 10,
+        maxHops: (window.MARSEL_CONFIG && MARSEL_CONFIG.RELAY_HOP_LIMIT) || 5,
         status: 'ACTIVE',
         originNetwork: MARSEL.networkType
     };
@@ -1100,14 +1100,101 @@ function getNetworkQuality() {
     return navigator.onLine ? 'WIFI_STABLE' : 'NONE';
 }
 
-// Capacité SMS réelle (SIM prête). Le réseau ne dit RIEN de la capacité SMS :
-// un téléphone en WiFi sans SIM doit déléguer ses SMS au réseau Marsel.
+// Capacité SMS réelle (SIM prête + réseau cellulaire enregistré). Le réseau
+// data ne dit RIEN de la capacité SMS : un téléphone en WiFi sans SIM (ou avec
+// SIM mais en zone blanche) doit déléguer ses SMS au réseau Marsel.
 function deviceCanSendSms() {
     if (window.AndroidBridge && typeof AndroidBridge.canSendSms === 'function') {
         try { return !!AndroidBridge.canSendSms(); } catch (e) {}
     }
     return false;
 }
+
+/* ---------------------------------------------------------
+   ACK RELAIS SMS — boucle fermée émetteur ↔ relais
+   Quand les SMS sont délégués au réseau Marsel, le relais qui les envoie
+   RÉELLEMENT (accusé système Android) diffuse un ACK qui remonte jusqu'à
+   nous (max 5 sauts). Sans ACK après SMS_ACK_TIMEOUT_MS (2 min) :
+   notification « Impossible d'envoyer les SMS ». Le paquet reste en
+   diffusion : si un relais apparaît plus tard, le succès est notifié.
+   --------------------------------------------------------- */
+var _smsAckTimers = {};   // id attendu → handle setTimeout
+var _smsAckDone = {};     // id attendu → true (ACK reçu)
+var _cascadeCtx = {};     // trackId d'envoi direct → contexte pour bascule MRN
+
+function armSmsAckWait(expectedId, label) {
+    if (!expectedId || _smsAckDone[expectedId] || _smsAckTimers[expectedId]) return;
+    var timeoutMs = (window.MARSEL_CONFIG && MARSEL_CONFIG.SMS_ACK_TIMEOUT_MS) || 120000;
+    mLog('J', 'SMS', 'attente ACK relais pour ' + expectedId + ' (' + Math.round(timeoutMs / 1000) + 's max)');
+    _smsAckTimers[expectedId] = setTimeout(function () {
+        _smsAckTimers[expectedId] = null;
+        if (_smsAckDone[expectedId]) return;
+        mLog('J', 'SMS', 'AUCUN ACK pour ' + expectedId + ' — échec notifié à l\'utilisateur');
+        if (window.AndroidBridge && typeof AndroidBridge.showNotification === 'function') {
+            try {
+                AndroidBridge.showNotification('⚠️ SMS non envoyés',
+                    'Impossible d\'envoyer les SMS ' + label + ' : aucun téléphone relais avec réseau à portée. L\'alerte continue de chercher un relais.');
+            } catch (e) {}
+        }
+        showToast('⚠️ Impossible d\'envoyer les SMS — aucun relais avec réseau à portée');
+    }, timeoutMs);
+}
+
+/* Appelé par Android quand un ACK relais arrive (les SMS ont réellement été
+   envoyés quelque part dans le maillage pour la demande ackedId). */
+window.onSmsRelayAck = function (ackedId) {
+    mLog('J', 'SMS', 'ACK relais reçu pour ' + ackedId);
+    if (_smsAckDone[ackedId]) return;
+    // Ne notifier que si c'est NOTRE demande (timer armé, ou id de notre urgence)
+    var ours = false;
+    if (_smsAckTimers[ackedId]) {
+        clearTimeout(_smsAckTimers[ackedId]);
+        _smsAckTimers[ackedId] = null;
+        ours = true;
+    }
+    if (MARSEL.emergencyId && ackedId.indexOf(MARSEL.emergencyId) === 0) ours = true;
+    if (!ours) return;
+    _smsAckDone[ackedId] = true;
+    if (window.AndroidBridge && typeof AndroidBridge.showNotification === 'function') {
+        try { AndroidBridge.showNotification('✅ SMS envoyés', 'Tes proches ont été prévenus par SMS via le réseau Marsel.'); } catch (e) {}
+    }
+    showToast('✅ SMS envoyés à tes proches via le réseau Marsel');
+};
+
+/* Appelé par Android avec le VERDICT système d'un envoi SMS local suivi.
+   Échec réel (radio, zone blanche apparue entre le check et l'envoi) →
+   bascule automatique sur le réseau Marsel. */
+window.onSmsSendResult = function (trackId, ok, code) {
+    mLog('J', 'SMS', 'verdict envoi ' + trackId + ' ok=' + ok + ' code=' + code);
+    if (ok) {
+        delete _cascadeCtx[trackId];
+        return;
+    }
+    // Échec d'un SMS de fin d'alerte / relance 20 min envoyé en direct
+    if (_cascadeCtx[trackId]) {
+        var ctx = _cascadeCtx[trackId];
+        delete _cascadeCtx[trackId];
+        mLog('J', 'SMS', 'échec SMS direct ' + ctx.kind + ' — bascule sur le réseau Marsel');
+        showToast('🔁 SMS non parti — tentative via le réseau Marsel');
+        sendCascadeViaMrn(ctx.kind, ctx.savedEmergency, ctx.hasAudio);
+        return;
+    }
+    // Échec du SMS d'alerte initial (trackId = messageId de l'urgence active)
+    var saved = null;
+    try { saved = JSON.parse(localStorage.getItem('marsel_emergency') || 'null'); } catch (e) {}
+    if (saved && (saved.messageId === trackId || saved.id === trackId)) {
+        saved.relaySms = '1';
+        saved.smsSent = false;
+        if (!saved.type) saved.type = 'MARSEL_EMERGENCY';
+        localStorage.setItem('marsel_emergency', JSON.stringify(saved));
+        mLog('J', 'SMS', 'échec SMS d\'alerte — relaySms=1, re-diffusion MRN');
+        showToast('🔁 SMS non parti — délégué au réseau Marsel');
+        if (window.AndroidBridge && typeof AndroidBridge.sendEmergencyViaRelay === 'function') {
+            try { AndroidBridge.sendEmergencyViaRelay(JSON.stringify(saved)); } catch (e) {}
+        }
+        armSmsAckWait(trackId, 'd\'alerte');
+    }
+};
 
 function routeEmergency(emergencyData) {
     var quality = getNetworkQuality();
@@ -1140,12 +1227,15 @@ function routeEmergency(emergencyData) {
         // un relais avec SIM les enverra à notre place. API backend si dispo.
         emergencyData.smsSent = false;
         if (quality !== 'NONE' && window.MARSEL_CONFIG && MARSEL_CONFIG.API_URL) sendToAPI(emergencyData);
-        mLog('J', 'NET', 'Pas de SIM — SMS délégués au relais MRN (relaySms=1)');
+        mLog('J', 'NET', 'Pas de SIM/réseau cellulaire — SMS délégués au relais MRN (relaySms=1)');
         showToast('🔁 Pas de SIM : SMS aux proches délégués au réseau Marsel');
         try {
             var savedNoSim = JSON.parse(localStorage.getItem('marsel_emergency') || 'null');
             if (savedNoSim) { savedNoSim.smsSent = false; localStorage.setItem('marsel_emergency', JSON.stringify(savedNoSim)); }
         } catch (e) {}
+        // ACK attendu du relais qui enverra réellement ; sans ACK sous 2 min →
+        // notification « Impossible d'envoyer les SMS »
+        armSmsAckWait(emergencyData.messageId || emergencyData.id, 'd\'alerte');
     } else if (quality === 'MOBILE_STABLE') {
         // 3G/4G/5G validé → SMS immédiat
         sendEmergencyViaInternet(emergencyData);
@@ -1168,6 +1258,9 @@ function routeEmergency(emergencyData) {
             var saved = JSON.parse(localStorage.getItem('marsel_emergency') || 'null');
             if (saved) { saved.smsSent = false; localStorage.setItem('marsel_emergency', JSON.stringify(saved)); }
         } catch (e) {}
+        // ACK attendu du relais qui enverra réellement ; sans ACK sous 2 min →
+        // notification « Impossible d'envoyer les SMS »
+        armSmsAckWait(emergencyData.messageId || emergencyData.id, 'd\'alerte');
     }
 }
 
@@ -1181,17 +1274,18 @@ function sendCascadeSms(kind, savedEmergency, message, hasAudio) {
     var canSms = deviceCanSendSms();
     var contacts = (savedEmergency.contacts || []).filter(function (c) { return c.mobile; });
 
-    // Position réelle uniquement pour le paquet relayé (jamais de défaut)
-    var scPos = getRealPosition();
-    if (!scPos && isFinite(savedEmergency.lat) && isFinite(savedEmergency.lng)) {
-        scPos = { lat: savedEmergency.lat, lng: savedEmergency.lng };
-    }
-
-    // TEST-FIX : le SMS direct exige réseau validé ET SIM prête. Sans SIM
-    // (cas terrain : WiFi seul), on délègue au réseau Marsel (paquet F/T).
+    // TEST-FIX : le SMS direct exige réseau validé ET SIM+réseau cellulaire.
+    // Sans ça (WiFi seul, zone blanche), délégation au réseau Marsel (F/T).
     if ((quality === 'MOBILE_STABLE' || quality === 'WIFI_STABLE') && canSms) {
-        contacts.forEach(function (c) {
-            if (window.AndroidBridge && typeof AndroidBridge.sendEmergencySMS === 'function') {
+        // Le premier envoi est SUIVI : si l'accusé système signale un échec réel
+        // (le réseau cellulaire a disparu entre le check et l'envoi), le verdict
+        // revient dans onSmsSendResult qui bascule sur le réseau Marsel.
+        var trackId = 'cascade_' + kind + '_' + (savedEmergency.id || savedEmergency.emergencyId || 'x') + '_' + Date.now();
+        _cascadeCtx[trackId] = { kind: kind, savedEmergency: savedEmergency, hasAudio: hasAudio };
+        contacts.forEach(function (c, idx) {
+            if (idx === 0 && window.AndroidBridge && typeof AndroidBridge.sendEmergencySMSTracked === 'function') {
+                try { AndroidBridge.sendEmergencySMSTracked(c.mobile, message, trackId); } catch (e) {}
+            } else if (window.AndroidBridge && typeof AndroidBridge.sendEmergencySMS === 'function') {
                 try { AndroidBridge.sendEmergencySMS(c.mobile, message); } catch (e) {}
             }
             // 5b : à la fin d'alerte, si audio + 4G validée → MMS du dernier
@@ -1203,29 +1297,42 @@ function sendCascadeSms(kind, savedEmergency, message, hasAudio) {
         });
         mLog('J', 'NET', kind + ' SMS direct (' + quality + ') → ' + contacts.length + ' proche(s)');
     } else {
-        var type = (kind === 'TIMEOUT') ? 'MARSEL_TIMEOUT_SMS_REQUEST' : 'MARSEL_RESOLVED_SMS_REQUEST';
-        var tag = (kind === 'TIMEOUT') ? 'timeout' : 'ressms';
-        var eId = savedEmergency.id || savedEmergency.emergencyId || MARSEL.emergencyId;
-        var reqPacket = {
-            type: type,
-            version: 1,
-            messageId: eId + '_' + tag + '_' + Date.now(),
-            emergencyId: eId,
-            userId: savedEmergency.userId,
-            pseudo: savedEmergency.pseudo || 'Utilisateur',
-            lat: scPos ? scPos.lat : null,
-            lng: scPos ? scPos.lng : null,
-            timestamp: Date.now(),
-            contacts: savedEmergency.contacts || [],
-            audio: hasAudio ? '1' : '0',
-            hopCount: 0,
-            maxHops: 10
-        };
-        if (window.AndroidBridge && typeof AndroidBridge.sendEmergencyViaRelay === 'function') {
-            try { AndroidBridge.sendEmergencyViaRelay(JSON.stringify(reqPacket)); } catch (e) {}
-        }
-        mLog('J', 'NET', kind + ' SMS délégué au MRN (' + type + ')');
+        sendCascadeViaMrn(kind, savedEmergency, hasAudio);
     }
+}
+
+// Chemin MRN de la cascade fin d'alerte / relance 20 min : paquet F ou T
+// relayé de téléphone en téléphone (max 5 sauts) jusqu'à un appareil avec
+// SIM + réseau qui enverra les SMS. ACK attendu, sinon notification d'échec.
+function sendCascadeViaMrn(kind, savedEmergency, hasAudio) {
+    // Position réelle uniquement pour le paquet relayé (jamais de défaut)
+    var scPos = getRealPosition();
+    if (!scPos && isFinite(savedEmergency.lat) && isFinite(savedEmergency.lng)) {
+        scPos = { lat: savedEmergency.lat, lng: savedEmergency.lng };
+    }
+    var type = (kind === 'TIMEOUT') ? 'MARSEL_TIMEOUT_SMS_REQUEST' : 'MARSEL_RESOLVED_SMS_REQUEST';
+    var tag = (kind === 'TIMEOUT') ? 'timeout' : 'ressms';
+    var eId = savedEmergency.id || savedEmergency.emergencyId || MARSEL.emergencyId;
+    var reqPacket = {
+        type: type,
+        version: 1,
+        messageId: eId + '_' + tag + '_' + Date.now(),
+        emergencyId: eId,
+        userId: savedEmergency.userId,
+        pseudo: savedEmergency.pseudo || 'Utilisateur',
+        lat: scPos ? scPos.lat : null,
+        lng: scPos ? scPos.lng : null,
+        timestamp: Date.now(),
+        contacts: savedEmergency.contacts || [],
+        audio: hasAudio ? '1' : '0',
+        hopCount: 0,
+        maxHops: (window.MARSEL_CONFIG && MARSEL_CONFIG.RELAY_HOP_LIMIT) || 5
+    };
+    if (window.AndroidBridge && typeof AndroidBridge.sendEmergencyViaRelay === 'function') {
+        try { AndroidBridge.sendEmergencyViaRelay(JSON.stringify(reqPacket)); } catch (e) {}
+    }
+    mLog('J', 'NET', kind + ' SMS délégué au MRN (' + type + ')');
+    armSmsAckWait(reqPacket.messageId, kind === 'TIMEOUT' ? 'de relance' : 'de fin d\'alerte');
 }
 
 function sendEmergencyViaInternet(emergencyData) {
@@ -1246,7 +1353,11 @@ function sendEmergencyViaInternet(emergencyData) {
         } catch (e) {}
     }
 
-    // Send SMS via Android SmsManager
+    // Send SMS via Android SmsManager.
+    // Le PREMIER envoi est SUIVI (trackId = messageId de l'urgence) : si
+    // l'accusé système signale un échec réel (zone blanche apparue après le
+    // check), onSmsSendResult bascule automatiquement sur le réseau Marsel.
+    var trackArmed = false;
     contacts.forEach(function (contact) {
         if (!contact.mobile) return;
 
@@ -1264,7 +1375,17 @@ function sendEmergencyViaInternet(emergencyData) {
             'Position : ' + mapsLink + '\n' +
             'Heure : ' + new Date(emergencyData.timestamp).toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit' });
 
-        if (window.AndroidBridge && typeof AndroidBridge.sendEmergencySMS === 'function') {
+        var trackId = emergencyData.messageId || emergencyData.id || null;
+        if (!trackArmed && trackId && window.AndroidBridge && typeof AndroidBridge.sendEmergencySMSTracked === 'function') {
+            trackArmed = true;
+            try {
+                AndroidBridge.sendEmergencySMSTracked(contact.mobile, msg, trackId);
+                showToast('SMS envoyé à ' + escapeHtml(contact.nom || contact.mobile));
+            } catch (ex) {
+                console.error('SMS tracked via Android failed:', ex);
+                sendViaSMSGateway(emergencyData);
+            }
+        } else if (window.AndroidBridge && typeof AndroidBridge.sendEmergencySMS === 'function') {
             try {
                 AndroidBridge.sendEmergencySMS(contact.mobile, msg);
                 showToast('SMS envoyé à ' + escapeHtml(contact.nom || contact.mobile));
@@ -1585,7 +1706,7 @@ function sendPositionUpdate(lat, lng) {
         timestamp: Date.now(),
         contacts: savedEmergency.contacts || [],
         hopCount: 0,
-        maxHops: 10
+        maxHops: (window.MARSEL_CONFIG && MARSEL_CONFIG.RELAY_HOP_LIMIT) || 5
     };
 
     // Mettre à jour DB locale

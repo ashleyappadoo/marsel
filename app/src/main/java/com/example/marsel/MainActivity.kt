@@ -148,6 +148,29 @@ class MainActivity : ComponentActivity() {
     private var relayServerSocket: ServerSocket? = null
     private var legacyServerSocket: ServerSocket? = null
 
+    // ── Suivi d'envoi SMS réel (accusé système Android) ─────────────────
+    // Le seul juge fiable de « le SMS est parti » est le sentIntent : SIM
+    // prête + réseau affiché peuvent quand même aboutir à un échec radio.
+    private val smsTrackCounter = java.util.concurrent.atomic.AtomicInteger(1000)
+    private val handledTrackResults = mutableSetOf<String>()
+    // Relais : envois en cours (origMessageId → true) et paquet source pour l'ACK
+    private val smsInFlight = ConcurrentHashMap<String, Boolean>()
+    private val pendingRelaySends = ConcurrentHashMap<String, String>()
+
+    private val smsSentReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val trackId = intent.getStringExtra("trackId") ?: return
+            val ok = resultCode == android.app.Activity.RESULT_OK
+            // Multipart = plusieurs callbacks pour le même trackId : le premier
+            // résultat fait verdict (les parties suivantes suivent la même radio).
+            synchronized(handledTrackResults) {
+                if (!handledTrackResults.add(trackId)) return
+                if (handledTrackResults.size > 500) handledTrackResults.clear()
+            }
+            onSmsSendResult(trackId, ok, resultCode)
+        }
+    }
+
     // DNS-SD connection-less relay: re-arm périodique adaptatif (A4/3a)
     // 8s quand une alerte est active (émise OU reçue non résolue), 25s en veille.
     private val p2pHandler = Handler(Looper.getMainLooper())
@@ -193,6 +216,7 @@ class MainActivity : ComponentActivity() {
         private const val AUDIO_SEGMENT_MS = 5 * 60 * 1000       // rotation 5 min
         private const val AUDIO_MMS_MAX_BYTES = 1_000_000L       // 1 Mo (spec 5b)
         private const val AUDIO_DIR = "Marsel"
+        private const val SMS_SENT_ACTION = "com.example.marsel.SMS_SENT"
     }
 
     // -------------------------------------------------------------------------
@@ -276,6 +300,15 @@ class MainActivity : ComponentActivity() {
 
         // --- Notification channel (must be created before any notification) ---
         createNotificationChannel()
+
+        // --- Accusés d'envoi SMS (verdict réel du système) ---
+        val smsFilter = IntentFilter(SMS_SENT_ACTION)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(smsSentReceiver, smsFilter, Context.RECEIVER_NOT_EXPORTED)
+        } else {
+            @Suppress("UnspecifiedRegisterReceiverFlag")
+            registerReceiver(smsSentReceiver, smsFilter)
+        }
 
         // Section 6 : les permissions ne sont PLUS demandées en un bloc ici.
         // Le flow d'onboarding JS (window) les demande groupe par groupe, dans
@@ -389,6 +422,7 @@ class MainActivity : ComponentActivity() {
         serversRunning = false
         try { relayServerSocket?.close() } catch (e: Exception) { Log.v(TAG, "close relay server: ${e.message}") }
         try { legacyServerSocket?.close() } catch (e: Exception) { Log.v(TAG, "close legacy server: ${e.message}") }
+        try { unregisterReceiver(smsSentReceiver) } catch (e: Exception) { Log.v(TAG, "unregister sms receiver: ${e.message}") }
         try {
             val cameraManager = getSystemService(Context.CAMERA_SERVICE) as CameraManager
             val cameraId = cameraManager.cameraIdList.firstOrNull()
@@ -704,7 +738,7 @@ class MainActivity : ComponentActivity() {
             }
             val msgType = extractJsonString(json, "type") ?: "?"
             val hopCount = extractJsonInt(json, "hopCount") ?: 0
-            val maxHops = extractJsonInt(json, "maxHops") ?: 10
+            val maxHops = extractJsonInt(json, "maxHops") ?: MarselProtocol.MAX_HOPS
 
             // AUDIT-FIX 1 : les paquets F/T (demande de SMS relayé) sont dispatchés
             // AVANT toute déduplication. Sinon un téléphone qui voit la demande
@@ -737,6 +771,30 @@ class MainActivity : ComponentActivity() {
             }
 
             logToJs("RELAY", "RECV $msgType id=$messageId")
+
+            // ACK « SMS réellement envoyés » : informer le JS (l'émetteur d'origine
+            // annule son timer d'échec et notifie l'utilisateur), puis propager
+            // l'ACK plus loin pour qu'il remonte jusqu'à l'émetteur (max 5 sauts).
+            if (msgType == MarselProtocol.TYPE_SMS_ACK) {
+                val ackedId = extractJsonString(json, "emergencyId")
+                    ?: extractJsonString(json, "id") ?: return
+                runOnUiThread {
+                    webView.evaluateJavascript(
+                        "window.onSmsRelayAck && window.onSmsRelayAck('${ackedId.replace("'", "")}')",
+                        null
+                    )
+                }
+                if (hopCount < maxHops) {
+                    val ackFwd = """"hopCount"\s*:\s*$hopCount""".toRegex()
+                        .replace(json, "\"hopCount\":${hopCount + 1}")
+                    registerRelayedService(ackFwd)
+                    synchronized(pendingRelayMessages) { pendingRelayMessages.add(ackFwd) }
+                    groupOwnerAddress?.let { addr ->
+                        if (!isGroupOwner) sendRelayToPeer(addr, ackFwd)
+                    }
+                }
+                return
+            }
 
             // TEST-FIX : ne jamais re-notifier une urgence DÉJÀ RÉSOLUE.
             // Vu en terrain : une vieille E rejouée par le canal socket après la
@@ -818,13 +876,15 @@ class MainActivity : ComponentActivity() {
         maxHops: Int
     ) {
         val quality = detectNetworkQuality()
-        // TEST-FIX : réseau validé ET SIM prête — un relais en WiFi sans SIM
-        // aurait marqué smsHandled sans jamais pouvoir envoyer (paquet mort).
+        // TEST-FIX : réseau validé ET SIM+réseau cellulaire — un relais en WiFi
+        // sans SIM aurait marqué smsHandled sans jamais pouvoir envoyer.
         if (quality != "NONE" && canSendSmsDirect()) {
-            // Dédup smsHandled persistée : un même paquet ne déclenche les SMS
-            // qu'UNE seule fois, même après restart de l'app.
-            if (dedupLedger.checkAndMark("sms", messageId)) {
-                logToJs("RELAY", "SMS-REQ $messageId déjà traité — skip")
+            // smsHandled n'est marqué qu'à l'accusé de SUCCÈS système ; en cas
+            // d'échec radio, le paquet reste vivant pour un autre relais.
+            if (dedupLedger.isSeen("sms", messageId)) {
+                return
+            }
+            if (smsInFlight.putIfAbsent(messageId, true) != null) {
                 return
             }
             val pseudo = extractJsonString(json, "pseudo") ?: "Utilisateur"
@@ -843,8 +903,12 @@ class MainActivity : ComponentActivity() {
                 "✅ FIN D'ALERTE MARSEL\n$pseudo est en sécurité.\nDernière position connue : $mapsLink$audioMention"
             }
             val mobiles = MarselProtocol.extractContactMobiles(json)
+            if (mobiles.isEmpty()) { smsInFlight.remove(messageId); return }
             logToJs("RELAY", "SMS-REQ $msgType : envoi de ${mobiles.size} SMS à la place de l'émetteur")
-            mobiles.forEach { mobile -> sendSMSDirect(mobile, smsMsg) }
+            pendingRelaySends[messageId] = json
+            mobiles.forEachIndexed { idx, mobile ->
+                sendSMSDirect(mobile, smsMsg, if (idx == 0) "relay|$messageId" else null)
+            }
         } else {
             // Pas de réseau validé ici non plus : propager plus loin.
             // AUDIT-FIX 1 : propagation UNIQUE. Le paquet F/T n'est pas dédupliqué
@@ -1061,6 +1125,7 @@ class MainActivity : ComponentActivity() {
             MarselProtocol.SHORT_RESOLVED -> MarselProtocol.resolvedInstanceName(msgId)
             MarselProtocol.SHORT_RESOLVED_SMS_REQUEST,
             MarselProtocol.SHORT_TIMEOUT_SMS_REQUEST -> MarselProtocol.smsReqInstanceName(msgId)
+            MarselProtocol.SHORT_SMS_ACK -> MarselProtocol.ackInstanceName(msgId)
             else -> return null
         }
         return WifiP2pDnsSdServiceInfo.newInstance(instanceName, "_marsel._tcp", rec)
@@ -1519,7 +1584,12 @@ class MainActivity : ComponentActivity() {
                 != PackageManager.PERMISSION_GRANTED
             ) return false
             val tm = getSystemService(Context.TELEPHONY_SERVICE) as android.telephony.TelephonyManager
-            tm.simState == android.telephony.TelephonyManager.SIM_STATE_READY
+            if (tm.simState != android.telephony.TelephonyManager.SIM_STATE_READY) return false
+            // SIM prête ne suffit pas : sans RÉSEAU cellulaire enregistré (zone
+            // blanche, mode avion partiel), le SMS échouera. networkOperator est
+            // vide tant que le téléphone n'est pas enregistré sur un réseau.
+            // Le verdict FINAL reste l'accusé d'envoi système (onSmsSendResult).
+            !tm.networkOperator.isNullOrEmpty()
         } catch (e: Exception) {
             Log.w(TAG, "canSendSmsDirect: ${e.message}")
             false
@@ -1600,12 +1670,15 @@ class MainActivity : ComponentActivity() {
     // =========================================================================
     // SMS helper (callable from any thread)
     // =========================================================================
-    private fun sendSMSDirect(phoneNumber: String, message: String) {
+    // trackId != null → l'accusé d'envoi système revient dans smsSentReceiver
+    // (onSmsSendResult) : c'est le SEUL verdict fiable de « le SMS est parti ».
+    private fun sendSMSDirect(phoneNumber: String, message: String, trackId: String? = null) {
         try {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.SEND_SMS)
                 != PackageManager.PERMISSION_GRANTED
             ) {
                 Log.w("MARSEL_SMS", "SEND_SMS permission not granted")
+                trackId?.let { onSmsSendResult(it, false, -1) }
                 return
             }
             val smsManager = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
@@ -1616,19 +1689,81 @@ class MainActivity : ComponentActivity() {
             }
             if (smsManager == null) {
                 Log.e("MARSEL_SMS", "SmsManager not available on this device")
+                trackId?.let { onSmsSendResult(it, false, -1) }
                 return
+            }
+            val sentPi = trackId?.let {
+                val intent = Intent(SMS_SENT_ACTION)
+                    .setPackage(packageName)
+                    .putExtra("trackId", it)
+                PendingIntent.getBroadcast(
+                    this, smsTrackCounter.incrementAndGet(), intent,
+                    PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                )
             }
             val parts = smsManager.divideMessage(message)
             if (parts.size == 1) {
-                smsManager.sendTextMessage(phoneNumber, null, message, null, null)
+                smsManager.sendTextMessage(phoneNumber, null, message, sentPi, null)
             } else {
-                smsManager.sendMultipartTextMessage(phoneNumber, null, parts, null, null)
+                val sentIntents = if (sentPi != null) ArrayList(parts.map { sentPi }) else null
+                smsManager.sendMultipartTextMessage(phoneNumber, null, parts, sentIntents, null)
             }
-            Log.d("MARSEL_SMS", "SMS sent to $phoneNumber")
+            Log.d("MARSEL_SMS", "SMS submitted to $phoneNumber (track=$trackId)")
         } catch (e: SecurityException) {
             Log.e("MARSEL_SMS", "SecurityException sending SMS to $phoneNumber: ${e.message}")
+            trackId?.let { onSmsSendResult(it, false, -1) }
         } catch (e: Exception) {
             Log.e("MARSEL_SMS", "SMS failed to $phoneNumber: ${e.message}")
+            trackId?.let { onSmsSendResult(it, false, -1) }
+        }
+    }
+
+    // =========================================================================
+    // Verdict d'envoi SMS + ACK maillage
+    // =========================================================================
+    // trackId "relay|<origId>" = envoi fait EN TANT QUE RELAIS pour un émetteur
+    // hors réseau → succès : marquer smsHandled + diffuser l'ACK qui remontera
+    // jusqu'à l'émetteur ; échec : libérer pour qu'un autre relais s'en charge.
+    // Tout autre trackId = envoi local (nos propres proches) → remonté au JS
+    // qui bascule sur le MRN en cas d'échec.
+    private fun onSmsSendResult(trackId: String, ok: Boolean, resultCode: Int) {
+        logToJs("SMS", "résultat envoi track=$trackId ok=$ok code=$resultCode")
+        if (trackId.startsWith("relay|")) {
+            val origId = trackId.removePrefix("relay|")
+            val sourceJson = pendingRelaySends.remove(origId)
+            smsInFlight.remove(origId)
+            if (ok) {
+                dedupLedger.checkAndMark("sms", origId)
+                sourceJson?.let { broadcastSmsAck(origId, it) }
+            } else {
+                logToJs("RELAY", "SMS relais ÉCHEC pour $origId — non marqué, un autre relais peut reprendre")
+            }
+        } else {
+            runOnUiThread {
+                webView.evaluateJavascript(
+                    "window.onSmsSendResult && window.onSmsSendResult('${trackId.replace("'", "")}',$ok,$resultCode)",
+                    null
+                )
+            }
+        }
+    }
+
+    // Diffuse l'accusé « SMS réellement envoyés » (type S) : remonte de proche
+    // en proche (max 5 sauts) jusqu'à l'émetteur d'origine.
+    private fun broadcastSmsAck(origMessageId: String, sourceJson: String) {
+        try {
+            val pseudo = extractJsonString(sourceJson, "pseudo") ?: "Utilisateur"
+            val lat = extractJsonNumber(sourceJson, "lat") ?: return
+            val lng = extractJsonNumber(sourceJson, "lng") ?: return
+            val ackJson = """{"type":"${MarselProtocol.TYPE_SMS_ACK}","messageId":"${origMessageId}_ack","id":"$origMessageId","emergencyId":"$origMessageId","pseudo":"$pseudo","lat":$lat,"lng":$lng,"timestamp":${System.currentTimeMillis()},"hopCount":0,"maxHops":${MarselProtocol.MAX_HOPS},"contacts":[]}"""
+            logToJs("RELAY", "ACK diffusé : SMS envoyés pour $origMessageId")
+            registerRelayedService(ackJson)
+            synchronized(pendingRelayMessages) { pendingRelayMessages.add(ackJson) }
+            groupOwnerAddress?.let { addr ->
+                if (!isGroupOwner) sendRelayToPeer(addr, ackJson)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "broadcastSmsAck: ${e.message}")
         }
     }
 
@@ -1900,20 +2035,25 @@ class MainActivity : ComponentActivity() {
                 logToJs("RELAY", "SMS relais : pas de réseau validé ici, propagation MRN uniquement")
                 return
             }
-            // TEST-FIX : un relais SANS SIM ne peut pas envoyer — il ne doit ni
-            // marquer smsHandled ni s'arrêter là (la propagation MRN continue
-            // dans processRelayMessage jusqu'à un téléphone avec SIM).
+            // TEST-FIX : un relais SANS SIM/réseau cellulaire ne peut pas envoyer —
+            // il ne doit ni marquer smsHandled ni s'arrêter là (la propagation MRN
+            // continue dans processRelayMessage jusqu'à un téléphone capable).
             if (!canSendSmsDirect()) {
-                logToJs("RELAY", "SMS relais : pas de SIM ici, propagation MRN uniquement")
+                logToJs("RELAY", "SMS relais : pas de SIM/réseau cellulaire ici, propagation MRN uniquement")
                 return
             }
             val messageId = extractJsonString(json, "messageId") ?: return
-            if (dedupLedger.checkAndMark("sms", messageId)) {
-                logToJs("RELAY", "SMS relais $messageId déjà envoyé — skip (dédup)")
+            // smsHandled n'est marqué qu'à l'ACCUSÉ DE SUCCÈS système
+            // (onSmsSendResult) — pas avant l'envoi. smsInFlight évite les
+            // doublons pendant que l'accusé est en route.
+            if (dedupLedger.isSeen("sms", messageId)) {
+                return
+            }
+            if (smsInFlight.putIfAbsent(messageId, true) != null) {
                 return
             }
             val mobiles = MarselProtocol.extractContactMobiles(json)
-            if (mobiles.isEmpty()) return
+            if (mobiles.isEmpty()) { smsInFlight.remove(messageId); return }
             val pseudo = extractJsonString(json, "pseudo") ?: "Utilisateur"
             val lat = extractJsonNumber(json, "lat")
             val lng = extractJsonNumber(json, "lng")
@@ -1922,7 +2062,12 @@ class MainActivity : ComponentActivity() {
             } else "Position inconnue"
             val smsMsg = "ALERTE MARSEL\n$pseudo a declenche une alerte d'urgence.\nPosition: $mapsLink"
             logToJs("RELAY", "SMS relais ($quality) : envoi à ${mobiles.size} proche(s) à la place de l'émetteur")
-            mobiles.forEach { mobile -> sendSMSDirect(mobile, smsMsg) }
+            pendingRelaySends[messageId] = json
+            mobiles.forEachIndexed { idx, mobile ->
+                // Le premier envoi porte le suivi : son accusé fait verdict pour
+                // le lot (même radio) → succès = smsHandled + ACK vers l'émetteur.
+                sendSMSDirect(mobile, smsMsg, if (idx == 0) "relay|$messageId" else null)
+            }
         } catch (e: Exception) {
             Log.e(TAG, "forwardEmergencyToContacts: ${e.message}")
         }
@@ -2148,6 +2293,15 @@ class MainActivity : ComponentActivity() {
         fun sendEmergencySMS(phoneNumber: String, message: String) {
             thread {
                 sendSMSDirect(phoneNumber, message)
+            }
+        }
+
+        // Envoi SUIVI : l'accusé système revient via window.onSmsSendResult
+        // (trackId, ok, code) — en cas d'échec réel, le JS bascule sur le MRN.
+        @JavascriptInterface
+        fun sendEmergencySMSTracked(phoneNumber: String, message: String, trackId: String) {
+            thread {
+                sendSMSDirect(phoneNumber, message, trackId)
             }
         }
 
