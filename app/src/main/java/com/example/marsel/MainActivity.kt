@@ -157,6 +157,20 @@ class MainActivity : ComponentActivity() {
     private val smsInFlight = ConcurrentHashMap<String, Boolean>()
     private val pendingRelaySends = ConcurrentHashMap<String, String>()
 
+    // BUG-3 : identifiants des paquets ÉMIS PAR CE TÉLÉPHONE. Le maillage nous
+    // renvoie nos propres paquets en écho (relayés par les voisins) — sans ce
+    // registre, on se notifiait de sa PROPRE alerte (vu en test terrain).
+    private val ownMessageIds: MutableSet<String> =
+        java.util.Collections.newSetFromMap(ConcurrentHashMap<String, Boolean>())
+
+    // BUG-5 : découverte déclenchée par événement PEERS_CHANGED (throttle 3s)
+    @Volatile private var lastPeerTriggeredDiscoverMs = 0L
+
+    // BUG « storm » : le broadcast sticky WIFI_P2P_STATE_CHANGED est re-délivré
+    // à chaque onResume (chaque dialogue de permission) — ne réagir qu'aux
+    // VRAIES transitions d'état.
+    private var prevP2pEnabled: Boolean? = null
+
     private val smsSentReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val trackId = intent.getStringExtra("trackId") ?: return
@@ -178,9 +192,16 @@ class MainActivity : ComponentActivity() {
         override fun run() {
             purgeExpiredMarselPeers()
             purgeExpiredRelayedServices()
-            watchdogCheck()
-            restartServiceDiscovery()
-            p2pHandler.postDelayed(this, if (isAlertActive()) 8_000L else 25_000L)
+            // BUG-4 : si le watchdog lance un recovery (clear→add→discover
+            // asynchrone), NE PAS lancer restartServiceDiscovery en parallèle —
+            // la collision produisait des « discoverServices ÉCHEC reason=3 »
+            // (requête effacée pendant le vol) et des cycles perdus de 8-25s.
+            val recoveryLaunched = watchdogCheck()
+            if (!recoveryLaunched) restartServiceDiscovery()
+            // Veille 12s (au lieu de 25s) : discoverServices est ponctuel, la
+            // latence de détection ≈ l'intervalle du récepteur. 12s + trigger
+            // PEERS_CHANGED = détection typique < 10s pour un coût batterie modéré.
+            p2pHandler.postDelayed(this, if (isAlertActive()) 8_000L else 12_000L)
         }
     }
 
@@ -588,11 +609,16 @@ class MainActivity : ComponentActivity() {
                     val state = intent.getIntExtra(WifiP2pManager.EXTRA_WIFI_STATE, -1)
                     wifiP2pEnabled = state == WifiP2pManager.WIFI_P2P_STATE_ENABLED
                     Log.d(TAG, "WiFi P2P state: ${if (wifiP2pEnabled) "ENABLED" else "DISABLED"}")
-                    if (wifiP2pEnabled) {
+                    // Le broadcast est STICKY : re-délivré à chaque re-register du
+                    // receiver (chaque onResume/dialogue de permission). Ne faire le
+                    // recovery complet que sur une VRAIE transition d'état — sinon
+                    // tempête de ré-enregistrements/kicks (vue pendant l'onboarding).
+                    val isTransition = prevP2pEnabled != wifiP2pEnabled
+                    prevP2pEnabled = wifiP2pEnabled
+                    if (wifiP2pEnabled && isTransition) {
                         // TEST-FIX : un rebond DISABLED→ENABLED du framework P2P
-                        // (fréquent, vu dans les logs terrain) EFFACE les services
-                        // locaux — sans ré-enregistrement, l'alerte cesse d'émettre
-                        // en silence. On ré-enregistre tout + relance la découverte.
+                        // EFFACE les services locaux — sans ré-enregistrement,
+                        // l'alerte cesse d'émettre en silence.
                         logToJs("P2P", "P2P ré-activé — ré-enregistrement des services actifs")
                         lastServiceRequestResetMs = 0  // force un re-arm complet
                         reRegisterActiveServices()
@@ -608,6 +634,17 @@ class MainActivity : ComponentActivity() {
                 }
 
                 WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION -> {
+                    // BUG-5 (latence 20-25s) : discoverServices est une REQUÊTE
+                    // PONCTUELLE — un service enregistré juste après notre requête
+                    // n'est vu qu'au cycle suivant. Quand un téléphone commence à
+                    // émettre (alerte), le framework nous délivre PEERS_CHANGED :
+                    // on relance immédiatement la découverte (throttle 3s) au lieu
+                    // d'attendre le prochain cycle périodique.
+                    val nowPeers = System.currentTimeMillis()
+                    if (nowPeers - lastPeerTriggeredDiscoverMs > 3_000) {
+                        lastPeerTriggeredDiscoverMs = nowPeers
+                        discoverServicesOnly()
+                    }
                     wifiP2pManager.requestPeers(wifiP2pChannel) { peers ->
                         synchronized(peerDevices) {
                             peerDevices.clear()
@@ -748,6 +785,9 @@ class MainActivity : ComponentActivity() {
             if (msgType == MarselProtocol.TYPE_RESOLVED_SMS_REQUEST ||
                 msgType == MarselProtocol.TYPE_TIMEOUT_SMS_REQUEST
             ) {
+                // BUG-3 : écho de NOTRE propre demande relayée par un voisin —
+                // ne pas la traiter (on l'a déjà diffusée nous-mêmes).
+                if (ownMessageIds.contains(messageId)) return
                 handleSmsRequestPacket(json, msgType, messageId, hopCount, maxHops)
                 return
             }
@@ -776,6 +816,8 @@ class MainActivity : ComponentActivity() {
             // annule son timer d'échec et notifie l'utilisateur), puis propager
             // l'ACK plus loin pour qu'il remonte jusqu'à l'émetteur (max 5 sauts).
             if (msgType == MarselProtocol.TYPE_SMS_ACK) {
+                // Écho de notre propre ACK relayé par un voisin : ignorer
+                if (ownMessageIds.contains(messageId)) return
                 val ackedId = extractJsonString(json, "emergencyId")
                     ?: extractJsonString(json, "id") ?: return
                 runOnUiThread {
@@ -805,8 +847,13 @@ class MainActivity : ComponentActivity() {
             if (msgType == MarselProtocol.TYPE_RESOLVED) {
                 dedupLedger.checkAndMark("res", emergencyKey)
             }
-            if (msgType == MarselProtocol.TYPE_EMERGENCY && dedupLedger.isSeen("res", emergencyKey)) {
-                logToJs("RELAY", "E $messageId ignorée : urgence déjà résolue")
+            // BUG-6 : le filtre couvre aussi les POSITION — des paquets de position
+            // périmés rejoués par le canal socket APRÈS la résolution recréaient
+            // le marqueur sur la carte (tags fantômes vus en test).
+            if ((msgType == MarselProtocol.TYPE_EMERGENCY || msgType == MarselProtocol.TYPE_POSITION) &&
+                dedupLedger.isSeen("res", emergencyKey)
+            ) {
+                logToJs("RELAY", "$msgType $messageId ignoré : urgence déjà résolue")
                 return
             }
 
@@ -1057,13 +1104,17 @@ class MainActivity : ComponentActivity() {
     // =========================================================================
     // A3/3f — Watchdog : silence DNS-SD > 60s alors que le P2P est actif
     // =========================================================================
-    private fun watchdogCheck() {
-        if (!wifiP2pEnabled) return
+    // Retourne true si un recovery a été lancé (le cycle appelant ne doit alors
+    // PAS lancer restartServiceDiscovery en parallèle — collision, BUG-4).
+    private fun watchdogCheck(): Boolean {
+        if (!wifiP2pEnabled) return false
         val silentMs = System.currentTimeMillis() - lastDnsSdEventMs
         if (silentMs > 60_000) {
             lastDnsSdEventMs = System.currentTimeMillis()
             fullServiceRecovery("aucun événement DNS-SD depuis ${silentMs / 1000}s")
+            return true
         }
+        return false
     }
 
     private fun fullServiceRecovery(reason: String) {
@@ -1139,12 +1190,31 @@ class MainActivity : ComponentActivity() {
         val record = buildTxtRecord(shortType, json) ?: return
         val msgId = record["i"] ?: return
 
-        // Jamais re-diffuser notre propre alerte sous forme relayée
+        // Jamais re-diffuser notre propre alerte active sous forme relayée.
+        // Exception : nos propres paquets F/T/S passent ICI volontairement
+        // (c'est leur canal d'émission) — mais un écho reçu du maillage est
+        // déjà bloqué en amont (ownMessageIds dans processRelayMessage).
         if (activeEmergencyRecord?.get("i") == msgId) return
+        // BUG-2 : ne pas re-diffuser une urgence résolue
+        val relEmergency = record["e"] ?: ""
+        if (shortType == MarselProtocol.SHORT_EMERGENCY &&
+            relEmergency.isNotEmpty() && dedupLedger.isSeen("res", relEmergency)
+        ) return
         if (relayedRecords.containsKey(msgId)) return
-        if (relayedRecords.size >= 5) {
-            logToJs("DNS-SD", "RELAYED: cap de 5 services relayés atteint, skip $msgId")
-            return
+        // BUG-7 : au cap, évincer le PLUS VIEUX service non-E au lieu de jeter
+        // le nouveau — un ACK arrivait au moment où le cap était plein et était
+        // « skip » (vu en test), retardant la confirmation chez l'émetteur.
+        if (relayedRecords.size >= 8) {
+            val oldest = relayedRecords.entries
+                .filter { it.value["y"] != MarselProtocol.SHORT_EMERGENCY }
+                .minByOrNull { it.value["s"]?.toLongOrNull() ?: 0L }
+                ?: relayedRecords.entries.minByOrNull { it.value["s"]?.toLongOrNull() ?: 0L }
+            if (oldest != null) {
+                dropRelayedService(oldest.key, "éviction cap")
+            } else {
+                logToJs("DNS-SD", "RELAYED: cap atteint, skip $msgId")
+                return
+            }
         }
 
         relayedRecords[msgId] = record
@@ -1324,12 +1394,12 @@ class MainActivity : ComponentActivity() {
             return
         }
         try {
-            val shortType = when (extractJsonString(json, "type")) {
-                "MARSEL_EMERGENCY" -> "E"
-                "MARSEL_POSITION_UPDATE" -> "P"
-                "MARSEL_EMERGENCY_RESOLVED" -> "R"
-                else -> { logToJs("DNS-SD", "Unknown type, skip"); return }
-            }
+            // BUG-1 (terrain) : le mapping local ne connaissait que E/P/R — les
+            // paquets F/T (SMS de fin / relance 20 min délégués) tombaient dans
+            // « Unknown type, skip » et n'étaient JAMAIS diffusés en DNS-SD.
+            // Résultat : pas de SMS de fin via relais, timeout ACK chez l'émetteur.
+            val shortType = MarselProtocol.shortTypeOf(extractJsonString(json, "type") ?: "")
+                ?: run { logToJs("DNS-SD", "Unknown type, skip"); return }
             val record = buildTxtRecord(shortType, json) ?: run {
                 logToJs("DNS-SD", "buildTxtRecord failed for $shortType")
                 return
@@ -1339,6 +1409,16 @@ class MainActivity : ComponentActivity() {
             runOnUiThread {
                 when (shortType) {
                     "E" -> {
+                        // BUG-2 (terrain) : ne JAMAIS (re-)diffuser une urgence déjà
+                        // RÉSOLUE. Le flush JS re-poussait de vieilles alertes finies
+                        // → marsel-alert-* fantômes, marqueurs qui s'accumulent,
+                        // re-notifications et re-SMS chez les voisins.
+                        val resolvedKey = record["e"] ?: record["i"] ?: ""
+                        if (resolvedKey.isNotEmpty() && dedupLedger.isSeen("res", resolvedKey)) {
+                            logToJs("DNS-SD", "EMERGENCY $resolvedKey déjà résolue — pas de re-diffusion")
+                            return@runOnUiThread
+                        }
+
                         // A2 : annuler tout clear différé d'une résolution précédente
                         // AVANT d'enregistrer la nouvelle alerte, sinon le runnable
                         // de 2 min effacerait le marsel-alert fraîchement posé.
@@ -1395,7 +1475,12 @@ class MainActivity : ComponentActivity() {
                         // Emergency resolved: retirer NOTRE alerte + position, diffuser R
                         // pendant 2 min. On ne touche PAS aux services relayés (C3).
                         val msgId = record["i"] ?: ""
-                        record["e"]?.let { purgePendingForEmergency(it) }  // I3
+                        // BUG-2 : mémoriser NOTRE PROPRE résolution — bloque toute
+                        // re-diffusion ultérieure de cette urgence (garde du "E").
+                        record["e"]?.let {
+                            dedupLedger.checkAndMark("res", it)
+                            purgePendingForEmergency(it)  // I3
+                        }
                         activeAlertServiceInfo?.let { safeRemoveLocalService(it, "resolved-alert") }
                         activePositionServiceInfo?.let { safeRemoveLocalService(it, "resolved-pos") }
                         activeEmergencyRecord = null
@@ -1417,6 +1502,15 @@ class MainActivity : ComponentActivity() {
                         }
                         resolvedClearRunnable = runnable
                         p2pHandler.postDelayed(runnable, 120_000)
+                    }
+                    // BUG-1 : diffusion des demandes de SMS relayé (fin d'alerte F /
+                    // relance 20 min T) émises par CE téléphone. Avant ce correctif
+                    // elles tombaient dans « Unknown type, skip » → jamais diffusées,
+                    // pas de SMS de fin via relais, timeout ACK garanti.
+                    "F", "T" -> {
+                        logToJs("DNS-SD", "SMS-REQ $shortType : diffusion ${MarselProtocol.smsReqInstanceName(record["i"] ?: "x")}")
+                        registerRelayedService(json)
+                        kickDiscoveryNow()
                     }
                 }
             }
@@ -1756,6 +1850,8 @@ class MainActivity : ComponentActivity() {
             val lat = extractJsonNumber(sourceJson, "lat") ?: return
             val lng = extractJsonNumber(sourceJson, "lng") ?: return
             val ackJson = """{"type":"${MarselProtocol.TYPE_SMS_ACK}","messageId":"${origMessageId}_ack","id":"$origMessageId","emergencyId":"$origMessageId","pseudo":"$pseudo","lat":$lat,"lng":$lng,"timestamp":${System.currentTimeMillis()},"hopCount":0,"maxHops":${MarselProtocol.MAX_HOPS},"contacts":[]}"""
+            // Notre propre ACK : l'écho relayé ne doit pas être re-traité (BUG-3)
+            ownMessageIds.add("${origMessageId}_ack")
             logToJs("RELAY", "ACK diffusé : SMS envoyés pour $origMessageId")
             registerRelayedService(ackJson)
             synchronized(pendingRelayMessages) { pendingRelayMessages.add(ackJson) }
@@ -2322,6 +2418,17 @@ class MainActivity : ComponentActivity() {
                 try {
                     val t = extractJsonString(emergencyJson, "type") ?: "?"
                     logToJs("RELAY", "SEND $t via DNS-SD + socket transport")
+
+                    // BUG-3 : marquer NOS paquets sortants — le maillage nous les
+                    // renvoie en écho (relayés par les voisins) et, sans ce marquage,
+                    // on se notifiait de sa propre alerte et on re-relayait ses
+                    // propres paquets.
+                    extractJsonString(emergencyJson, "messageId")?.let { ownId ->
+                        ownMessageIds.add(ownId)
+                        if (ownMessageIds.size > 300) ownMessageIds.clear()
+                        synchronized(processedMessageIds) { processedMessageIds.add(ownId) }
+                        dedupLedger.checkAndMark("msg", ownId)
+                    }
 
                     // PRIMARY transport: connection-less DNS-SD broadcast.
                     // broadcastViaService enchaîne register→kickDiscoveryNow (3b) :

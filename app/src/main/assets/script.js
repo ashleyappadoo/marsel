@@ -109,6 +109,7 @@ var MARSEL = {
     p2pConnected: false,
     relayQueue: [],
     processedMessageIds: {},   // id → true  (Set replacement for ES5)
+    resolvedEmergencies: {},   // emergencyId → true — plus jamais de marqueur/notif pour elles
 
     // Mode
     mode: 'autonome',          // 'autonome' | 'assistance'
@@ -1002,17 +1003,27 @@ function deactivateEmergency() {
 
     // Mark resolved in DB
     if (MARSEL.emergencyId) {
+        var resolvedId = MARSEL.emergencyId;
+        MARSEL.resolvedEmergencies[resolvedId] = true;
         dbPut('emergency_events', {
-            id: MARSEL.emergencyId,
+            id: resolvedId,
             status: 'RESOLVED',
             resolvedAt: Date.now()
         }).catch(function () {});
 
         // Remove from map
-        if (MARSEL.incidentMarkers[MARSEL.emergencyId]) {
-            try { MARSEL.leafletMap.removeLayer(MARSEL.incidentMarkers[MARSEL.emergencyId]); } catch (e) {}
-            delete MARSEL.incidentMarkers[MARSEL.emergencyId];
+        if (MARSEL.incidentMarkers[resolvedId]) {
+            try { MARSEL.leafletMap.removeLayer(MARSEL.incidentMarkers[resolvedId]); } catch (e) {}
+            delete MARSEL.incidentMarkers[resolvedId];
         }
+
+        // BUG-2 : purger la file relay JS de TOUT paquet de cette urgence —
+        // sinon ils seraient re-poussés plus tard (marqueurs/SMS fantômes).
+        MARSEL.relayQueue = MARSEL.relayQueue.filter(function (p) {
+            var pid = (p && (p.emergencyId || p.id || p.messageId)) || '';
+            return String(pid).indexOf(resolvedId) === -1;
+        });
+        dbDelete('relay_queue', resolvedId).catch(function () {});
     }
 
     localStorage.removeItem('marsel_emergency');
@@ -1537,12 +1548,12 @@ window.onP2PConnected = function (info) {
     mLog('J', 'RELAY', 'P2P connected isOwner=' + (info && info.isOwner) + ' addr=' + (info && info.address));
     updateNetworkBadge('🔁 Marsel Relay Network ✓');
 
-    // Flush relay queue now that we have a peer
-    MARSEL.relayQueue.forEach(function (emergencyData) {
-        if (window.AndroidBridge && typeof AndroidBridge.sendEmergencyViaRelay === 'function') {
-            try { AndroidBridge.sendEmergencyViaRelay(JSON.stringify(emergencyData)); } catch (e) {}
-        }
-    });
+    // BUG-2 (terrain) : le flush de MARSEL.relayQueue re-poussait ici CHAQUE
+    // vieille urgence (y compris résolues) à CHAQUE connexion P2P → services
+    // marsel-alert-* fantômes, marqueurs qui s'accumulent, re-notifications et
+    // re-SMS chez les voisins. SUPPRIMÉ : le service DNS-SD de l'alerte active
+    // émet déjà en continu, et la file socket native (pendingRelayMessages)
+    // gère la livraison aux pairs qui se connectent.
 };
 
 /* Called by Android when a relay message arrives from another device */
@@ -1575,6 +1586,14 @@ window.onRelayMessageReceived = function (jsonStr) {
     if (!msgId) return;
     if (MARSEL.processedMessageIds[msgId]) return;
     MARSEL.processedMessageIds[msgId] = true;
+
+    // BUG-2/6 : urgence déjà résolue (fin d'alerte reçue ou émise) — aucun
+    // marqueur ni notification, même si un vieux paquet E traîne encore.
+    var eKey = data.emergencyId || data.id || msgId;
+    if (MARSEL.resolvedEmergencies[eKey]) {
+        mLog('J', 'RELAY', 'E ignorée (urgence résolue) : ' + eKey);
+        return;
+    }
 
     var record = {
         id: msgId,
@@ -1736,6 +1755,9 @@ function sendPositionUpdate(lat, lng) {
 /* Mise à jour de position d'un autre utilisateur reçue via relay */
 function handlePositionUpdate(data) {
     if (!data.emergencyId) return;
+    // BUG-6 : une position périmée arrivant APRÈS la fin d'alerte recréait le
+    // marqueur (tag fantôme). Urgence résolue → ignorer définitivement.
+    if (MARSEL.resolvedEmergencies[data.emergencyId]) return;
     var fLat = parseFloat(data.lat);
     var fLng = parseFloat(data.lng);
     if (isNaN(fLat) || isNaN(fLng)) { mLog('J','RELAY','POS_UPDATE bad coords'); return; }
@@ -1778,6 +1800,10 @@ function handlePositionUpdate(data) {
 function handleEmergencyResolved(data) {
     var eId = data.emergencyId;
     if (!eId) return;
+
+    // BUG-2/6 : mémoriser la résolution — tout paquet E/P retardataire de
+    // cette urgence sera ignoré (plus de marqueur fantôme qui revient).
+    MARSEL.resolvedEmergencies[eId] = true;
 
     // Supprimer le marqueur de la carte
     if (MARSEL.incidentMarkers[eId] && MARSEL.leafletMap) {
