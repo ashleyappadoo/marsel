@@ -336,6 +336,21 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
+        // CRASH-FIX (structurel) : TOUS les champs lateinit sont assignés en
+        // premier, avant toute logique susceptible de les utiliser (y compris
+        // des callbacks asynchrones comme le ChannelListener WiFi P2P installé
+        // plus bas). Bug réel corrigé ici : initLocationManager() était
+        // auparavant appelée plus haut dans cette méthode, AVANT l'assignation
+        // de `locationManager` — chez tout utilisateur ayant déjà accordé la
+        // permission localisation lors d'une session précédente (donc à CHAQUE
+        // réouverture suivante), cela levait une UninitializedPropertyAccessException
+        // non rattrapée (le try/catch interne ne couvre que SecurityException)
+        // → crash garanti à l'ouverture. « Vider le cache » revoke la permission
+        // au niveau système, ce qui évitait temporairement le chemin fautif —
+        // d'où le cycle « crash → vider le cache → ça remarche → re-crash ».
+        locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        webView = WebView(this)
+
         // --- Notification channel (must be created before any notification) ---
         createNotificationChannel()
 
@@ -352,13 +367,13 @@ class MainActivity : ComponentActivity() {
         // Le flow d'onboarding JS (window) les demande groupe par groupe, dans
         // l'ordre, avec explication, via MarselBridge.requestPermissionGroup().
         // ACCESS_BACKGROUND_LOCATION est demandée séparément et en dernier (G1) ;
-        // plus aucune permission Bluetooth (G3). On initialise juste la
-        // localisation si elle est déjà accordée (utilisateur existant).
-        if (hasLocationPermission()) initLocationManager()
+        // plus aucune permission Bluetooth (G3).
 
         // --- WiFi P2P setup ---
         // A1/3e : ChannelListener obligatoire — un channel mort sans listener
         // rend le relay sourd ET muet en silence jusqu'au restart de l'app.
+        // webView et locationManager sont déjà assignés ci-dessus : ce callback
+        // peut désormais s'exécuter sans risque, à tout moment.
         wifiP2pManager = getSystemService(Context.WIFI_P2P_SERVICE) as WifiP2pManager
         wifiP2pChannel = wifiP2pManager.initialize(this, mainLooper) { onChannelLost() }
         wifiP2pReceiver = WifiP2pBroadcastReceiver()
@@ -369,12 +384,12 @@ class MainActivity : ComponentActivity() {
         setupDnsSdListeners()
         p2pHandler.postDelayed(rediscoverRunnable, 3_000)
 
-        // --- Location manager ---
-        locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
+        // --- Location manager : seed avec la dernière position connue si la
+        // permission est déjà accordée (utilisateur existant). Sans effet et
+        // sans risque si elle ne l'est pas encore (vérifiée en interne). ---
         initLocationManager()
 
-        // --- WebView ---
-        webView = WebView(this)
+        // --- WebView (configuration — l'instance existe déjà) ---
         webView.settings.javaScriptEnabled = true
         webView.settings.domStorageEnabled = true
         webView.settings.allowFileAccess = true
