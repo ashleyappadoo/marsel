@@ -171,6 +171,16 @@ class MainActivity : ComponentActivity() {
     // VRAIES transitions d'état.
     private var prevP2pEnabled: Boolean? = null
 
+    // PERM-FIX (terrain) : sans NEARBY_WIFI_DEVICES (API 33+) ou FINE_LOCATION
+    // (API < 33), TOUTES les opérations WiFi P2P échouent en reason=0 et le MRN
+    // est silencieusement mort. On le détecte, on prévient l'UI (qui redemande
+    // la permission) et on arrête de marteler le framework.
+    @Volatile private var lastPermWarnMs = 0L
+    @Volatile private var p2pBlockedNotified = false
+    // Filet de sécurité : si reason=0 persiste ALORS QUE les permissions sont
+    // OK, le channel est gelé → on le recrée après 6 échecs consécutifs.
+    private val consecutiveP2pErrors = java.util.concurrent.atomic.AtomicInteger(0)
+
     private val smsSentReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val trackId = intent.getStringExtra("trackId") ?: return
@@ -260,6 +270,13 @@ class MainActivity : ComponentActivity() {
                 !shouldShowRequestPermissionRationale(it)
         }
         if (granted && (group == "location")) initLocationManager()
+        // PERM-FIX : permission proximité tout juste accordée → relancer le MRN
+        // immédiatement (re-arm complet + ré-enregistrement des services actifs).
+        if (granted && group == "nearby") {
+            lastServiceRequestResetMs = 0
+            reRegisterActiveServices()
+            kickDiscoveryNow()
+        }
         runOnUiThread {
             webView.evaluateJavascript(
                 "window.onPermissionResult && window.onPermissionResult('$group',$granted,$permanentlyDenied)",
@@ -634,16 +651,16 @@ class MainActivity : ComponentActivity() {
                 }
 
                 WifiP2pManager.WIFI_P2P_PEERS_CHANGED_ACTION -> {
-                    // BUG-5 (latence 20-25s) : discoverServices est une REQUÊTE
-                    // PONCTUELLE — un service enregistré juste après notre requête
-                    // n'est vu qu'au cycle suivant. Quand un téléphone commence à
-                    // émettre (alerte), le framework nous délivre PEERS_CHANGED :
-                    // on relance immédiatement la découverte (throttle 3s) au lieu
-                    // d'attendre le prochain cycle périodique.
+                    // BUG-5 + CACHE-FIX : quand un téléphone commence à émettre,
+                    // le framework nous délivre PEERS_CHANGED. On force alors un
+                    // re-arm COMPLET (clear→add→discover) — un simple discover
+                    // réutiliserait la requête existante et serait servi depuis
+                    // le cache, sans voir le nouveau service. Throttle 5s.
                     val nowPeers = System.currentTimeMillis()
-                    if (nowPeers - lastPeerTriggeredDiscoverMs > 3_000) {
+                    if (nowPeers - lastPeerTriggeredDiscoverMs > 5_000) {
                         lastPeerTriggeredDiscoverMs = nowPeers
-                        discoverServicesOnly()
+                        lastServiceRequestResetMs = 0  // force le re-arm complet
+                        restartServiceDiscovery()
                     }
                     wifiP2pManager.requestPeers(wifiP2pChannel) { peers ->
                         synchronized(peerDevices) {
@@ -1102,6 +1119,78 @@ class MainActivity : ComponentActivity() {
     }
 
     // =========================================================================
+    // PERM-FIX — permission P2P requise + recovery du channel gelé
+    // =========================================================================
+    private fun hasNearbyPermission(): Boolean =
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            ContextCompat.checkSelfPermission(this, Manifest.permission.NEARBY_WIFI_DEVICES) ==
+                PackageManager.PERMISSION_GRANTED
+        } else {
+            // API < 33 : la découverte WiFi P2P exige la localisation fine
+            ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) ==
+                PackageManager.PERMISSION_GRANTED
+        }
+
+    // true si la permission manque : le MRN est inopérant. Prévient l'UI
+    // (une seule fois par état) qui redemande la permission, et log throttlé
+    // (1/min) au lieu de marteler le framework avec des reason=0.
+    private fun p2pPermissionMissing(): Boolean {
+        if (hasNearbyPermission()) {
+            if (p2pBlockedNotified) {
+                p2pBlockedNotified = false
+                runOnUiThread {
+                    webView.evaluateJavascript("window.onP2PBlocked && window.onP2PBlocked('')", null)
+                }
+            }
+            return false
+        }
+        val now = System.currentTimeMillis()
+        if (now - lastPermWarnMs > 60_000) {
+            lastPermWarnMs = now
+            logToJs("P2P", "MRN INACTIF : permission « Appareils à proximité » manquante")
+        }
+        if (!p2pBlockedNotified) {
+            p2pBlockedNotified = true
+            runOnUiThread {
+                webView.evaluateJavascript("window.onP2PBlocked && window.onP2PBlocked('permission')", null)
+            }
+        }
+        return true
+    }
+
+    private fun noteP2pError() {
+        if (!hasNearbyPermission()) return  // cause connue : permission, pas le channel
+        if (consecutiveP2pErrors.incrementAndGet() >= 6) {
+            p2pHandler.post { recreateP2pChannel("6 échecs consécutifs reason=0 avec permissions OK") }
+        }
+    }
+
+    private fun noteP2pSuccess() {
+        consecutiveP2pErrors.set(0)
+    }
+
+    // Recréation dure du channel (close + initialize) : dernier recours quand
+    // le framework répond ERROR en boucle alors que les permissions sont là.
+    private fun recreateP2pChannel(why: String) {
+        logToJs("P2P", "RECRÉATION du channel WiFi P2P ($why)")
+        consecutiveP2pErrors.set(0)
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
+                try { wifiP2pChannel.close() } catch (e: Exception) { Log.v(TAG, "channel close: ${e.message}") }
+            }
+        } catch (e: Exception) { /* ignore */ }
+        try {
+            wifiP2pChannel = wifiP2pManager.initialize(this, mainLooper) { onChannelLost() }
+            setupDnsSdListeners()
+            lastServiceRequestResetMs = 0
+            reRegisterActiveServices()
+            kickDiscoveryNow()
+        } catch (e: Exception) {
+            Log.e(TAG, "recreateP2pChannel: ${e.message}")
+        }
+    }
+
+    // =========================================================================
     // A3/3f — Watchdog : silence DNS-SD > 60s alors que le P2P est actif
     // =========================================================================
     // Retourne true si un recovery a été lancé (le cycle appelant ne doit alors
@@ -1275,13 +1364,18 @@ class MainActivity : ComponentActivity() {
     // Helpers add/remove service avec log — toujours appelés sur le main thread
     // =========================================================================
     private fun addLocalServiceSafe(info: WifiP2pDnsSdServiceInfo, label: String, onOk: (() -> Unit)? = null) {
+        if (p2pPermissionMissing()) return
         try {
             wifiP2pManager.addLocalService(wifiP2pChannel, info, object : WifiP2pManager.ActionListener {
                 override fun onSuccess() {
+                    noteP2pSuccess()
                     logToJs("DNS-SD", "$label registered ✓")
                     onOk?.invoke()
                 }
-                override fun onFailure(r: Int) { logToJs("DNS-SD", "$label register FAILED: $r") }
+                override fun onFailure(r: Int) {
+                    logToJs("DNS-SD", "$label register FAILED: $r")
+                    noteP2pError()
+                }
             })
         } catch (ex: SecurityException) {
             logToJs("DNS-SD", "$label denied: ${ex.message}")
@@ -1352,6 +1446,7 @@ class MainActivity : ComponentActivity() {
 
     private fun handleServiceTxtRecord(record: Map<String, String?>) {
         try {
+            noteP2pSuccess()  // réception réelle = stack P2P sain
             val json = MarselProtocol.txtRecordToJson(record, System.currentTimeMillis()) ?: run {
                 logToJs("DNS-SD", "TXT record invalide/incomplet: $record")
                 return
@@ -1393,6 +1488,7 @@ class MainActivity : ComponentActivity() {
             logToJs("DNS-SD", "WiFi P2P disabled — cannot broadcast")
             return
         }
+        if (p2pPermissionMissing()) return
         try {
             // BUG-1 (terrain) : le mapping local ne connaissait que E/P/R — les
             // paquets F/T (SMS de fin / relance 20 min délégués) tombaient dans
@@ -1523,13 +1619,18 @@ class MainActivity : ComponentActivity() {
 
     // Register the emergency alert service (called once on EMERGENCY, after clearLocalServices).
     private fun registerAlertService(info: WifiP2pDnsSdServiceInfo) {
+        if (p2pPermissionMissing()) return
         try {
             wifiP2pManager.addLocalService(wifiP2pChannel, info, object : WifiP2pManager.ActionListener {
                 override fun onSuccess() {
+                    noteP2pSuccess()
                     activeAlertServiceInfo = info
                     logToJs("DNS-SD", "marsel-alert registered ✓ — broadcasting continuously")
                 }
-                override fun onFailure(r: Int) { logToJs("DNS-SD", "marsel-alert register FAILED: $r") }
+                override fun onFailure(r: Int) {
+                    logToJs("DNS-SD", "marsel-alert register FAILED: $r")
+                    noteP2pError()
+                }
             })
         } catch (ex: SecurityException) {
             logToJs("DNS-SD", "registerAlertService denied: ${ex.message}")
@@ -1538,10 +1639,17 @@ class MainActivity : ComponentActivity() {
 
     // Add a position service without touching the alert service.
     private fun addPosServiceSafe(info: WifiP2pDnsSdServiceInfo) {
+        if (p2pPermissionMissing()) return
         try {
             wifiP2pManager.addLocalService(wifiP2pChannel, info, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() { logToJs("DNS-SD", "marsel-pos registered ✓") }
-                override fun onFailure(r: Int) { logToJs("DNS-SD", "marsel-pos register FAILED: $r") }
+                override fun onSuccess() {
+                    noteP2pSuccess()
+                    logToJs("DNS-SD", "marsel-pos registered ✓")
+                }
+                override fun onFailure(r: Int) {
+                    logToJs("DNS-SD", "marsel-pos register FAILED: $r")
+                    noteP2pError()
+                }
             })
         } catch (ex: SecurityException) {
             logToJs("DNS-SD", "addPosServiceSafe denied: ${ex.message}")
@@ -1556,8 +1664,18 @@ class MainActivity : ComponentActivity() {
 
     private fun restartServiceDiscovery() {
         if (!wifiP2pEnabled) return
+        // PERM-FIX : sans permission proximité, tout échouerait en reason=0 —
+        // on prévient l'UI (qui redemande) au lieu de marteler le framework.
+        if (p2pPermissionMissing()) return
         val now = System.currentTimeMillis()
-        if (now - lastServiceRequestResetMs > 120_000) {
+        // CACHE-FIX (terrain, 2e appel invisible) : une requête de service
+        // réutilisée est servie depuis le CACHE du framework — un service
+        // enregistré par un pair APRÈS notre requête reste invisible jusqu'au
+        // re-arm complet (clear→add→discover). 120s était bien trop long :
+        // re-arm toutes les 15s en alerte, 45s en veille. Entre deux re-arms,
+        // discoverServices seul (pas de churn).
+        val rearmInterval = if (isAlertActive()) 15_000L else 45_000L
+        if (now - lastServiceRequestResetMs > rearmInterval) {
             lastServiceRequestResetMs = now
             try {
                 wifiP2pManager.clearServiceRequests(wifiP2pChannel, object : WifiP2pManager.ActionListener {
@@ -1588,14 +1706,19 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun discoverServicesOnly() {
+        if (p2pPermissionMissing()) return
         try {
             wifiP2pManager.discoverServices(wifiP2pChannel, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() { Log.d(TAG, "DNS-SD discovery running") }
+                override fun onSuccess() {
+                    noteP2pSuccess()
+                    Log.d(TAG, "DNS-SD discovery running")
+                }
                 override fun onFailure(reason: Int) {
                     // Échec visible dans l'overlay (avant : Log.w invisible en test
                     // mobile) + re-arm complet au prochain cycle.
                     logToJs("DNS-SD", "discoverServices ÉCHEC reason=$reason — re-arm au prochain cycle")
                     lastServiceRequestResetMs = 0
+                    noteP2pError()
                 }
             })
         } catch (e: SecurityException) {

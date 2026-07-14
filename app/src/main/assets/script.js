@@ -1523,6 +1523,28 @@ window.onPeersDiscovered = function (peers) {
     }
 };
 
+/* PERM-FIX : appelé par Android quand le MRN est bloqué par une permission
+   manquante (« Appareils à proximité »). On informe l'utilisateur et on
+   redemande la permission UNE fois automatiquement (l'onboarding ne repasse
+   plus après le premier lancement). reason vide = débloqué. */
+var _p2pBlockedPromptDone = false;
+window.onP2PBlocked = function (reason) {
+    if (!reason) {
+        mLog('J', 'NET', 'MRN débloqué — permission OK');
+        updateNetworkBadge();
+        return;
+    }
+    mLog('J', 'NET', 'MRN BLOQUÉ : ' + reason);
+    updateNetworkBadge('⚠️ Permission proximité requise');
+    if (!_p2pBlockedPromptDone) {
+        _p2pBlockedPromptDone = true;
+        showToast('⚠️ Le réseau Marsel a besoin de la permission « Appareils à proximité »');
+        if (window.AndroidBridge && typeof AndroidBridge.requestPermissionGroup === 'function') {
+            try { AndroidBridge.requestPermissionGroup('nearby'); } catch (e) {}
+        }
+    }
+};
+
 /* Appelé par Android quand l'état de l'enregistrement audio change (Section 5). */
 window.onRecordingStateChanged = function (recording, reason) {
     mLog('J', 'NET', 'audio recording=' + recording + ' reason=' + reason);
@@ -1639,8 +1661,13 @@ window.onRelayMessageReceived = function (jsonStr) {
 
 function startEmergencyTracking(emergencyData) {
     stopEmergencyTracking(); // reset si déjà actif
-    // Envoyer la position immédiatement, puis toutes les 10s
-    sendPositionUpdate(MARSEL.currentLat, MARSEL.currentLng);
+    // Première position après 2s : envoyée immédiatement, elle partait en
+    // COURSE avec l'enregistrement du service d'alerte côté natif (threads
+    // séparés) et était jetée (« POSITION: no active emergency, skip »,
+    // vu en test terrain). Puis toutes les 10s.
+    setTimeout(function () {
+        if (MARSEL.emergencyActive) sendPositionUpdate(MARSEL.currentLat, MARSEL.currentLng);
+    }, 2000);
     MARSEL.trackingInterval = setInterval(function () {
         if (!MARSEL.emergencyActive) { stopEmergencyTracking(); return; }
         sendPositionUpdate(MARSEL.currentLat, MARSEL.currentLng);
@@ -2555,7 +2582,23 @@ function _onbRequest() {
 // Callback natif (Section 6)
 window.onPermissionResult = function (group, granted, permanentlyDenied) {
     mLog('J', 'NET', 'perm ' + group + ' granted=' + granted + ' permDenied=' + permanentlyDenied);
-    if (!_onbStarted) return;
+    if (!_onbStarted) {
+        // PERM-FIX : re-demande hors onboarding (permission proximité pour le MRN)
+        if (group === 'nearby') {
+            if (granted) {
+                showToast('✅ Réseau Marsel activé');
+                updateNetworkBadge();
+            } else if (permanentlyDenied) {
+                showToast('⚠️ Active « Appareils à proximité » dans les réglages pour le réseau Marsel');
+                if (window.AndroidBridge && typeof AndroidBridge.openAppSettings === 'function') {
+                    try { AndroidBridge.openAppSettings(); } catch (e) {}
+                }
+            } else {
+                showToast('⚠️ Sans cette permission, le réseau Marsel reste inactif');
+            }
+        }
+        return;
+    }
     var g = MARSEL_PERM_GROUPS[_onbIndex];
     if (!g || g.key !== group) return;
     if (!granted && permanentlyDenied) {
