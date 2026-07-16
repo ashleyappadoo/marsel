@@ -124,6 +124,11 @@ var MARSEL = {
     trackingInterval: null,    // setInterval handle for continuous position broadcast
     firstGpsFix: false,        // true dès qu'un VRAI fix GPS est reçu (jamais avant)
 
+    // GPS-QUALITY (terrain) : filtre des fix réseau grossiers + recentrage
+    lastFixAcc: null,          // précision (m) du dernier fix ACCEPTÉ
+    lastFixTs: 0,              // timestamp du dernier fix accepté
+    mapCenteredAcc: null,      // précision du fix sur lequel la carte a été centrée
+
     // Timer 20 minutes (Section 4)
     timeoutTimer: null         // setTimeout handle for the 20-min still-active alert
 };
@@ -424,7 +429,26 @@ window.onLocationUpdate = function (lat, lng, accuracy) {
     var fLng = parseFloat(lng);
     // Rejeter uniquement les valeurs non numériques (0,0 est une coordonnée valide)
     if (!isFinite(fLat) || !isFinite(fLng)) { mLog('J','GPS','invalid coords: ' + lat + ',' + lng); return; }
-    mLog('J', 'GPS', 'fix lat=' + fLat.toFixed(5) + ' lng=' + fLng.toFixed(5) + ' acc=' + (accuracy||'?'));
+    var fAcc = parseFloat(accuracy);
+    if (!isFinite(fAcc) || fAcc <= 0) fAcc = 1000; // précision inconnue = grossière
+    mLog('J', 'GPS', 'fix lat=' + fLat.toFixed(5) + ' lng=' + fLng.toFixed(5) + ' acc=' + Math.round(fAcc));
+
+    // GPS-QUALITY (terrain) : les fix « network » (cellule/WiFi, 400-800 m)
+    // arrivent APRÈS les fix GPS précis et écrasaient la vraie position — la
+    // carte semblait « ne pas recentrer sur nous ». On rejette un fix grossier
+    // (>100 m) si on a accepté un fix précis (<50 m) il y a moins de 30 s.
+    // Jamais de rejet du premier fix : une position grossière vaut mieux
+    // qu'aucune position (elle sera remplacée dès qu'un fix précis arrive).
+    var nowTs = Date.now();
+    if (MARSEL.firstGpsFix && fAcc > 100 &&
+        MARSEL.lastFixAcc !== null && MARSEL.lastFixAcc < 50 &&
+        (nowTs - MARSEL.lastFixTs) < 30000) {
+        mLog('J', 'GPS', 'fix grossier rejeté (acc=' + Math.round(fAcc) +
+            'm, précis récent acc=' + Math.round(MARSEL.lastFixAcc) + 'm)');
+        return;
+    }
+    MARSEL.lastFixAcc = fAcc;
+    MARSEL.lastFixTs = nowTs;
 
     var wasFirst = !MARSEL.firstGpsFix;
     MARSEL.currentLat = fLat;
@@ -449,6 +473,15 @@ window.onLocationUpdate = function (lat, lng, accuracy) {
         }
         if (wasFirst) {
             MARSEL.leafletMap.setView([fLat, fLng], 15);
+            MARSEL.mapCenteredAcc = fAcc;
+        } else if (MARSEL.mapCenteredAcc !== null &&
+                   MARSEL.mapCenteredAcc > 100 && fAcc < 20) {
+            // RECENTRAGE INTELLIGENT : la carte avait été centrée sur un fix
+            // grossier (réseau) et un fix GPS précis vient d'arriver — la vraie
+            // position peut être à des centaines de mètres du centre affiché.
+            MARSEL.leafletMap.setView([fLat, fLng], 15);
+            MARSEL.mapCenteredAcc = fAcc;
+            mLog('J', 'MAP', 'recentrage auto sur fix précis (acc=' + Math.round(fAcc) + 'm)');
         }
         // Lieux sûrs du CSV selon la position réelle — appelé à chaque fix,
         // le garde interne (>500 m) évite tout re-rendu inutile ; les lieux
@@ -501,6 +534,20 @@ function acquireImmediateRealFix() {
 /* ---------------------------------------------------------
    MAP
    --------------------------------------------------------- */
+/* Bouton de recentrage manuel : recentre la carte sur la position réelle
+   (fix courant ou dernier fix réel connu). Aucune position factice : sans
+   vrai fix, on informe l'utilisateur au lieu d'inventer un centre. */
+function recenterMap() {
+    var pos = getRealPosition();
+    if (pos && MARSEL.leafletMap) {
+        MARSEL.leafletMap.setView([pos.lat, pos.lng], 16);
+        if (MARSEL.lastFixAcc !== null) MARSEL.mapCenteredAcc = MARSEL.lastFixAcc;
+    } else {
+        showToast('Position GPS pas encore disponible');
+        acquireImmediateRealFix();
+    }
+}
+
 function initMap() {
     if (MARSEL.mapInitialized) {
         if (MARSEL.leafletMap) {
@@ -534,6 +581,9 @@ function initMap() {
         var realStart = getRealPosition();
         if (realStart) {
             MARSEL.leafletMap.setView([realStart.lat, realStart.lng], 15);
+            // Précision inconnue pour un « dernier fix connu » → traiter comme
+            // grossier : le premier fix GPS précis recentrera automatiquement.
+            MARSEL.mapCenteredAcc = 9999;
         } else {
             MARSEL.leafletMap.setView([20, 0], 2);
         }

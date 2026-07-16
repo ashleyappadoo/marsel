@@ -201,6 +201,18 @@ class MarselProtocolTest {
     }
 
     @Test
+    fun longRequestIds_surviveTxtRoundTripIntact() {
+        // ID-FIX : les ids F/T (42-43 caractères) étaient tronqués à 40 dans le
+        // TXT → corrélation d'ACK impossible chez l'émetteur (bug terrain).
+        val longId = "emg-mrklbsgj-n1arldgx_ressms_1784057866915"  // 42 chars
+        val json = """{"type":"MARSEL_RESOLVED_SMS_REQUEST","messageId":"$longId","emergencyId":"emg-mrklbsgj-n1arldgx","pseudo":"Bob","lat":1.0,"lng":2.0,"timestamp":10,"hopCount":0,"contacts":[{"mobile":"+33600"}]}"""
+        val rec = MarselProtocol.buildTxtRecord("F", json, 0)!!
+        assertEquals("id intact dans le TXT", longId, rec["i"])
+        val back = MarselProtocol.txtRecordToJson(rec, 0)!!
+        assertEquals(longId, MarselProtocol.extractJsonString(back, "messageId"))
+    }
+
+    @Test
     fun ackPacket_preservesAckedRequestId() {
         // L'ACK transporte l'id de la demande traitée dans emergencyId ;
         // l'émetteur le compare à ses propres demandes en attente.

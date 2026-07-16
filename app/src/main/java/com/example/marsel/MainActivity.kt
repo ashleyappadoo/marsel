@@ -211,7 +211,31 @@ class MainActivity : ComponentActivity() {
             // Veille 12s (au lieu de 25s) : discoverServices est ponctuel, la
             // latence de détection ≈ l'intervalle du récepteur. 12s + trigger
             // PEERS_CHANGED = détection typique < 10s pour un coût batterie modéré.
-            p2pHandler.postDelayed(this, if (isAlertActive()) 8_000L else 12_000L)
+            // SOCKET-FIRST : groupe P2P connecté → le socket TCP est le canal
+            // principal ; on espace le DNS-SD (20s) pour ne pas déstabiliser la
+            // liaison (le scan off-channel agressif aggravait le flapping
+            // DISABLED→ENABLED observé sur Samsung toutes les 20-40s).
+            val interval = when {
+                groupOwnerAddress != null -> 20_000L
+                isAlertActive() -> 8_000L
+                else -> 12_000L
+            }
+            p2pHandler.postDelayed(this, interval)
+        }
+    }
+
+    // SOCKET-FIRST (terrain, flapping) : tant que le groupe P2P est connecté et
+    // qu'on est CLIENT, on tire (pull) les messages du GO par socket toutes les
+    // 10s — canal bien plus fiable que le DNS-SD pendant une connexion. Le
+    // serveur pousse déjà tous ses pendingRelayMessages à chaque connexion
+    // entrante et la déduplication (DedupLedger) absorbe les répétitions.
+    // attempts=1 : un poll raté n'est pas grave, le suivant arrive dans 10s.
+    private val socketPollRunnable = object : Runnable {
+        override fun run() {
+            val addr = groupOwnerAddress
+            if (addr == null || isGroupOwner) return  // groupe perdu ou on est GO
+            sendRelayToPeer(addr, "", attempts = 1)
+            p2pHandler.postDelayed(this, 10_000L)
         }
     }
 
@@ -674,7 +698,15 @@ class MainActivity : ComponentActivity() {
                     val nowPeers = System.currentTimeMillis()
                     if (nowPeers - lastPeerTriggeredDiscoverMs > 5_000) {
                         lastPeerTriggeredDiscoverMs = nowPeers
-                        lastServiceRequestResetMs = 0  // force le re-arm complet
+                        // SOCKET-FIRST : pendant une connexion de groupe, les
+                        // événements PEERS_CHANGED sont fréquents (négociation,
+                        // heartbeats) — forcer un re-arm complet à chaque fois
+                        // détruirait la requête en vol et fragiliserait le lien.
+                        // Le socket transporte déjà les messages ; on garde le
+                        // re-arm forcé pour le mode déconnecté uniquement.
+                        if (groupOwnerAddress == null) {
+                            lastServiceRequestResetMs = 0  // force le re-arm complet
+                        }
                         restartServiceDiscovery()
                     }
                     wifiP2pManager.requestPeers(wifiP2pChannel) { peers ->
@@ -732,6 +764,11 @@ class MainActivity : ComponentActivity() {
                                     // No messages to send — pull any emergency alerts from GO
                                     sendRelayToPeer(address, "")
                                 }
+                                // SOCKET-FIRST : polling périodique du GO (10s)
+                                // tant que le groupe tient — canal principal
+                                // pendant la connexion, le DNS-SD passe en retrait.
+                                p2pHandler.removeCallbacks(socketPollRunnable)
+                                p2pHandler.postDelayed(socketPollRunnable, 10_000L)
                             }
                             // If GO: pending messages will be pushed to clients when they connect
 
@@ -746,7 +783,11 @@ class MainActivity : ComponentActivity() {
                     } else {
                         isGroupOwner = false
                         groupOwnerAddress = null
+                        p2pHandler.removeCallbacks(socketPollRunnable)
                         Log.d(TAG, "P2P disconnected")
+                        // Retour au mode déconnecté : reprendre immédiatement le
+                        // rythme DNS-SD normal (le cycle courant était espacé à 20s).
+                        kickDiscoveryNow()
                     }
                 }
 
@@ -1013,12 +1054,14 @@ class MainActivity : ComponentActivity() {
     // =========================================================================
     // Send relay message to a specific peer
     // =========================================================================
-    private fun sendRelayToPeer(address: String, messageJson: String) {
+    // attempts=1 pour le POLLING périodique (un échec n'est pas grave, le
+    // prochain poll arrive dans 10s) ; 3 pour les envois de paquets (D1/3d).
+    private fun sendRelayToPeer(address: String, messageJson: String, attempts: Int = 3) {
         thread {
             // D1/3d : sur WiFi Direct la première connexion échoue souvent
             // (ARP pas résolu, GO pas prêt) — 1 essai + 2 retries espacés de 2s.
             var lastError: Exception? = null
-            for (attempt in 1..3) {
+            for (attempt in 1..attempts) {
                 var socket: Socket? = null
                 try {
                     socket = Socket()
@@ -1689,7 +1732,13 @@ class MainActivity : ComponentActivity() {
         // re-arm complet (clear→add→discover). 120s était bien trop long :
         // re-arm toutes les 15s en alerte, 45s en veille. Entre deux re-arms,
         // discoverServices seul (pas de churn).
-        val rearmInterval = if (isAlertActive()) 15_000L else 45_000L
+        // SOCKET-FIRST : groupe connecté → les messages passent par socket, le
+        // re-arm complet (churn clear→add) peut être bien plus rare (60s).
+        val rearmInterval = when {
+            groupOwnerAddress != null -> 60_000L
+            isAlertActive() -> 15_000L
+            else -> 45_000L
+        }
         if (now - lastServiceRequestResetMs > rearmInterval) {
             lastServiceRequestResetMs = now
             try {

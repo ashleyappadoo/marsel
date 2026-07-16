@@ -107,10 +107,19 @@ object MarselProtocol {
         // a déjà SMS-é ses proches, le relais ne doit PAS renvoyer (anti double-SMS).
         val relaySms = extractJsonString(json, "relaySms") == "1"
 
+        // ID-FIX (terrain) : la troncature à 40 caractères CASSAIT la corrélation
+        // des ACK — les ids des demandes F/T font 42-43 caractères
+        // (emg-xxxxxxxx-xxxxxxxx_ressms_<13 chiffres>), les derniers chiffres
+        // étaient coupés dans le TXT : l'émetteur attendait l'ACK sous l'id
+        // complet, le relais répondait sous l'id tronqué → fausse notification
+        // « SMS non envoyés » alors que le SMS était parti, et dédup smsHandled
+        // incohérente entre canal TXT (tronqué) et socket (complet) → risque de
+        // double SMS. 64 couvre tous nos formats d'id avec marge (limite réelle
+        // d'une valeur TXT : ~255 octets).
         val record = mutableMapOf(
             "y" to shortType,
-            "i" to msgId.take(40),
-            "e" to emergencyId.take(40),
+            "i" to msgId.take(64),
+            "e" to emergencyId.take(64),
             "p" to pseudo,
             "a" to String.format(java.util.Locale.US, "%.5f", lat),
             "o" to String.format(java.util.Locale.US, "%.5f", lng),
