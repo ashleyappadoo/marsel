@@ -60,6 +60,76 @@ Le service doit couvrir **deux cas**, pas seulement l'émetteur :
    d'un service always-on, et consentement utilisateur explicite (opt-in) pour
    « prêter » son téléphone comme relais/point de sortie SMS.
 
+## Confidentialité & sécurité des données — chantier différé
+
+Constat de l'audit du 22/07/2026 (auth actuelle + stockage) : l'absence de
+backend est un bon point pour l'anonymat, mais plusieurs fuites existent en
+dehors de toute base de données et doivent être traitées avant une mise en
+production. Périmètre ci-dessous **hors audio** (MMS audio traité séparément
+ci-dessous, `Music/` public, non concerné par ce chantier).
+
+### 1. Vraie authentification locale (sans Google/Facebook/OAuth tiers)
+
+**Constat :** `doLogin()`/`doRegister()` (`script.js`) acceptent n'importe quel
+couple email/mot de passe car `API_URL` est vide — ce n'est pas de
+l'authentification, juste une identité locale (`userId` généré côté client)
+stockée en clair dans `localStorage['marsel_user']`. Aucun verrou n'existe
+avant d'accéder à l'historique d'alertes, aux contacts, à la position passée.
+
+**À faire :**
+1. Remplacer le pseudo-login par une **authentification locale réelle** :
+   mot de passe (ou code PIN) **haché** (Argon2id/PBKDF2, jamais stocké en
+   clair) et vérifié sur l'appareil — pas de compte serveur, pas de
+   connexion tierce (Google/Facebook/Apple explicitement exclus par
+   l'utilisateur).
+2. Option biométrique (`BiometricPrompt`, empreinte/visage) en complément du
+   PIN/mot de passe, pas en remplacement (fallback obligatoire).
+3. Verrouiller l'accès à l'app (ou au minimum à l'historique/contacts/carte)
+   tant que l'authentification locale n'est pas validée — important dans le
+   scénario où quelqu'un d'autre a un accès physique au téléphone.
+4. Chiffrer au repos les données sensibles actuellement en clair
+   (`marsel_user`, `marsel_contacts`, `marsel_profile`, `marsel_emergency`,
+   IndexedDB `emergency_events`) — clé dérivée du secret local, jamais
+   envoyée nulle part.
+5. Neutraliser `android:allowBackup` (ou fournir un vrai
+   `data_extraction_rules.xml`/`backup_rules.xml` excluant ces données) pour
+   empêcher leur fuite via la sauvegarde cloud Android par défaut.
+
+### 2. Anonymisation de l'affichage lors d'un appel d'urgence
+
+**Constat :** le pseudo réel de l'émetteur circule en clair dans les paquets
+MRN (TXT `"p"`) et est affiché tel quel côté réception (notification,
+marqueur carte, popup) — visible par tout relais et par le destinataire.
+
+**À faire :**
+1. Générer un **identifiant d'alerte pseudonymisé** (ex. dérivé de
+   `emergencyId`, distinct du `userId` et du pseudo réel) à afficher côté
+   réception (notification, marqueur, popup carte) **à la place du nom/pseudo**.
+2. Le pseudo réel ne doit plus transiter tel quel dans les paquets MRN
+   diffusés aux relais/tiers (TXT `"p"`) ; seul l'ID pseudonymisé y circule.
+3. Le nom réel reste disponible **uniquement** pour l'émetteur lui-même
+   (localStorage) et, en clair, dans le corps du SMS envoyé à SES PROPRES
+   contacts (ceux-ci doivent bien identifier qui les appelle à l'aide) — la
+   pseudonymisation cible la diffusion MRN/carte vers des tiers/relais, pas
+   le SMS final aux contacts choisis par l'émetteur.
+4. Revoir en conséquence l'affichage carte (`addIncidentMarker`) et les
+   notifications de réception (`onRelayMessageReceived`) pour n'utiliser que
+   l'ID pseudonymisé.
+
+### 3. Autres fuites identifiées (à cadrer, priorité à discuter)
+
+- Contacts d'urgence (nom + numéro) diffusés en clair dans le TXT DNS-SD
+  (`"c"`) et sur les sockets TCP 8888/8890 sans TLS — receivable par tout
+  appareil à portée scannant `_marsel._tcp`, pas seulement les relais
+  légitimes.
+- Aucune authenticité/intégrité des paquets MRN : un tiers peut forger un
+  faux `RESOLVED` (étouffer une vraie alerte) ou un faux `ACK` (faire croire
+  à tort qu'un SMS est parti). Hors périmètre anonymisation mais à traiter
+  dans la foulée (signature/HMAC léger des paquets ?).
+- `usesCleartextTraffic="true"` sans `network_security_config.xml` : sans
+  conséquence tant qu'aucun `API_URL` n'est activé, mais à durcir le jour où
+  un backend optionnel est branché.
+
 ## MMS audio (5b) — best-effort à fiabiliser
 
 `sendLastRecordingMms` est un envoi best-effort : `SmsManager.sendMultimediaMessage`
