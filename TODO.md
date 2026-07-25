@@ -101,20 +101,36 @@ avant d'accéder à l'historique d'alertes, aux contacts, à la position passée
 MRN (TXT `"p"`) et est affiché tel quel côté réception (notification,
 marqueur carte, popup) — visible par tout relais et par le destinataire.
 
+**Règle validée avec l'utilisateur :** le **vrai nom de l'émetteur ne doit
+être communiqué qu'à ses proches** (la liste de contacts d'urgence qu'il a
+lui-même renseignée). Tout le reste du réseau — relais, autres utilisateurs
+Marsel à proximité, simples spectateurs de l'alerte — ne doit voir qu'un
+identifiant anonymisé, jamais le nom réel.
+
 **À faire :**
 1. Générer un **identifiant d'alerte pseudonymisé** (ex. dérivé de
    `emergencyId`, distinct du `userId` et du pseudo réel) à afficher côté
-   réception (notification, marqueur, popup carte) **à la place du nom/pseudo**.
+   réception (notification, marqueur, popup carte) **à la place du nom/pseudo**
+   pour tout destinataire qui n'est pas dans la liste des proches.
 2. Le pseudo réel ne doit plus transiter tel quel dans les paquets MRN
    diffusés aux relais/tiers (TXT `"p"`) ; seul l'ID pseudonymisé y circule.
-3. Le nom réel reste disponible **uniquement** pour l'émetteur lui-même
-   (localStorage) et, en clair, dans le corps du SMS envoyé à SES PROPRES
-   contacts (ceux-ci doivent bien identifier qui les appelle à l'aide) — la
-   pseudonymisation cible la diffusion MRN/carte vers des tiers/relais, pas
-   le SMS final aux contacts choisis par l'émetteur.
+3. Le nom réel reste disponible **pour les proches uniquement**, quel que
+   soit le canal :
+   - dans le corps du SMS envoyé à SES PROPRES contacts (ceux-ci doivent
+     bien identifier qui les appelle à l'aide) — déjà correct aujourd'hui ;
+   - **et** si un proche est lui-même utilisateur Marsel et reçoit l'alerte
+     directement via le réseau maillé (pas seulement par SMS), il doit voir
+     le vrai nom sur son app alors qu'un relais/tiers ne voit que l'ID
+     anonymisé pour cette même alerte. Cela suppose un moyen de reconnaître
+     côté réception « je suis un proche déclaré de cet émetteur » (ex. via
+     l'appairage/clé partagée déjà envisagé pour le chat — cf. étude de
+     faisabilité abandonnée pour l'instant, mais le mécanisme d'identité
+     proche-à-proche reste pertinent ici) pour lever l'anonymisation
+     uniquement pour ce destinataire précis, sans jamais exposer le nom aux
+     autres relais qui font transiter le même paquet.
 4. Revoir en conséquence l'affichage carte (`addIncidentMarker`) et les
    notifications de réception (`onRelayMessageReceived`) pour n'utiliser que
-   l'ID pseudonymisé.
+   l'ID pseudonymisé, sauf résolution positive « proche » comme au point 3.
 
 ### 3. Autres fuites identifiées (à cadrer, priorité à discuter)
 
