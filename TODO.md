@@ -94,6 +94,9 @@ avant d'accéder à l'historique d'alertes, aux contacts, à la position passée
 5. Neutraliser `android:allowBackup` (ou fournir un vrai
    `data_extraction_rules.xml`/`backup_rules.xml` excluant ces données) pour
    empêcher leur fuite via la sauvegarde cloud Android par défaut.
+6. Retirer de `app.html` les boutons Google/Facebook/Apple actuellement
+   affichés sur l'écran de connexion (`.social-row`, morts/non câblés) —
+   leur simple présence visuelle contredit l'exclusion actée au point 1.
 
 ### 2. Anonymisation de l'affichage lors d'un appel d'urgence
 
