@@ -2,6 +2,7 @@ package com.example.marsel
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -158,6 +159,9 @@ class MarselProtocolTest {
     // ── TXT record : encodage/décodage E, P, R, F, T (I4) ───────────────
     @Test
     fun txtRoundTrip_emergencyWithContacts() {
+        // TODO.md §2.2 : un E « public » (pas relaySms) ne porte JAMAIS le
+        // vrai pseudo dans le TXT — "Alice" est remplacé par l'alias dérivé
+        // de l'emergencyId, quel que soit le pseudo fourni en entrée.
         val json = """{"type":"MARSEL_EMERGENCY","messageId":"emg-1","emergencyId":"emg-1","pseudo":"Alice","lat":48.8566,"lng":2.3522,"timestamp":1700000000000,"hopCount":0,"contacts":[{"mobile":"+33611"},{"mobile":"+33622"}]}"""
         val rec = MarselProtocol.buildTxtRecord("E", json, 0)!!
         assertEquals("E", rec["y"])
@@ -166,7 +170,7 @@ class MarselProtocolTest {
 
         val back = MarselProtocol.txtRecordToJson(rec, 0)!!
         assertEquals("MARSEL_EMERGENCY", MarselProtocol.extractJsonString(back, "type"))
-        assertEquals("Alice", MarselProtocol.extractJsonString(back, "pseudo"))
+        assertEquals(MarselProtocol.deriveAlertAlias("emg-1"), MarselProtocol.extractJsonString(back, "pseudo"))
         assertEquals(listOf("+33611", "+33622"), MarselProtocol.extractContactMobiles(back))
     }
 
@@ -258,9 +262,52 @@ class MarselProtocolTest {
 
     @Test
     fun buildTxtRecord_sanitizesPseudoQuotes() {
-        // Un pseudo avec guillemets est nettoyé pour ne pas corrompre le TXT record
-        val json = """{"type":"MARSEL_EMERGENCY","messageId":"m","emergencyId":"e","pseudo":"a\"b","lat":1.0,"lng":2.0,"timestamp":10,"hopCount":0,"contacts":[]}"""
+        // Un pseudo avec guillemets est nettoyé pour ne pas corrompre le TXT
+        // record — testé sur un paquet relaySms="1" : c'est le seul cas où le
+        // vrai pseudo transite encore dans le TXT (TODO.md §2.2/§2.3), un E
+        // "public" étant de toute façon remplacé par l'alias (cf. test
+        // txtRoundTrip_emergencyWithContacts), sans besoin de sanitisation.
+        val json = """{"type":"MARSEL_EMERGENCY","messageId":"m","emergencyId":"e","pseudo":"a\"b","lat":1.0,"lng":2.0,"timestamp":10,"hopCount":0,"relaySms":"1","contacts":[{"mobile":"+33600"}]}"""
         val rec = MarselProtocol.buildTxtRecord("E", json, 0)!!
         assertFalse("pas de guillemet dans le pseudo TXT", rec["p"]!!.contains("\""))
+    }
+
+    // ── Anonymisation (TODO.md §2) ───────────────────────────────────────
+    @Test
+    fun deriveAlertAlias_isDeterministicAndDoesNotLeakEmergencyId() {
+        val alias1 = MarselProtocol.deriveAlertAlias("emg-secret-id-123")
+        val alias2 = MarselProtocol.deriveAlertAlias("emg-secret-id-123")
+        assertEquals("même emergencyId -> même alias", alias1, alias2)
+        assertTrue(alias1.startsWith("Alerte Marsel #"))
+        assertFalse("l'id source ne doit pas apparaître dans l'alias", alias1.contains("secret"))
+
+        val aliasOther = MarselProtocol.deriveAlertAlias("emg-other-id-456")
+        assertNotEquals("des emergencyId différents donnent des alias différents", alias1, aliasOther)
+    }
+
+    @Test
+    fun anonymizePseudoForTransit_publicPacketGetsAlias_delegationPacketKeepsRealPseudo() {
+        // Paquet public (pas relaySms) : le vrai pseudo est remplacé.
+        val publicJson = """{"type":"MARSEL_EMERGENCY","messageId":"m","emergencyId":"emg-1","pseudo":"Alice","lat":1.0,"lng":2.0,"timestamp":10,"hopCount":0,"contacts":[]}"""
+        val anonymized = MarselProtocol.anonymizePseudoForTransit(publicJson)
+        assertEquals(MarselProtocol.deriveAlertAlias("emg-1"), MarselProtocol.extractJsonString(anonymized, "pseudo"))
+
+        // Paquet de délégation SMS (relaySms="1") : le vrai pseudo doit
+        // survivre, le relais en a besoin pour le SMS aux propres contacts.
+        val relayJson = """{"type":"MARSEL_EMERGENCY","messageId":"m","emergencyId":"emg-1","pseudo":"Alice","lat":1.0,"lng":2.0,"timestamp":10,"hopCount":0,"relaySms":"1","contacts":[]}"""
+        assertEquals("Alice", MarselProtocol.extractJsonString(MarselProtocol.anonymizePseudoForTransit(relayJson), "pseudo"))
+
+        // Paquet F (RESOLVED_SMS_REQUEST) : même raison, jamais anonymisé.
+        val fJson = """{"type":"MARSEL_RESOLVED_SMS_REQUEST","messageId":"m","emergencyId":"emg-1","pseudo":"Alice","lat":1.0,"lng":2.0,"timestamp":10,"hopCount":0,"contacts":[{"mobile":"+33600"}]}"""
+        assertEquals("Alice", MarselProtocol.extractJsonString(MarselProtocol.anonymizePseudoForTransit(fJson), "pseudo"))
+    }
+
+    @Test
+    fun anonymizePseudoForDisplay_alwaysUsesAlias_evenForRelaySmsPackets() {
+        // La couche affichage JS n'a JAMAIS besoin du vrai pseudo — l'envoi du
+        // SMS relaySms="1" est entièrement natif (forwardEmergencyToContacts).
+        val relayJson = """{"type":"MARSEL_EMERGENCY","messageId":"m","emergencyId":"emg-1","pseudo":"Alice","lat":1.0,"lng":2.0,"timestamp":10,"hopCount":0,"relaySms":"1","contacts":[]}"""
+        val displayJson = MarselProtocol.anonymizePseudoForDisplay(relayJson)
+        assertEquals(MarselProtocol.deriveAlertAlias("emg-1"), MarselProtocol.extractJsonString(displayJson, "pseudo"))
     }
 }

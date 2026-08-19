@@ -42,10 +42,12 @@ import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import androidx.activity.ComponentActivity
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.biometric.BiometricManager
+import androidx.biometric.BiometricPrompt
 import androidx.core.app.NotificationCompat
 import androidx.core.content.ContextCompat
+import androidx.fragment.app.FragmentActivity
 import java.io.BufferedReader
 import java.io.File
 import java.io.InputStreamReader
@@ -65,7 +67,9 @@ data class MarselPeer(
     @Volatile var lastSeenMs: Long
 )
 
-class MainActivity : ComponentActivity() {
+// FragmentActivity (superset de ComponentActivity) requis par BiometricPrompt
+// (TODO.md §1.2) — androidx.biometric n'a pas d'API pour ComponentActivity nu.
+class MainActivity : FragmentActivity() {
 
     // -------------------------------------------------------------------------
     // Core WebView
@@ -254,6 +258,9 @@ class MainActivity : ComponentActivity() {
     // Location fields
     // -------------------------------------------------------------------------
     private lateinit var locationManager: LocationManager
+    // Chantier confidentialité (TODO.md §1) : auth locale + chiffrement au
+    // repos, jamais de compte serveur ni de connexion tierce.
+    private lateinit var secureStorage: SecureStore
     private var lastLat: Double = 0.0
     private var lastLng: Double = 0.0
     private var hasLocation = false
@@ -374,6 +381,7 @@ class MainActivity : ComponentActivity() {
         // d'où le cycle « crash → vider le cache → ça remarche → re-crash ».
         locationManager = getSystemService(Context.LOCATION_SERVICE) as LocationManager
         webView = WebView(this)
+        secureStorage = SecureStore(this)
 
         // --- Notification channel (must be created before any notification) ---
         createNotificationChannel()
@@ -930,10 +938,14 @@ class MainActivity : ComponentActivity() {
                 return
             }
 
-            // Notify JS to display on map (use escapeJs for safe double-quoted string)
+            // Notify JS to display on map (use escapeJs for safe double-quoted string).
+            // ANONYMISATION (TODO.md §2) : la WebView n'a jamais besoin du vrai
+            // pseudo — même si le paquet natif le porte pour permettre l'envoi
+            // du SMS relaySms="1" (entièrement natif, cf. forwardEmergencyToContacts).
+            val displayJson = MarselProtocol.anonymizePseudoForDisplay(json)
             runOnUiThread {
                 webView.evaluateJavascript(
-                    "window.onRelayMessageReceived && window.onRelayMessageReceived(${escapeJs(json)})",
+                    "window.onRelayMessageReceived && window.onRelayMessageReceived(${escapeJs(displayJson)})",
                     null
                 )
             }
@@ -945,9 +957,18 @@ class MainActivity : ComponentActivity() {
 
             // Show system notification only for actual emergency (not position/resolved)
             if (msgType == MarselProtocol.TYPE_EMERGENCY) {
-                val pseudo = extractJsonString(json, "pseudo") ?: "Utilisateur"
-                logToJs("RELAY", "NOTIF: showing system notification for $pseudo")
-                showNotificationDirect("🚨 Alerte Marsel", "$pseudo a declenche une alerte d'urgence a proximite")
+                // ANONYMISATION (TODO.md §2) : la notification « alerte à
+                // proximité » est un affichage PUBLIC (tout utilisateur Marsel
+                // à portée, pas seulement les proches) — elle utilise TOUJOURS
+                // l'alias, même quand le paquet porte le vrai pseudo pour
+                // permettre à forwardEmergencyToContacts() de SMS-er les
+                // proches (relaySms="1"). Le vrai nom ne doit apparaître que
+                // dans le SMS envoyé aux contacts déclarés, jamais ici.
+                val emergencyId = extractJsonString(json, "emergencyId")
+                    ?: extractJsonString(json, "id") ?: messageId
+                val alias = MarselProtocol.deriveAlertAlias(emergencyId)
+                logToJs("RELAY", "NOTIF: showing system notification for $alias")
+                showNotificationDirect("🚨 Alerte Marsel", "$alias a été déclenchée à proximité")
             }
 
             val updatedJson = """"hopCount"\s*:\s*$hopCount""".toRegex()
@@ -2033,7 +2054,12 @@ class MainActivity : ComponentActivity() {
     // en proche (max 5 sauts) jusqu'à l'émetteur d'origine.
     private fun broadcastSmsAck(origMessageId: String, sourceJson: String) {
         try {
-            val pseudo = extractJsonString(sourceJson, "pseudo") ?: "Utilisateur"
+            // ANONYMISATION (TODO.md §2.2) : l'ACK est un accusé technique, pas
+            // un affichage — inutile qu'il porte le vrai pseudo (extrait avant
+            // depuis le F/T source, qui le préserve légitimement pour la
+            // composition du SMS). Alias dérivé directement, cohérent avec ce
+            // que buildTxtRecord calculerait de toute façon pour ce type.
+            val pseudo = MarselProtocol.deriveAlertAlias(origMessageId)
             val lat = extractJsonNumber(sourceJson, "lat") ?: return
             val lng = extractJsonNumber(sourceJson, "lng") ?: return
             val ackJson = """{"type":"${MarselProtocol.TYPE_SMS_ACK}","messageId":"${origMessageId}_ack","id":"$origMessageId","emergencyId":"$origMessageId","pseudo":"$pseudo","lat":$lat,"lng":$lng,"timestamp":${System.currentTimeMillis()},"hopCount":0,"maxHops":${MarselProtocol.MAX_HOPS},"contacts":[]}"""
@@ -2048,6 +2074,46 @@ class MainActivity : ComponentActivity() {
         } catch (e: Exception) {
             Log.e(TAG, "broadcastSmsAck: ${e.message}")
         }
+    }
+
+    // =========================================================================
+    // Biométrie (TODO.md §1.2) — complément du mot de passe local, JAMAIS un
+    // remplacement : le champ mot de passe reste toujours disponible côté JS.
+    // =========================================================================
+    private fun biometricAvailable(): Boolean {
+        val manager = BiometricManager.from(this)
+        val canAuth = manager.canAuthenticate(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+        return canAuth == BiometricManager.BIOMETRIC_SUCCESS
+    }
+
+    private fun showBiometricPromptInternal() {
+        if (!biometricAvailable()) {
+            webView.evaluateJavascript("window.onBiometricResult && window.onBiometricResult(false)", null)
+            return
+        }
+        val executor = ContextCompat.getMainExecutor(this)
+        val callback = object : BiometricPrompt.AuthenticationCallback() {
+            override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
+                webView.evaluateJavascript("window.onBiometricResult && window.onBiometricResult(true)", null)
+            }
+            override fun onAuthenticationError(errorCode: Int, errString: CharSequence) {
+                // Inclut l'annulation utilisateur : dans tous les cas on retombe
+                // sur le mot de passe (déjà affiché), jamais de blocage.
+                webView.evaluateJavascript("window.onBiometricResult && window.onBiometricResult(false)", null)
+            }
+            override fun onAuthenticationFailed() {
+                // Empreinte/visage non reconnu : le prompt système reste ouvert
+                // et retente lui-même — pas de callback JS ici.
+            }
+        }
+        val prompt = BiometricPrompt(this, executor, callback)
+        val info = BiometricPrompt.PromptInfo.Builder()
+            .setTitle("Déverrouiller Marsel")
+            .setSubtitle("Utilisez votre empreinte ou votre visage")
+            .setNegativeButtonText("Utiliser le mot de passe")
+            .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
+            .build()
+        prompt.authenticate(info)
     }
 
     // =========================================================================
@@ -2421,6 +2487,42 @@ class MainActivity : ComponentActivity() {
     inner class MarselBridge {
 
         // -----------------------------------------------------------------------
+        // Authentification locale + stockage chiffré (TODO.md §1)
+        // Aucun compte serveur, aucune connexion Google/Facebook/Apple : tout
+        // est vérifié et chiffré sur l'appareil via SecureStore (Keystore).
+        // -----------------------------------------------------------------------
+
+        @JavascriptInterface
+        fun hasLocalAuth(): Boolean = secureStorage.hasLocalAuth()
+
+        @JavascriptInterface
+        fun setLocalSecret(secret: String): Boolean = secureStorage.setLocalSecret(secret)
+
+        @JavascriptInterface
+        fun verifyLocalSecret(secret: String): Boolean = secureStorage.verifyLocalSecret(secret)
+
+        @JavascriptInterface
+        fun secureStore(key: String, value: String) {
+            secureStorage.secureStore(key, value)
+        }
+
+        @JavascriptInterface
+        fun secureRetrieve(key: String): String? = secureStorage.secureRetrieve(key)
+
+        @JavascriptInterface
+        fun secureRemove(key: String) {
+            secureStorage.secureRemove(key)
+        }
+
+        @JavascriptInterface
+        fun isBiometricAvailable(): Boolean = biometricAvailable()
+
+        @JavascriptInterface
+        fun showBiometricPrompt() {
+            runOnUiThread { showBiometricPromptInternal() }
+        }
+
+        // -----------------------------------------------------------------------
         // Flash
         // -----------------------------------------------------------------------
 
@@ -2600,9 +2702,18 @@ class MainActivity : ComponentActivity() {
         // -----------------------------------------------------------------------
 
         @JavascriptInterface
-        fun sendEmergencyViaRelay(emergencyJson: String) {
+        fun sendEmergencyViaRelay(rawEmergencyJson: String) {
             thread {
                 try {
+                    // ANONYMISATION (TODO.md §2.2) : à partir d'ici, le paquet
+                    // quitte le contexte local de l'émetteur pour être diffusé
+                    // sur le MRN (DNS-SD ET socket) — le vrai pseudo est
+                    // remplacé par un alias dérivé de l'emergencyId AVANT tout
+                    // envoi. L'état JS local (marsel_user, marsel_emergency)
+                    // n'est pas touché : il garde le vrai pseudo pour l'écran
+                    // de l'émetteur et pour le SMS envoyé à SES PROPRES contacts.
+                    val emergencyJson = MarselProtocol.anonymizePseudoForTransit(rawEmergencyJson)
+
                     val t = extractJsonString(emergencyJson, "type") ?: "?"
                     logToJs("RELAY", "SEND $t via DNS-SD + socket transport")
 

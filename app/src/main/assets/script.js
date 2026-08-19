@@ -140,6 +140,44 @@ var EMERGENCY_TIMEOUT_MS = 20 * 60 * 1000;
 var RING_CIRCUMFERENCE = 2 * Math.PI * 78; // ≈ 490
 
 /* ---------------------------------------------------------
+   STOCKAGE CHIFFRÉ (chantier confidentialité, TODO.md §1.4)
+   --------------------------------------------------------- */
+/* marsel_user, marsel_contacts, marsel_profile et marsel_emergency
+   contiennent des données sensibles (pseudo, numéros de proches, position,
+   historique d'alertes) — elles ne doivent plus jamais toucher le
+   localStorage en clair. secureSet/secureGet/secureRemove passent par le
+   pont natif (AES-GCM, clé Android Keystore, jamais exportée) ; repli sur
+   localStorage en clair uniquement si le pont natif est indisponible
+   (aperçu navigateur hors app), pour ne pas casser le développement. */
+function secureSet(key, value) {
+    try {
+        if (window.AndroidBridge && typeof AndroidBridge.secureStore === 'function') {
+            AndroidBridge.secureStore(key, value);
+            return;
+        }
+    } catch (e) {}
+    try { localStorage.setItem(key, value); } catch (e) {}
+}
+function secureGet(key) {
+    try {
+        if (window.AndroidBridge && typeof AndroidBridge.secureRetrieve === 'function') {
+            var v = AndroidBridge.secureRetrieve(key);
+            return (v === null || v === undefined || v === '') ? null : v;
+        }
+    } catch (e) {}
+    try { return localStorage.getItem(key); } catch (e) { return null; }
+}
+function secureRemove(key) {
+    try {
+        if (window.AndroidBridge && typeof AndroidBridge.secureRemove === 'function') {
+            AndroidBridge.secureRemove(key);
+            return;
+        }
+    } catch (e) {}
+    try { localStorage.removeItem(key); } catch (e) {}
+}
+
+/* ---------------------------------------------------------
    LOCAL DATABASE (IndexedDB)
    --------------------------------------------------------- */
 function initDB() {
@@ -495,12 +533,12 @@ window.onLocationUpdate = function (lat, lng, accuracy) {
     // à chaque fix GPS (~1 Hz), saturant complètement le stack WiFi P2P.
     if (MARSEL.emergencyActive && MARSEL.emergencyId) {
         var saved = null;
-        try { saved = JSON.parse(localStorage.getItem('marsel_emergency') || 'null'); } catch (e) {}
+        try { saved = JSON.parse(secureGet('marsel_emergency') || 'null'); } catch (e) {}
         if (saved) {
             var hadNoPosition = !isFinite(saved.lat) || !isFinite(saved.lng);
             saved.lat = fLat;
             saved.lng = fLng;
-            localStorage.setItem('marsel_emergency', JSON.stringify(saved));
+            secureSet('marsel_emergency', JSON.stringify(saved));
             // L'alerte avait été déclenchée AVANT d'avoir un fix : maintenant qu'on
             // a la vraie position, on crée le marqueur d'incident et on la diffuse
             // immédiatement (une seule fois) au réseau + backend.
@@ -718,7 +756,7 @@ function loadFriendsOnMap() {
     // Load contacts who have location sharing enabled.
     // Without a real server, we show contacts at a slight offset from user's position
     // so the map reflects "nearby" contacts. When API_URL is configured, fetch real coords.
-    var contacts = JSON.parse(localStorage.getItem('marsel_contacts') || '[]');
+    var contacts = JSON.parse(secureGet('marsel_contacts') || '[]');
     var settings = JSON.parse(localStorage.getItem('marsel_settings') || '{}');
     if (!settings.location) return;
 
@@ -730,7 +768,7 @@ function loadFriendsOnMap() {
 
         // If API is configured, try to fetch real position
         if (window.MARSEL_CONFIG && MARSEL_CONFIG.API_URL && MARSEL_CONFIG.API_KEY) {
-            var userData = JSON.parse(localStorage.getItem('marsel_user') || '{}');
+            var userData = JSON.parse(secureGet('marsel_user') || '{}');
             fetch(MARSEL_CONFIG.API_URL + '/friends/location?contactEmail=' + encodeURIComponent(contact.email || ''), {
                 headers: { 'Authorization': 'Bearer ' + (userData.token || MARSEL_CONFIG.API_KEY) }
             }).then(function (r) {
@@ -932,10 +970,10 @@ function activateEmergency() {
     }
 
     // Build emergency payload
-    var contacts = JSON.parse(localStorage.getItem('marsel_contacts') || '[]')
+    var contacts = JSON.parse(secureGet('marsel_contacts') || '[]')
         .filter(function (c) { return c.nom || c.mobile; });
-    var userData = JSON.parse(localStorage.getItem('marsel_user') || '{}');
-    var profileData = JSON.parse(localStorage.getItem('marsel_profile') || '{}');
+    var userData = JSON.parse(secureGet('marsel_user') || '{}');
+    var profileData = JSON.parse(secureGet('marsel_profile') || '{}');
 
     // Position RÉELLE uniquement : fix courant, sinon dernier fix réel Android.
     // Jamais de coordonnées par défaut. Si aucune position réelle n'est encore
@@ -968,7 +1006,7 @@ function activateEmergency() {
 
     // Persist locally
     dbPut('emergency_events', emergencyData).catch(function () {});
-    localStorage.setItem('marsel_emergency', JSON.stringify(emergencyData));
+    secureSet('marsel_emergency', JSON.stringify(emergencyData));
 
     // Show own incident on map (uniquement si vraie position)
     if (pos) addIncidentMarker(emergencyData);
@@ -1005,7 +1043,7 @@ function deactivateEmergency() {
 
     // Envoyer notification de fin d'alerte aux proches et appareils voisins
     var savedEmergency = null;
-    try { savedEmergency = JSON.parse(localStorage.getItem('marsel_emergency') || 'null'); } catch (e) {}
+    try { savedEmergency = JSON.parse(secureGet('marsel_emergency') || 'null'); } catch (e) {}
 
     if (savedEmergency) {
         var pseudo = savedEmergency.pseudo || 'Utilisateur';
@@ -1076,7 +1114,7 @@ function deactivateEmergency() {
         dbDelete('relay_queue', resolvedId).catch(function () {});
     }
 
-    localStorage.removeItem('marsel_emergency');
+    secureRemove('marsel_emergency');
     MARSEL.emergencyId = null;
 
     // Reset ring
@@ -1242,12 +1280,12 @@ window.onSmsSendResult = function (trackId, ok, code) {
     }
     // Échec du SMS d'alerte initial (trackId = messageId de l'urgence active)
     var saved = null;
-    try { saved = JSON.parse(localStorage.getItem('marsel_emergency') || 'null'); } catch (e) {}
+    try { saved = JSON.parse(secureGet('marsel_emergency') || 'null'); } catch (e) {}
     if (saved && (saved.messageId === trackId || saved.id === trackId)) {
         saved.relaySms = '1';
         saved.smsSent = false;
         if (!saved.type) saved.type = 'MARSEL_EMERGENCY';
-        localStorage.setItem('marsel_emergency', JSON.stringify(saved));
+        secureSet('marsel_emergency', JSON.stringify(saved));
         mLog('J', 'SMS', 'échec SMS d\'alerte — relaySms=1, re-diffusion MRN');
         showToast('🔁 SMS non parti — délégué au réseau Marsel');
         if (window.AndroidBridge && typeof AndroidBridge.sendEmergencyViaRelay === 'function') {
@@ -1271,8 +1309,8 @@ function routeEmergency(emergencyData) {
     // AUDIT-FIX 3 : persister relaySms pour qu'un redémarrage de l'app préserve
     // le flag lors de la re-diffusion de l'alerte.
     try {
-        var savedRoute = JSON.parse(localStorage.getItem('marsel_emergency') || 'null');
-        if (savedRoute) { savedRoute.relaySms = emergencyData.relaySms; localStorage.setItem('marsel_emergency', JSON.stringify(savedRoute)); }
+        var savedRoute = JSON.parse(secureGet('marsel_emergency') || 'null');
+        if (savedRoute) { savedRoute.relaySms = emergencyData.relaySms; secureSet('marsel_emergency', JSON.stringify(savedRoute)); }
     } catch (e) {}
 
     // ── ÉTAPE B (TOUJOURS) : diffusion MRN ──
@@ -1291,8 +1329,8 @@ function routeEmergency(emergencyData) {
         mLog('J', 'NET', 'Pas de SIM/réseau cellulaire — SMS délégués au relais MRN (relaySms=1)');
         showToast('🔁 Pas de SIM : SMS aux proches délégués au réseau Marsel');
         try {
-            var savedNoSim = JSON.parse(localStorage.getItem('marsel_emergency') || 'null');
-            if (savedNoSim) { savedNoSim.smsSent = false; localStorage.setItem('marsel_emergency', JSON.stringify(savedNoSim)); }
+            var savedNoSim = JSON.parse(secureGet('marsel_emergency') || 'null');
+            if (savedNoSim) { savedNoSim.smsSent = false; secureSet('marsel_emergency', JSON.stringify(savedNoSim)); }
         } catch (e) {}
         // ACK attendu du relais qui enverra réellement ; sans ACK sous 2 min →
         // notification « Impossible d'envoyer les SMS »
@@ -1316,8 +1354,8 @@ function routeEmergency(emergencyData) {
         showToast('🔁 Hors réseau : alerte transmise via le réseau Marsel');
         // Persister le flag pour éviter un double-envoi au flush (F2)
         try {
-            var saved = JSON.parse(localStorage.getItem('marsel_emergency') || 'null');
-            if (saved) { saved.smsSent = false; localStorage.setItem('marsel_emergency', JSON.stringify(saved)); }
+            var saved = JSON.parse(secureGet('marsel_emergency') || 'null');
+            if (saved) { saved.smsSent = false; secureSet('marsel_emergency', JSON.stringify(saved)); }
         } catch (e) {}
         // ACK attendu du relais qui enverra réellement ; sans ACK sous 2 min →
         // notification « Impossible d'envoyer les SMS »
@@ -1495,7 +1533,7 @@ function sendEmergencyViaRelayNetwork(emergencyData) {
 
 function sendToAPI(emergencyData) {
     if (!window.MARSEL_CONFIG || !MARSEL_CONFIG.API_URL) return;
-    var userData = JSON.parse(localStorage.getItem('marsel_user') || '{}');
+    var userData = JSON.parse(secureGet('marsel_user') || '{}');
     var token = userData.token || MARSEL_CONFIG.API_KEY;
 
     fetch(MARSEL_CONFIG.API_URL + '/emergency', {
@@ -1760,7 +1798,7 @@ function triggerEmergencyTimeout() {
     if (!MARSEL.emergencyActive) return;
 
     var savedEmergency = null;
-    try { savedEmergency = JSON.parse(localStorage.getItem('marsel_emergency') || 'null'); } catch (e) {}
+    try { savedEmergency = JSON.parse(secureGet('marsel_emergency') || 'null'); } catch (e) {}
     if (!savedEmergency) return;
 
     var pseudo = savedEmergency.pseudo || 'Utilisateur';
@@ -1787,7 +1825,7 @@ function sendPositionUpdate(lat, lng) {
     if (isNaN(fLat) || isNaN(fLng)) return; // skip if GPS not yet fixed
 
     var savedEmergency = null;
-    try { savedEmergency = JSON.parse(localStorage.getItem('marsel_emergency') || 'null'); } catch (e) {}
+    try { savedEmergency = JSON.parse(secureGet('marsel_emergency') || 'null'); } catch (e) {}
     if (!savedEmergency || !MARSEL.emergencyId) return;
 
     var updatePacket = {
@@ -1983,7 +2021,7 @@ function sendChatMessage() {
     // Cloud API if configured and online
     if (window.MARSEL_CONFIG && MARSEL_CONFIG.API_URL &&
         (MARSEL.networkType === 'WIFI' || MARSEL.networkType === 'MOBILE')) {
-        var userData = JSON.parse(localStorage.getItem('marsel_user') || '{}');
+        var userData = JSON.parse(secureGet('marsel_user') || '{}');
         fetch(MARSEL_CONFIG.API_URL + '/messages', {
             method: 'POST',
             headers: {
@@ -2000,25 +2038,46 @@ function sendChatMessage() {
 }
 
 /* ---------------------------------------------------------
-   AUTH
+   AUTH — authentification locale réelle (TODO.md §1)
+   Aucun compte serveur, aucune connexion Google/Facebook/Apple : le
+   mot de passe/code est haché et vérifié EXCLUSIVEMENT sur l'appareil
+   (AndroidBridge.setLocalSecret/verifyLocalSecret, PBKDF2 côté natif,
+   jamais transmis nulle part). Les onglets signin/signup ne sont plus un
+   choix libre de l'utilisateur : l'écran affiche automatiquement la
+   création d'accès (aucun secret local existant) ou le déverrouillage
+   (secret déjà défini), déterminé par initAuthScreen().
    --------------------------------------------------------- */
 function switchAuthTab(tab) {
-    var signinTab = document.getElementById('tab-signin');
-    var signupTab = document.getElementById('tab-signup');
     var formSignin = document.getElementById('form-signin');
     var formSignup = document.getElementById('form-signup');
-
     if (tab === 'signin') {
-        if (signinTab) signinTab.classList.add('active');
-        if (signupTab) signupTab.classList.remove('active');
         if (formSignin) formSignin.classList.add('active');
         if (formSignup) formSignup.classList.remove('active');
     } else {
-        if (signupTab) signupTab.classList.add('active');
-        if (signinTab) signinTab.classList.remove('active');
         if (formSignup) formSignup.classList.add('active');
         if (formSignin) formSignin.classList.remove('active');
     }
+}
+
+/* Appelé à chaque affichage de screen-auth (verrouillage systématique —
+   TODO.md §1.3) : bascule entre « créer un accès local » (premier
+   lancement / aucun secret défini) et « déverrouiller » (secret déjà
+   défini, à re-saisir à CHAQUE ouverture de l'app, pas juste une fois). */
+function initAuthScreen() {
+    var hasAuth = false;
+    try { hasAuth = !!(window.AndroidBridge && AndroidBridge.hasLocalAuth && AndroidBridge.hasLocalAuth()); } catch (e) {}
+
+    switchAuthTab(hasAuth ? 'signin' : 'signup');
+
+    var bioBtn = document.getElementById('biometric-unlock-btn');
+    if (bioBtn) {
+        var bioAvail = false;
+        try { bioAvail = hasAuth && !!(window.AndroidBridge && AndroidBridge.isBiometricAvailable && AndroidBridge.isBiometricAvailable()); } catch (e) {}
+        bioBtn.style.display = bioAvail ? 'flex' : 'none';
+    }
+
+    var pinField = document.getElementById('signin-password');
+    if (pinField) pinField.value = '';
 }
 
 function togglePassword(inputId, eyeEl) {
@@ -2037,60 +2096,68 @@ function generateUserId() {
     return 'MRS-' + Date.now().toString(36).toUpperCase() + '-' + Math.random().toString(36).substr(2, 5).toUpperCase();
 }
 
-function doLogin() {
-    var email = ((document.getElementById('signin-email') || {}).value || '').trim();
-    var password = ((document.getElementById('signin-password') || {}).value || '').trim();
-
-    if (!email || !password) {
-        showToast('Veuillez remplir tous les champs');
-        return;
-    }
-
-    // Preserve existing userId across logins so relay identity stays stable
-    var existingUser = null;
-    try { existingUser = JSON.parse(localStorage.getItem('marsel_user') || 'null'); } catch (e) {}
-    var userId = (existingUser && existingUser.userId) ? existingUser.userId : generateUserId();
-
-    var userData = {
-        email: email,
-        pseudo: email.split('@')[0] || 'User',
-        loggedIn: true,
-        userId: userId
-    };
-    localStorage.setItem('marsel_user', JSON.stringify(userData));
-
+/* Entrée commune une fois le verrou (mot de passe OU biométrie) validé. */
+function unlockIntoApp() {
+    var userData = null;
+    try { userData = JSON.parse(secureGet('marsel_user') || 'null'); } catch (e) {}
     MARSEL.currentUser = userData;
-
-    // Try API login if configured (non-blocking)
-    if (window.MARSEL_CONFIG && MARSEL_CONFIG.API_URL) {
-        fetch(MARSEL_CONFIG.API_URL + '/auth/login', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ email: email, password: password })
-        }).then(function (r) {
-            if (r.ok) return r.json();
-        }).then(function (data) {
-            if (data && data.token) {
-                userData.token = data.token;
-                if (data.userId) userData.userId = data.userId;
-                localStorage.setItem('marsel_user', JSON.stringify(userData));
-                MARSEL.currentUser = userData;
-            }
-        }).catch(function () {});
-    }
-
     MARSEL.screenHistory = [];
     showScreen('screen-home');
     startRealGPS();
 }
 
+/* Déverrouillage (secret local déjà créé) — PLUS de compte email/mot de
+   passe distant : le mot de passe ne sert qu'à débloquer les données déjà
+   présentes sur l'appareil. */
+function doLogin() {
+    var password = ((document.getElementById('signin-password') || {}).value || '').trim();
+    if (!password) {
+        showToast('Veuillez saisir votre mot de passe');
+        return;
+    }
+    var ok = false;
+    try { ok = !!(window.AndroidBridge && AndroidBridge.verifyLocalSecret && AndroidBridge.verifyLocalSecret(password)); } catch (e) {}
+    if (!ok) {
+        showToast('Mot de passe incorrect');
+        return;
+    }
+    unlockIntoApp();
+}
+
+/* Biométrie : complément du mot de passe, jamais un remplacement — le
+   champ mot de passe reste toujours disponible en repli (TODO.md §1.2). */
+function requestBiometricUnlock() {
+    try {
+        if (window.AndroidBridge && AndroidBridge.showBiometricPrompt) AndroidBridge.showBiometricPrompt();
+    } catch (e) {}
+}
+window.onBiometricResult = function (success) {
+    if (success) {
+        unlockIntoApp();
+    } else {
+        showToast('Authentification biométrique indisponible — utilisez votre mot de passe');
+    }
+};
+
+/* Création de l'accès local (premier lancement, ou après un factory
+   reset) : choix d'un pseudo + d'un mot de passe/code haché sur
+   l'appareil. Aucune donnée n'est envoyée à un serveur. */
 function doRegister() {
-    var email = ((document.getElementById('signup-email') || {}).value || '').trim();
+    var pseudo = ((document.getElementById('signup-pseudo') || {}).value || '').trim();
     var password = ((document.getElementById('signup-password') || {}).value || '').trim();
+    var password2 = ((document.getElementById('signup-password2') || {}).value || '').trim();
     var agreed = (document.getElementById('agree-tnc') || {}).checked;
 
-    if (!email || !password) {
+    if (!pseudo || !password) {
         showToast('Veuillez remplir tous les champs');
+        return;
+    }
+    if (password.length < 4) {
+        showToast('Le mot de passe doit contenir au moins 4 caractères');
+        return;
+    }
+    if (password !== password2) {
+        showToast('Les mots de passe ne correspondent pas');
         return;
     }
     if (!agreed) {
@@ -2098,45 +2165,33 @@ function doRegister() {
         return;
     }
 
-    var userId = generateUserId();
-    var userData = {
-        email: email,
-        pseudo: email.split('@')[0] || 'User',
-        loggedIn: true,
-        userId: userId
-    };
-    localStorage.setItem('marsel_user', JSON.stringify(userData));
-    MARSEL.currentUser = userData;
-
-    // Try API registration if configured (non-blocking)
-    if (window.MARSEL_CONFIG && MARSEL_CONFIG.API_URL) {
-        fetch(MARSEL_CONFIG.API_URL + '/auth/register', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ email: email, password: password, userId: userId })
-        }).then(function (r) {
-            if (r.ok) return r.json();
-        }).then(function (data) {
-            if (data && data.token) {
-                userData.token = data.token;
-                localStorage.setItem('marsel_user', JSON.stringify(userData));
-                MARSEL.currentUser = userData;
-            }
-        }).catch(function () {});
+    var created = false;
+    try { created = !!(window.AndroidBridge && AndroidBridge.setLocalSecret && AndroidBridge.setLocalSecret(password)); } catch (e) {}
+    if (!created) {
+        showToast('Impossible de créer l\'accès local sur cet appareil');
+        return;
     }
 
-    MARSEL.screenHistory = [];
-    showScreen('screen-home');
-    startRealGPS();
+    // Préserve un userId existant (ex. après un changement de mot de
+    // passe) pour que l'identité de relais MRN reste stable.
+    var existingUser = null;
+    try { existingUser = JSON.parse(secureGet('marsel_user') || 'null'); } catch (e) {}
+    var userId = (existingUser && existingUser.userId) ? existingUser.userId : generateUserId();
+
+    var userData = { pseudo: pseudo, loggedIn: true, userId: userId };
+    secureSet('marsel_user', JSON.stringify(userData));
+
+    unlockIntoApp();
 }
 
 function doLogout() {
     MARSEL.emergencyActive = false;
     MARSEL.emergencyId = null;
     MARSEL.currentUser = null;
-    localStorage.removeItem('marsel_emergency');
+    secureRemove('marsel_emergency');
     stopGPS();
     MARSEL.screenHistory = [];
+    initAuthScreen();
     showScreen('screen-auth');
 }
 
@@ -2144,8 +2199,8 @@ function doLogout() {
    PROFILE
    --------------------------------------------------------- */
 function updateProfileMenu() {
-    var userData = JSON.parse(localStorage.getItem('marsel_user') || '{}');
-    var profileData = JSON.parse(localStorage.getItem('marsel_profile') || '{}');
+    var userData = JSON.parse(secureGet('marsel_user') || '{}');
+    var profileData = JSON.parse(secureGet('marsel_profile') || '{}');
     var pseudo = profileData.pseudo || userData.pseudo || 'Utilisateur';
     var email = profileData.email || userData.email || '';
 
@@ -2156,8 +2211,8 @@ function updateProfileMenu() {
 }
 
 function loadProfileForm() {
-    var userData = JSON.parse(localStorage.getItem('marsel_user') || '{}');
-    var profileData = JSON.parse(localStorage.getItem('marsel_profile') || '{}');
+    var userData = JSON.parse(secureGet('marsel_user') || '{}');
+    var profileData = JSON.parse(secureGet('marsel_profile') || '{}');
 
     var idEl = document.getElementById('profile-id');
     if (idEl) idEl.value = userData.userId || '—';
@@ -2179,13 +2234,13 @@ function saveProfile() {
     var email = ((document.getElementById('profile-email') || {}).value || '').trim();
 
     var profileData = { pseudo: pseudo, mobile: mobile, email: email };
-    localStorage.setItem('marsel_profile', JSON.stringify(profileData));
+    secureSet('marsel_profile', JSON.stringify(profileData));
 
     // Sync user object
-    var userData = JSON.parse(localStorage.getItem('marsel_user') || '{}');
+    var userData = JSON.parse(secureGet('marsel_user') || '{}');
     if (pseudo) userData.pseudo = pseudo;
     if (email) userData.email = email;
-    localStorage.setItem('marsel_user', JSON.stringify(userData));
+    secureSet('marsel_user', JSON.stringify(userData));
     MARSEL.currentUser = userData;
 
     // Push to API if configured
@@ -2241,7 +2296,7 @@ function saveSetting(key, value) {
    CONTACTS
    --------------------------------------------------------- */
 function renderContacts() {
-    var contacts = JSON.parse(localStorage.getItem('marsel_contacts') || '[]');
+    var contacts = JSON.parse(secureGet('marsel_contacts') || '[]');
     while (contacts.length < 5) contacts.push({ nom: '', mobile: '', email: '', pseudo: '' });
 
     var list = document.getElementById('contacts-list');
@@ -2281,7 +2336,7 @@ function renderContacts() {
 }
 
 function openContactDetail(idx) {
-    var contacts = JSON.parse(localStorage.getItem('marsel_contacts') || '[]');
+    var contacts = JSON.parse(secureGet('marsel_contacts') || '[]');
     while (contacts.length < 5) contacts.push({ nom: '', mobile: '', email: '', pseudo: '' });
     var c = contacts[idx] || {};
 
@@ -2300,7 +2355,7 @@ function openContactDetail(idx) {
 
     el = document.getElementById('contact-pseudo');
     if (el) {
-        var userData = JSON.parse(localStorage.getItem('marsel_user') || '{}');
+        var userData = JSON.parse(secureGet('marsel_user') || '{}');
         el.value = c.pseudo || userData.pseudo || 'Marsel';
     }
 
@@ -2314,11 +2369,11 @@ function saveContact() {
     var email = ((document.getElementById('contact-email') || {}).value || '').trim();
     var pseudo = ((document.getElementById('contact-pseudo') || {}).value || '').trim();
 
-    var contacts = JSON.parse(localStorage.getItem('marsel_contacts') || '[]');
+    var contacts = JSON.parse(secureGet('marsel_contacts') || '[]');
     while (contacts.length < 5) contacts.push({ nom: '', mobile: '', email: '', pseudo: '' });
 
     contacts[idx] = { nom: nom, mobile: mobile, email: email, pseudo: pseudo };
-    localStorage.setItem('marsel_contacts', JSON.stringify(contacts));
+    secureSet('marsel_contacts', JSON.stringify(contacts));
 
     showToast('Contact enregistré !');
     goBack();
@@ -2730,7 +2785,7 @@ document.addEventListener('DOMContentLoaded', function () {
 
     // 3. Check if emergency was active when app was killed
     var savedEmergency = null;
-    try { savedEmergency = JSON.parse(localStorage.getItem('marsel_emergency') || 'null'); } catch (e) {}
+    try { savedEmergency = JSON.parse(secureGet('marsel_emergency') || 'null'); } catch (e) {}
     if (savedEmergency && savedEmergency.id) {
         MARSEL.emergencyActive = true;
         MARSEL.emergencyId = savedEmergency.id;
@@ -2748,20 +2803,15 @@ document.addEventListener('DOMContentLoaded', function () {
         armEmergencyTimeout(savedEmergency);
     }
 
-    // 4. After splash delay, check auth and route to correct screen
+    // 4. After splash delay, ALWAYS route through the lock screen (TODO.md
+    // §1.3) : même si un secret local existe déjà, il doit être re-saisi
+    // (ou déverrouillé par biométrie) à CHAQUE ouverture de l'app — utile
+    // notamment si le téléphone change de main. initAuthScreen() choisit
+    // automatiquement « créer un accès » vs « déverrouiller ».
     setTimeout(function () {
-        var userData = null;
-        try { userData = JSON.parse(localStorage.getItem('marsel_user') || 'null'); } catch (e) {}
-
-        if (userData && userData.loggedIn) {
-            MARSEL.currentUser = userData;
-            MARSEL.screenHistory = [];
-            showScreen('screen-home');
-            startRealGPS();
-        } else {
-            MARSEL.screenHistory = [];
-            showScreen('screen-auth');
-        }
+        MARSEL.screenHistory = [];
+        initAuthScreen();
+        showScreen('screen-auth');
     }, 2500);
 
     // 5. Online / offline events

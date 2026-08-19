@@ -44,6 +44,10 @@ dependencies {
     implementation(libs.androidx.core.ktx)
     implementation(libs.androidx.lifecycle.runtime.ktx)
     implementation(libs.androidx.activity.compose)
+    // Chantier confidentialité (TODO.md §1) : FragmentActivity requis par
+    // BiometricPrompt (complément du mot de passe local, pas un remplacement).
+    implementation(libs.androidx.fragment.ktx)
+    implementation(libs.androidx.biometric)
 
     implementation(platform(libs.androidx.compose.bom))
     implementation(libs.androidx.compose.ui)

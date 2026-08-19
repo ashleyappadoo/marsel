@@ -87,6 +87,80 @@ object MarselProtocol {
     fun sanitizeTxtValue(value: String, maxLen: Int = 24): String =
         value.replace("\\", "").replace("\"", "").take(maxLen)
 
+    // ── Anonymisation (TODO.md §2) ───────────────────────────────────────
+    // Le vrai nom/pseudo de l'émetteur n'est communiqué qu'à ses proches
+    // (SMS local, composé depuis l'état JS local — jamais depuis un paquet
+    // reçu). Tout ce qui transite sur le MRN (TXT DNS-SD ET socket) ne doit
+    // porter qu'un identifiant d'alerte pseudonymisé, dérivé de façon
+    // déterministe de l'emergencyId : chaque appareil du réseau calcule le
+    // même alias indépendamment, sans qu'aucun champ pseudo supplémentaire
+    // n'ait besoin de circuler.
+    //
+    // Limite connue (documentée dans TODO.md §2.3) : un proche qui reçoit
+    // l'alerte via le MRN (pas seulement par SMS) verra lui aussi l'alias,
+    // faute d'un mécanisme de reconnaissance « je suis un proche déclaré de
+    // cet émetteur » — ce mécanisme (appairage) reste à concevoir.
+    fun deriveAlertAlias(emergencyId: String): String {
+        val digest = java.security.MessageDigest.getInstance("SHA-256")
+            .digest(emergencyId.toByteArray(Charsets.UTF_8))
+        val hex = digest.joinToString("") { "%02X".format(it) }.take(6)
+        return "Alerte Marsel #$hex"
+    }
+
+    private val PSEUDO_FIELD_REGEX = Regex("\"pseudo\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"")
+
+    /**
+     * Remplace le champ "pseudo" d'un paquet JSON par l'alias pseudonymisé
+     * dérivé de son emergencyId — à appeler UNE SEULE FOIS, au moment où un
+     * paquet quitte le contexte local de l'émetteur pour être diffusé sur
+     * le MRN (DNS-SD et/ou socket). N'affecte jamais l'état JS local
+     * (marsel_user, marsel_emergency…) : ceux-ci gardent le vrai pseudo
+     * pour l'affichage local et la composition des SMS aux propres contacts.
+     *
+     * EXCEPTION VOULUE : les paquets F/T (RESOLVED_SMS_REQUEST /
+     * TIMEOUT_SMS_REQUEST), ET tout paquet E marqué relaySms="1", ne sont
+     * JAMAIS anonymisés. Dans ces deux cas, le paquet sert À PORTER le vrai
+     * pseudo + les numéros des proches jusqu'à un relais qui composera le
+     * SMS « <pseudo> a déclenché une alerte » à destination de CES MÊMES
+     * proches (TODO.md §2.3 : le nom réel reste dû aux destinataires
+     * déclarés par l'émetteur lui-même — forwardEmergencyToContacts() sur
+     * un E avec relaySms="1" ET handleSmsRequestPacket() sur un F/T en ont
+     * tous deux besoin). Un paquet E/P/R/S SANS relaySms est de la
+     * télémétrie publique affichée à des tiers/relais quelconques et doit
+     * donc rester anonymisé.
+     */
+    fun anonymizePseudoForTransit(json: String): String {
+        val type = extractJsonString(json, "type")
+        val relaySms = extractJsonString(json, "relaySms") == "1"
+        if (type == TYPE_RESOLVED_SMS_REQUEST || type == TYPE_TIMEOUT_SMS_REQUEST || relaySms) return json
+        val emergencyId = extractJsonString(json, "emergencyId")
+            ?: extractJsonString(json, "id")
+            ?: extractJsonString(json, "messageId")
+            ?: return json
+        val alias = deriveAlertAlias(emergencyId)
+        if (!PSEUDO_FIELD_REGEX.containsMatchIn(json)) return json
+        return PSEUDO_FIELD_REGEX.replaceFirst(json, "\"pseudo\":\"$alias\"")
+    }
+
+    /**
+     * Variante SANS exception pour l'affichage JS (carte, popups, toasts).
+     * Contrairement à anonymizePseudoForTransit(), aucun cas n'est exempté
+     * ici : la couche JS n'a jamais besoin du vrai pseudo (l'envoi du SMS
+     * relaySms="1" à la place de l'émetteur est entièrement natif, via
+     * forwardEmergencyToContacts()/handleSmsRequestPacket() — le JS ne
+     * fait qu'afficher). À utiliser pour tout paquet transmis à la WebView
+     * pour affichage (ex. window.onRelayMessageReceived).
+     */
+    fun anonymizePseudoForDisplay(json: String): String {
+        val emergencyId = extractJsonString(json, "emergencyId")
+            ?: extractJsonString(json, "id")
+            ?: extractJsonString(json, "messageId")
+            ?: return json
+        val alias = deriveAlertAlias(emergencyId)
+        if (!PSEUDO_FIELD_REGEX.containsMatchIn(json)) return json
+        return PSEUDO_FIELD_REGEX.replaceFirst(json, "\"pseudo\":\"$alias\"")
+    }
+
     // ── Encodage TXT record (paquet JSON → map compacte) ────────────────
     // Clés : y=type court, i=messageId, e=emergencyId, p=pseudo, a=lat,
     // o=lng, s=timestamp, h=hopCount, c=numéros mobiles (chaîne relay
@@ -95,7 +169,22 @@ object MarselProtocol {
         val msgId = extractJsonString(json, "messageId") ?: return null
         val emergencyId = extractJsonString(json, "emergencyId")
             ?: extractJsonString(json, "id") ?: msgId
-        val pseudo = sanitizeTxtValue(extractJsonString(json, "pseudo") ?: "")
+        // ANONYMISATION (TODO.md §2.2) : le TXT DNS-SD ne porte JAMAIS le
+        // vrai pseudo pour les paquets de télémétrie publique — la clé "p"
+        // est alors dérivée de l'emergencyId, jamais lue depuis le paquet.
+        // EXCEPTION VOULUE pour F/T (RESOLVED_SMS_REQUEST/TIMEOUT_SMS_REQUEST)
+        // et pour tout paquet marqué relaySms="1" : ces paquets doivent
+        // porter le vrai pseudo jusqu'au relais qui composera le SMS aux
+        // propres contacts de l'émetteur (même raison qu'anonymizePseudoForTransit,
+        // qui a déjà laissé le vrai pseudo dans le JSON source dans ces cas).
+        val isSmsDelegation = shortType == SHORT_RESOLVED_SMS_REQUEST ||
+            shortType == SHORT_TIMEOUT_SMS_REQUEST ||
+            extractJsonString(json, "relaySms") == "1"
+        val pseudo = if (isSmsDelegation) {
+            sanitizeTxtValue(extractJsonString(json, "pseudo") ?: "Utilisateur", maxLen = 32)
+        } else {
+            sanitizeTxtValue(deriveAlertAlias(emergencyId), maxLen = 32)
+        }
         val lat = extractJsonNumber(json, "lat") ?: return null
         val lng = extractJsonNumber(json, "lng") ?: return null
         val ts = extractJsonNumber(json, "timestamp")?.toLong() ?: nowMs

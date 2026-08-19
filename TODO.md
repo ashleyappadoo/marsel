@@ -68,41 +68,53 @@ dehors de toute base de données et doivent être traitées avant une mise en
 production. Périmètre ci-dessous **hors audio** (MMS audio traité séparément
 ci-dessous, `Music/` public, non concerné par ce chantier).
 
-### 1. Vraie authentification locale (sans Google/Facebook/OAuth tiers)
+### 1. Vraie authentification locale (sans Google/Facebook/OAuth tiers) — ✅ fait
 
-**Constat :** `doLogin()`/`doRegister()` (`script.js`) acceptent n'importe quel
-couple email/mot de passe car `API_URL` est vide — ce n'est pas de
-l'authentification, juste une identité locale (`userId` généré côté client)
-stockée en clair dans `localStorage['marsel_user']`. Aucun verrou n'existe
-avant d'accéder à l'historique d'alertes, aux contacts, à la position passée.
+**Constat (historique) :** `doLogin()`/`doRegister()` (`script.js`) acceptaient
+n'importe quel couple email/mot de passe car `API_URL` est vide — ce n'était
+pas de l'authentification, juste une identité locale (`userId` généré côté
+client) stockée en clair dans `localStorage['marsel_user']`. Aucun verrou
+n'existait avant d'accéder à l'historique d'alertes, aux contacts, à la
+position passée.
 
-**À faire :**
-1. Remplacer le pseudo-login par une **authentification locale réelle** :
-   mot de passe (ou code PIN) **haché** (Argon2id/PBKDF2, jamais stocké en
-   clair) et vérifié sur l'appareil — pas de compte serveur, pas de
-   connexion tierce (Google/Facebook/Apple explicitement exclus par
-   l'utilisateur).
-2. Option biométrique (`BiometricPrompt`, empreinte/visage) en complément du
-   PIN/mot de passe, pas en remplacement (fallback obligatoire).
-3. Verrouiller l'accès à l'app (ou au minimum à l'historique/contacts/carte)
-   tant que l'authentification locale n'est pas validée — important dans le
-   scénario où quelqu'un d'autre a un accès physique au téléphone.
-4. Chiffrer au repos les données sensibles actuellement en clair
-   (`marsel_user`, `marsel_contacts`, `marsel_profile`, `marsel_emergency`,
-   IndexedDB `emergency_events`) — clé dérivée du secret local, jamais
-   envoyée nulle part.
-5. Neutraliser `android:allowBackup` (ou fournir un vrai
-   `data_extraction_rules.xml`/`backup_rules.xml` excluant ces données) pour
-   empêcher leur fuite via la sauvegarde cloud Android par défaut.
-6. Retirer de `app.html` les boutons Google/Facebook/Apple actuellement
-   affichés sur l'écran de connexion (`.social-row`, morts/non câblés) —
-   leur simple présence visuelle contredit l'exclusion actée au point 1.
+**Fait :**
+1. ✅ Écran de connexion refondu (`app.html`/`script.js`) : plus d'email/mot
+   de passe distant, plus d'onglets manuels — création d'un accès local
+   (pseudo + mot de passe/code, ≥4 caractères) ou déverrouillage, choisi
+   automatiquement par `initAuthScreen()` selon qu'un secret existe déjà.
+   Vérification **exclusivement sur l'appareil** via `SecureStore` (nouveau
+   fichier `SecureStore.kt`) : hachage PBKDF2WithHmacSHA256 (120 000
+   itérations, sel aléatoire par appareil), comparaison à temps constant,
+   jamais de compte serveur ni de connexion tierce.
+2. ✅ Biométrie (`BiometricPrompt`, androidx.biometric) en complément du mot
+   de passe — bouton affiché seulement si `BiometricManager` confirme un
+   moyen fort enrôlé, le champ mot de passe reste toujours utilisable en
+   repli. `MainActivity` passe de `ComponentActivity` à `FragmentActivity`
+   (superset requis par l'API biométrique).
+3. ✅ Verrouillage systématique : l'app route **toujours** par l'écran
+   d'authentification à chaque lancement (plus de bypass direct vers
+   `screen-home` même si `marsel_user.loggedIn` était vrai) — important
+   dans le scénario où quelqu'un d'autre a un accès physique au téléphone.
+4. ⚠️ **Partiellement fait** — chiffrement au repos (AES/256-GCM, clé
+   Android Keystore non exportable) appliqué à `marsel_user`,
+   `marsel_contacts`, `marsel_profile`, `marsel_emergency` (migrés de
+   `localStorage` vers un pont natif `secureStore`/`secureGet`/`secureRemove`).
+   **Reste à faire :** l'historique IndexedDB `emergency_events` n'est PAS
+   chiffré — refactor plus invasif (valeurs indexées, pas un simple
+   couple clé/valeur), volontairement laissé de côté cette passe pour ne
+   pas le faire à l'aveugle.
+5. ✅ `android:allowBackup` passé à `false` (neutralisation complète, plus
+   simple et plus sûr qu'une liste d'exclusion).
+6. ✅ Boutons Google/Facebook/Apple retirés de `app.html` (et CSS mort
+   associé nettoyé : `.auth-tabs`, `.auth-or`, `.social-row`, `.social-btn`,
+   `.auth-row`, `.forgot-link`).
 
-### 2. Anonymisation de l'affichage lors d'un appel d'urgence
+### 2. Anonymisation de l'affichage lors d'un appel d'urgence — ✅ fait (avec une limite documentée)
 
-**Constat :** le pseudo réel de l'émetteur circule en clair dans les paquets
-MRN (TXT `"p"`) et est affiché tel quel côté réception (notification,
-marqueur carte, popup) — visible par tout relais et par le destinataire.
+**Constat (historique) :** le pseudo réel de l'émetteur circulait en clair
+dans les paquets MRN (TXT `"p"`) et était affiché tel quel côté réception
+(notification, marqueur carte, popup) — visible par tout relais et par le
+destinataire.
 
 **Règle validée avec l'utilisateur :** le **vrai nom de l'émetteur ne doit
 être communiqué qu'à ses proches** (la liste de contacts d'urgence qu'il a
@@ -110,30 +122,39 @@ lui-même renseignée). Tout le reste du réseau — relais, autres utilisateurs
 Marsel à proximité, simples spectateurs de l'alerte — ne doit voir qu'un
 identifiant anonymisé, jamais le nom réel.
 
-**À faire :**
-1. Générer un **identifiant d'alerte pseudonymisé** (ex. dérivé de
-   `emergencyId`, distinct du `userId` et du pseudo réel) à afficher côté
-   réception (notification, marqueur, popup carte) **à la place du nom/pseudo**
-   pour tout destinataire qui n'est pas dans la liste des proches.
-2. Le pseudo réel ne doit plus transiter tel quel dans les paquets MRN
-   diffusés aux relais/tiers (TXT `"p"`) ; seul l'ID pseudonymisé y circule.
-3. Le nom réel reste disponible **pour les proches uniquement**, quel que
-   soit le canal :
-   - dans le corps du SMS envoyé à SES PROPRES contacts (ceux-ci doivent
-     bien identifier qui les appelle à l'aide) — déjà correct aujourd'hui ;
-   - **et** si un proche est lui-même utilisateur Marsel et reçoit l'alerte
-     directement via le réseau maillé (pas seulement par SMS), il doit voir
-     le vrai nom sur son app alors qu'un relais/tiers ne voit que l'ID
-     anonymisé pour cette même alerte. Cela suppose un moyen de reconnaître
-     côté réception « je suis un proche déclaré de cet émetteur » (ex. via
-     l'appairage/clé partagée déjà envisagé pour le chat — cf. étude de
-     faisabilité abandonnée pour l'instant, mais le mécanisme d'identité
-     proche-à-proche reste pertinent ici) pour lever l'anonymisation
-     uniquement pour ce destinataire précis, sans jamais exposer le nom aux
-     autres relais qui font transiter le même paquet.
-4. Revoir en conséquence l'affichage carte (`addIncidentMarker`) et les
-   notifications de réception (`onRelayMessageReceived`) pour n'utiliser que
-   l'ID pseudonymisé, sauf résolution positive « proche » comme au point 3.
+**Fait :**
+1. ✅ `MarselProtocol.deriveAlertAlias(emergencyId)` (nouveau) dérive un
+   identifiant pseudonymisé déterministe (`"Alerte Marsel #XXXXXX"`, hex
+   SHA-256 tronqué) — chaque appareil du réseau le recalcule indépendamment
+   à partir de l'`emergencyId` déjà présent dans tout paquet, sans champ
+   supplémentaire à faire circuler.
+2. ✅ Le TXT DNS-SD (`buildTxtRecord`) ne porte plus le vrai pseudo pour les
+   paquets de télémétrie publique (E/P/R/S) — la clé `"p"` est dérivée de
+   l'`emergencyId`. Idem côté socket : `sendEmergencyViaRelay` (nouveau
+   choke point `MarselProtocol.anonymizePseudoForTransit`) anonymise avant
+   toute diffusion, DNS-SD et socket confondus.
+3. Le nom réel reste disponible **pour les proches uniquement** :
+   - ✅ dans le corps du SMS envoyé à SES PROPRES contacts — inchangé,
+     toujours correct ;
+   - ⚠️ **Exception voulue et documentée**, pas la reconnaissance « proche »
+     initialement envisagée : les paquets `F`/`T` (SMS_REQUEST) et tout
+     paquet marqué `relaySms="1"` conservent le vrai pseudo **jusqu'au
+     relais qui compose le SMS** (`forwardEmergencyToContacts`,
+     `handleSmsRequestPacket`) — c'est le mécanisme déjà existant qui
+     délègue l'envoi SMS à un inconnu à proximité, il a structurellement
+     besoin du vrai nom. Cette exception est bornée : la couche JS/carte ne
+     voit jamais ce vrai nom même dans ce cas (`anonymizePseudoForDisplay`,
+     appliqué avant tout `window.onRelayMessageReceived`), et la
+     notification système « alerte à proximité » utilise toujours l'alias.
+   - ❌ **Toujours pas résolu** : un proche qui est lui-même utilisateur
+     Marsel et reçoit l'alerte via le MRN (pas par SMS) verra l'alias comme
+     n'importe quel tiers — aucun mécanisme « je suis un proche déclaré »
+     n'a été conçu (dépend de l'appairage évoqué pour le chat, étude
+     abandonnée pour l'instant). Seul le canal SMS donne le vrai nom.
+4. ✅ Carte (`addIncidentMarker`) et notifications de réception
+   (`onRelayMessageReceived`, notification système) n'affichent plus que
+   l'alias — géré automatiquement puisque l'anonymisation a lieu à la
+   source, avant toute diffusion/affichage.
 
 ### 3. Autres fuites identifiées (à cadrer, priorité à discuter)
 
