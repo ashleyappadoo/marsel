@@ -162,7 +162,25 @@ function secureGet(key) {
     try {
         if (window.AndroidBridge && typeof AndroidBridge.secureRetrieve === 'function') {
             var v = AndroidBridge.secureRetrieve(key);
-            return (v === null || v === undefined || v === '') ? null : v;
+            if (v !== null && v !== undefined && v !== '') return v;
+            // MIGRATION (QA-FIX) : rien dans le stockage chiffré — normal pour
+            // une install déjà à jour, mais une install ANTÉRIEURE à ce
+            // chantier avait ces mêmes clés en clair dans localStorage. Sans
+            // ce repli, un simple upgrade de l'app faisait disparaître
+            // silencieusement contacts/profil/urgence en cours (hasLocalAuth()
+            // est de toute façon false pour ces installs, donc l'utilisateur
+            // recrée un accès local — mais ses données existantes doivent
+            // survivre). On lit l'ancienne valeur, on la migre immédiatement
+            // vers le stockage chiffré, puis on nettoie le clair pour ne pas
+            // garder deux copies.
+            var legacy = null;
+            try { legacy = localStorage.getItem(key); } catch (e) {}
+            if (legacy !== null && legacy !== undefined) {
+                try { AndroidBridge.secureStore(key, legacy); } catch (e) {}
+                try { localStorage.removeItem(key); } catch (e) {}
+                return legacy;
+            }
+            return null;
         }
     } catch (e) {}
     try { return localStorage.getItem(key); } catch (e) { return null; }

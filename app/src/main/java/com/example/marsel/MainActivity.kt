@@ -8,6 +8,7 @@ import android.app.PendingIntent
 import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.security.keystore.KeyPermanentlyInvalidatedException
 import android.content.IntentFilter
 import android.content.pm.PackageManager
 import android.hardware.camera2.CameraManager
@@ -55,6 +56,7 @@ import java.io.OutputStreamWriter
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.ConcurrentHashMap
+import javax.crypto.Cipher
 import kotlin.concurrent.thread
 
 /**
@@ -2057,9 +2059,17 @@ class MainActivity : FragmentActivity() {
             // ANONYMISATION (TODO.md §2.2) : l'ACK est un accusé technique, pas
             // un affichage — inutile qu'il porte le vrai pseudo (extrait avant
             // depuis le F/T source, qui le préserve légitimement pour la
-            // composition du SMS). Alias dérivé directement, cohérent avec ce
-            // que buildTxtRecord calculerait de toute façon pour ce type.
-            val pseudo = MarselProtocol.deriveAlertAlias(origMessageId)
+            // composition du SMS). Alias dérivé du VRAI emergencyId du paquet
+            // source (QA-FIX) — PAS de origMessageId, qui est en réalité le
+            // messageId du F/T (`<emergencyId>_<tag>_<timestamp>`, cf.
+            // sendCascadeViaMrn) : dériver l'alias depuis origMessageId aurait
+            // produit un alias DIFFÉRENT de celui affiché ailleurs pour la
+            // même alerte (notification, carte). "emergencyId"/"id" du paquet
+            // ACK restent volontairement égaux à origMessageId ci-dessous :
+            // c'est cet id-là que armSmsAckWait() (script.js) attend pour
+            // corréler l'accusé à sa demande, pas le vrai emergencyId.
+            val realEmergencyId = extractJsonString(sourceJson, "emergencyId") ?: origMessageId
+            val pseudo = MarselProtocol.deriveAlertAlias(realEmergencyId)
             val lat = extractJsonNumber(sourceJson, "lat") ?: return
             val lng = extractJsonNumber(sourceJson, "lng") ?: return
             val ackJson = """{"type":"${MarselProtocol.TYPE_SMS_ACK}","messageId":"${origMessageId}_ack","id":"$origMessageId","emergencyId":"$origMessageId","pseudo":"$pseudo","lat":$lat,"lng":$lng,"timestamp":${System.currentTimeMillis()},"hopCount":0,"maxHops":${MarselProtocol.MAX_HOPS},"contacts":[]}"""
@@ -2091,6 +2101,29 @@ class MainActivity : FragmentActivity() {
             webView.evaluateJavascript("window.onBiometricResult && window.onBiometricResult(false)", null)
             return
         }
+        // QA-FIX : lier le prompt à un CryptoObject (clé Keystore dédiée,
+        // setInvalidatedByBiometricEnrollment) — sans ça, BiometricPrompt ne
+        // vérifie qu'« un moyen biométrique fort existe sur ce téléphone »,
+        // et N'IMPORTE QUELLE empreinte/visage enrôlé (y compris ajouté après
+        // coup par un tiers ayant eu un accès bref au téléphone) déverrouille
+        // l'app — exactement le scénario que §1.3 visait à couvrir.
+        val cipher: Cipher
+        try {
+            cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.ENCRYPT_MODE, secureStorage.getOrCreateBiometricGateKey())
+        } catch (e: KeyPermanentlyInvalidatedException) {
+            // L'enrôlement biométrique a changé depuis la création de la clé
+            // (nouvelle empreinte ajoutée, etc.) : on refuse ce déverrouillage
+            // biométrique-ci (repli mot de passe) et on régénère la clé pour
+            // les prochaines tentatives.
+            secureStorage.resetBiometricGateKey()
+            webView.evaluateJavascript("window.onBiometricResult && window.onBiometricResult(false)", null)
+            return
+        } catch (e: Exception) {
+            Log.e(TAG, "showBiometricPromptInternal cipher init: ${e.message}")
+            webView.evaluateJavascript("window.onBiometricResult && window.onBiometricResult(false)", null)
+            return
+        }
         val executor = ContextCompat.getMainExecutor(this)
         val callback = object : BiometricPrompt.AuthenticationCallback() {
             override fun onAuthenticationSucceeded(result: BiometricPrompt.AuthenticationResult) {
@@ -2113,7 +2146,7 @@ class MainActivity : FragmentActivity() {
             .setNegativeButtonText("Utiliser le mot de passe")
             .setAllowedAuthenticators(BiometricManager.Authenticators.BIOMETRIC_STRONG)
             .build()
-        prompt.authenticate(info)
+        prompt.authenticate(info, BiometricPrompt.CryptoObject(cipher))
     }
 
     // =========================================================================

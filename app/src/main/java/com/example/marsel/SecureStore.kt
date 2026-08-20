@@ -39,6 +39,10 @@ class SecureStore(context: Context) {
     companion object {
         private const val TAG = "SecureStore"
         private const val KEY_ALIAS = "marsel_secure_data_key"
+        // QA-FIX : clé DISTINCTE, dédiée à la porte biométrique — ne sert
+        // jamais à chiffrer de données, uniquement à exiger une preuve
+        // biométrique cryptographique (voir getOrCreateBiometricGateKey).
+        private const val BIOMETRIC_KEY_ALIAS = "marsel_biometric_gate_key"
         private const val ANDROID_KEYSTORE = "AndroidKeyStore"
         private const val PBKDF2_ITERATIONS = 120_000
         private const val PBKDF2_KEY_LENGTH = 256
@@ -115,6 +119,51 @@ class SecureStore(context: Context) {
             .build()
         keyGenerator.init(spec)
         return keyGenerator.generateKey()
+    }
+
+    // QA-FIX (§1.2) : BiometricPrompt sans CryptoObject lié ne vérifie que
+    // « un moyen biométrique fort est enrôlé sur ce téléphone » — n'importe
+    // quelle empreinte/visage du système déverrouille alors l'app, pas
+    // seulement celle du propriétaire. En lisant cette clé à travers un
+    // Cipher exigé par le prompt, ET en la configurant pour s'auto-invalider
+    // dès qu'un NOUVEAU moyen biométrique est enrôlé
+    // (setInvalidatedByBiometricEnrollment), un empreinte ajoutée après coup
+    // (ex. par quelqu'un ayant eu un accès bref aux réglages du téléphone)
+    // rend cette clé définitivement inutilisable → la biométrie échoue et
+    // retombe sur le mot de passe, au lieu de déverrouiller silencieusement.
+    fun getOrCreateBiometricGateKey(): SecretKey {
+        val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+        (keyStore.getKey(BIOMETRIC_KEY_ALIAS, null) as? SecretKey)?.let { return it }
+
+        val keyGenerator = KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, ANDROID_KEYSTORE)
+        val builder = KeyGenParameterSpec.Builder(
+            BIOMETRIC_KEY_ALIAS,
+            KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT
+        )
+            .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
+            .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
+            .setKeySize(256)
+            .setUserAuthenticationRequired(true)
+            .setInvalidatedByBiometricEnrollment(true)
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+            builder.setUserAuthenticationParameters(0, KeyProperties.AUTH_BIOMETRIC_STRONG)
+        } else {
+            @Suppress("DEPRECATION")
+            builder.setUserAuthenticationValidityDurationSeconds(-1)
+        }
+        keyGenerator.init(builder.build())
+        return keyGenerator.generateKey()
+    }
+
+    /** Efface la clé-porte (ex. après KeyPermanentlyInvalidatedException) —
+     *  elle sera régénérée transparemment au prochain essai biométrique. */
+    fun resetBiometricGateKey() {
+        try {
+            val keyStore = KeyStore.getInstance(ANDROID_KEYSTORE).apply { load(null) }
+            keyStore.deleteEntry(BIOMETRIC_KEY_ALIAS)
+        } catch (e: Exception) {
+            Log.e(TAG, "resetBiometricGateKey failed: ${e.message}")
+        }
     }
 
     fun secureStore(key: String, value: String) {

@@ -110,6 +110,22 @@ object MarselProtocol {
     private val PSEUDO_FIELD_REGEX = Regex("\"pseudo\"\\s*:\\s*\"((?:[^\"\\\\]|\\\\.)*)\"")
 
     /**
+     * Politique UNIQUE (QA-FIX, évite la divergence) : vrai si ce paquet
+     * sert à déléguer l'envoi d'un SMS à un relais — F/T
+     * (RESOLVED_SMS_REQUEST/TIMEOUT_SMS_REQUEST), ou tout paquet marqué
+     * relaySms="1". Utilisée à la fois par anonymizePseudoForTransit()
+     * (canal socket) et buildTxtRecord() (canal TXT DNS-SD) pour qu'ils ne
+     * puissent jamais être en désaccord sur quels paquets gardent le vrai
+     * pseudo.
+     */
+    fun isSmsDelegationPacket(json: String): Boolean {
+        val type = extractJsonString(json, "type")
+        return type == TYPE_RESOLVED_SMS_REQUEST ||
+            type == TYPE_TIMEOUT_SMS_REQUEST ||
+            extractJsonString(json, "relaySms") == "1"
+    }
+
+    /**
      * Remplace le champ "pseudo" d'un paquet JSON par l'alias pseudonymisé
      * dérivé de son emergencyId — à appeler UNE SEULE FOIS, au moment où un
      * paquet quitte le contexte local de l'émetteur pour être diffusé sur
@@ -130,9 +146,7 @@ object MarselProtocol {
      * donc rester anonymisé.
      */
     fun anonymizePseudoForTransit(json: String): String {
-        val type = extractJsonString(json, "type")
-        val relaySms = extractJsonString(json, "relaySms") == "1"
-        if (type == TYPE_RESOLVED_SMS_REQUEST || type == TYPE_TIMEOUT_SMS_REQUEST || relaySms) return json
+        if (isSmsDelegationPacket(json)) return json
         val emergencyId = extractJsonString(json, "emergencyId")
             ?: extractJsonString(json, "id")
             ?: extractJsonString(json, "messageId")
@@ -172,15 +186,10 @@ object MarselProtocol {
         // ANONYMISATION (TODO.md §2.2) : le TXT DNS-SD ne porte JAMAIS le
         // vrai pseudo pour les paquets de télémétrie publique — la clé "p"
         // est alors dérivée de l'emergencyId, jamais lue depuis le paquet.
-        // EXCEPTION VOULUE pour F/T (RESOLVED_SMS_REQUEST/TIMEOUT_SMS_REQUEST)
-        // et pour tout paquet marqué relaySms="1" : ces paquets doivent
-        // porter le vrai pseudo jusqu'au relais qui composera le SMS aux
-        // propres contacts de l'émetteur (même raison qu'anonymizePseudoForTransit,
-        // qui a déjà laissé le vrai pseudo dans le JSON source dans ces cas).
-        val isSmsDelegation = shortType == SHORT_RESOLVED_SMS_REQUEST ||
-            shortType == SHORT_TIMEOUT_SMS_REQUEST ||
-            extractJsonString(json, "relaySms") == "1"
-        val pseudo = if (isSmsDelegation) {
+        // isSmsDelegationPacket() est la MÊME politique qu'anonymizePseudoForTransit
+        // (QA-FIX : centralisée pour que le canal TXT et le canal socket ne
+        // puissent jamais diverger sur quels paquets gardent le vrai pseudo).
+        val pseudo = if (isSmsDelegationPacket(json)) {
             sanitizeTxtValue(extractJsonString(json, "pseudo") ?: "Utilisateur", maxLen = 32)
         } else {
             sanitizeTxtValue(deriveAlertAlias(emergencyId), maxLen = 32)
