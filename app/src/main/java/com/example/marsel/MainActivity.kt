@@ -104,8 +104,12 @@ class MainActivity : FragmentActivity() {
     // depuis MARSEL_PEER_TTL_MS est expiré.
     private val marselPeers = ConcurrentHashMap<String, MarselPeer>()
 
-    private var isGroupOwner = false
-    private var groupOwnerAddress: String? = null
+    // QA-FIX : @Volatile — désormais aussi écrits depuis le thread background
+    // de sendRelayToPeer (handleRelayChannelDead) et lus depuis le thread
+    // principal (rediscoverRunnable, socketPollRunnable, CONNECTION_CHANGED) ;
+    // sans ça, la visibilité inter-thread d'un simple var n'est pas garantie.
+    @Volatile private var isGroupOwner = false
+    @Volatile private var groupOwnerAddress: String? = null
     private val pendingRelayMessages = mutableListOf<String>()
     private val processedMessageIds = mutableSetOf<String>()
     private var wifiP2pEnabled = false
@@ -187,6 +191,17 @@ class MainActivity : FragmentActivity() {
     // OK, le channel est gelé → on le recrée après 6 échecs consécutifs.
     private val consecutiveP2pErrors = java.util.concurrent.atomic.AtomicInteger(0)
 
+    // QA-FIX (terrain, propagation lente du RESOLVED) : quand la liaison P2P
+    // meurt SANS que Android délivre WIFI_P2P_CONNECTION_CHANGED_ACTION (vu en
+    // pratique, notamment Samsung), `groupOwnerAddress` reste non-null alors
+    // que le canal socket est mort — l'appareil reste bloqué sur la cadence
+    // DNS-SD lente (20s/60s, cf. rediscoverRunnable/restartServiceDiscovery)
+    // ALORS QUE le socket censé compenser ne fonctionne plus non plus : les
+    // deux canaux sont morts en même temps. 2 échecs consécutifs de
+    // sendRelayToPeer (envoi OU poll) sont traités comme la liaison morte —
+    // on revient immédiatement à la cadence rapide (kickDiscoveryNow).
+    private val consecutiveRelayFailures = java.util.concurrent.atomic.AtomicInteger(0)
+
     private val smsSentReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val trackId = intent.getStringExtra("trackId") ?: return
@@ -254,6 +269,28 @@ class MainActivity : FragmentActivity() {
     private fun kickDiscoveryNow() {
         p2pHandler.removeCallbacks(rediscoverRunnable)
         p2pHandler.post(rediscoverRunnable)
+    }
+
+    // QA-FIX : la liaison P2P est considérée morte (échecs socket répétés) —
+    // on ne peut plus lui faire confiance pour relayer quoi que ce soit tant
+    // qu'une nouvelle connexion n'est pas établie. On abandonne l'état
+    // « connecté » (ce qui fait retomber rediscoverRunnable/restartServiceDiscovery
+    // sur leur cadence rapide dès le prochain cycle) et on arrête le polling
+    // socket vers une adresse qui ne répond plus.
+    private fun handleRelayChannelDead(reason: String) {
+        logToJs("DNS-SD", "Canal P2P mort ($reason) — retour en scan rapide")
+        isGroupOwner = false
+        groupOwnerAddress = null
+        consecutiveRelayFailures.set(0)
+        p2pHandler.removeCallbacks(socketPollRunnable)
+        // Sans ça, restartServiceDiscovery() pouvait rester sur un simple
+        // discoverServices() (servi depuis le CACHE du framework) si la
+        // fenêtre de re-arm de 60s — calculée pendant qu'on croyait le groupe
+        // encore connecté — n'était pas encore écoulée : un service enregistré
+        // entre-temps par un pair (ex. marsel-res-* de fin d'alerte) restait
+        // invisible malgré le retour à la cadence rapide.
+        lastServiceRequestResetMs = 0
+        kickDiscoveryNow()
     }
 
     // -------------------------------------------------------------------------
@@ -791,13 +828,12 @@ class MainActivity : FragmentActivity() {
                             }
                         }
                     } else {
-                        isGroupOwner = false
-                        groupOwnerAddress = null
-                        p2pHandler.removeCallbacks(socketPollRunnable)
                         Log.d(TAG, "P2P disconnected")
-                        // Retour au mode déconnecté : reprendre immédiatement le
-                        // rythme DNS-SD normal (le cycle courant était espacé à 20s).
-                        kickDiscoveryNow()
+                        // QA-FIX : réutilise la même remise à zéro que la détection
+                        // de canal mort (échecs socket répétés) — retour immédiat au
+                        // rythme DNS-SD rapide + re-arm complet, pas seulement l'état
+                        // isGroupOwner/groupOwnerAddress.
+                        handleRelayChannelDead("WIFI_P2P_CONNECTION_CHANGED déconnecté")
                     }
                 }
 
@@ -1105,18 +1141,30 @@ class MainActivity : FragmentActivity() {
                         line = reader.readLine()
                     }
                     Log.d("MARSEL_RELAY", "Relay exchange with $address complete (attempt $attempt)")
+                    // QA-FIX : un échange réussi prouve que la liaison est vivante —
+                    // efface tout historique d'échecs récents.
+                    consecutiveRelayFailures.set(0)
                     return@thread
                 } catch (e: Exception) {
                     lastError = e
-                    Log.w("MARSEL_RELAY", "Relay to $address attempt $attempt/3 failed: ${e.message}")
-                    if (attempt < 3) {
+                    Log.w("MARSEL_RELAY", "Relay to $address attempt $attempt/$attempts failed: ${e.message}")
+                    if (attempt < attempts) {
                         try { Thread.sleep(2_000) } catch (ie: InterruptedException) { return@thread }
                     }
                 } finally {
                     try { socket?.close() } catch (ex: Exception) { Log.v(TAG, "close: ${ex.message}") }
                 }
             }
-            Log.e("MARSEL_RELAY", "Relay to $address abandoned after 3 attempts: ${lastError?.message}")
+            Log.e("MARSEL_RELAY", "Relay to $address abandoned after $attempts attempts: ${lastError?.message}")
+            // QA-FIX (terrain, propagation lente du RESOLVED) : abandon complet
+            // d'un envoi/poll vers le Group Owner actuel — si ça se reproduit,
+            // la liaison P2P est probablement morte sans que Android l'ait
+            // signalé (CONNECTION_CHANGED pas toujours fiable). Ne réagit qu'à
+            // des échecs envers le GO ACTUEL (une adresse déjà remplacée ne
+            // doit pas déclencher un reset qui n'a plus de sens).
+            if (address == groupOwnerAddress && consecutiveRelayFailures.incrementAndGet() >= 2) {
+                handleRelayChannelDead("échecs socket répétés vers $address")
+            }
         }
     }
 
