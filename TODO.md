@@ -170,6 +170,87 @@ identifiant anonymisé, jamais le nom réel.
   conséquence tant qu'aucun `API_URL` n'est activé, mais à durcir le jour où
   un backend optionnel est branché.
 
+## Fiabilité du relais SMS — éviter les envois en double (élection d'un seul relais)
+
+**Constat (audit du 09/09/2026, suite à une question utilisateur) :** la
+demande de relais SMS (paquets `F`/`T`, ou `E` avec `relaySms="1"`) est
+diffusée en *flood* — tous les téléphones à portée/dans les 5 sauts la
+reçoivent, il n'y a pas de relais « élu » à l'avance. Chaque relais ne
+vérifie que son **propre** historique local (`smsInFlight` en RAM +
+`dedupLedger` persisté, kind `"sms"`) avant d'envoyer.
+
+**Trou confirmé dans le code** : quand un relais reçoit l'accusé
+`SMS_ACK` diffusé par un AUTRE relais qui a déjà envoyé le SMS
+(`processRelayMessage`, branche `TYPE_SMS_ACK`), il le retransmet plus
+loin dans le maillage (pour qu'il remonte jusqu'à l'émetteur) mais **ne
+marque jamais son propre `dedupLedger("sms", ...)`** avant de retourner.
+Résultat : si deux téléphones-passerelles ont réseau + SIM au même
+moment et reçoivent la demande avant que l'un des deux ait fini d'agir,
+**le même SMS peut partir en double** (voire plus), depuis des numéros
+différents, vers les mêmes contacts — ce n'est pas qu'un cas limite
+théorique, c'est une vraie course actuellement non protégée.
+
+**À faire (par ordre de coût croissant) :**
+1. **Correctif rapide** : dans `processRelayMessage` (branche
+   `TYPE_SMS_ACK`, `MainActivity.kt`), appeler
+   `dedupLedger.checkAndMark("sms", ackedId)` dès réception de l'accusé,
+   même sur un relais qui n'a pas lui-même envoyé le SMS. N'élimine pas
+   la course si les deux envois partent quasi simultanément, mais évite
+   qu'un relais envoie *après* avoir vu la preuve que c'est déjà fait.
+2. **Vraie élection d'un seul relais avant envoi** (ce que l'utilisateur
+   demande explicitement) : avant qu'un relais n'envoie, un mécanisme de
+   coordination doit désigner UN SEUL exécutant parmi tous les relais
+   ayant reçu la demande — par ex. un scoring déterministe (force du
+   signal, niveau de batterie, ou simplement l'adresse MAC/deviceAddress
+   la plus basse) calculé indépendamment par chaque relais à partir de
+   données déjà présentes dans le paquet + un court délai d'attente
+   aléatoire avant d'agir (le premier à agir et à faire circuler son ACK
+   coupe l'herbe sous le pied des autres). Effort gros : ça touche le
+   protocole (`MarselProtocol`), `handleSmsRequestPacket` et
+   `forwardEmergencyToContacts`. À noter : même une élection soignée reste
+   probabiliste sur un réseau best-effort comme WiFi Direct — l'objectif
+   réaliste est de réduire drastiquement la probabilité de doublon, pas
+   de l'annuler à 100 %.
+
+## Import des proches depuis les contacts du téléphone (`Intent.ACTION_PICK`)
+
+**Constat (demande utilisateur du 09/09/2026) :** aujourd'hui, les 5
+contacts de confiance (« proches ») sont saisis entièrement à la main
+(nom, mobile, email) — aucun lien avec le carnet d'adresses du téléphone.
+C'est d'ailleurs une propriété de confidentialité déjà auditée
+positivement : Marsel ne demande **aucune permission `READ_CONTACTS`**
+et n'a donc aucun accès à la liste de contacts (cf. chantier
+Confidentialité ci-dessus).
+
+**Objectif :** permettre de choisir un proche dans les contacts du
+téléphone plutôt que de tout retaper, **sans revenir sur cette propriété
+de confidentialité**.
+
+**À faire :**
+1. Utiliser le **sélecteur système** (`Intent.ACTION_PICK` sur
+   `ContactsContract.Contacts.CONTENT_URI`, ou directement
+   `ContactsContract.CommonDataKinds.Phone.CONTENT_URI` pour arriver
+   droit sur un numéro) plutôt qu'une requête directe au fournisseur de
+   contacts. Ce choix est déterminant : le picker système ne nécessite
+   **pas** la permission `READ_CONTACTS` — l'utilisateur choisit UN
+   contact dans l'app Contacts elle-même (app de confiance, hors
+   sandbox Marsel), et seul ce contact précis est retourné à Marsel via
+   l'intent résultat. Aucun accès à la liste complète du carnet
+   d'adresses.
+2. Nouveau bridge natif (`MainActivity.kt`) : lancer l'intent via
+   `ActivityResultContracts.StartActivityForResult` (déjà utilisé pour
+   les permissions dans le projet), lire nom + numéro depuis l'URI
+   retournée (`ContactsContract.CommonDataKinds.Phone`), renvoyer le
+   résultat à la WebView (callback JS, ex. `window.onContactPicked`).
+3. Côté `app.html`/`script.js` : bouton « Importer depuis mes contacts »
+   sur l'écran d'édition d'un proche, qui préremplit `contact-nom` et
+   `contact-mobile` avec le résultat — l'utilisateur garde la main pour
+   corriger/compléter avant d'enregistrer (le pseudo affiché à l'émetteur
+   reste un champ Marsel distinct, non importé).
+4. Le stockage reste inchangé : le proche importé est enregistré comme
+   n'importe quel proche saisi à la main (`marsel_contacts`, chiffré au
+   repos — cf. chantier Confidentialité §1.4).
+
 ## MMS audio (5b) — best-effort à fiabiliser
 
 `sendLastRecordingMms` est un envoi best-effort : `SmsManager.sendMultimediaMessage`
