@@ -2380,6 +2380,35 @@ function openContactDetail(idx) {
     showScreen('screen-contact-detail');
 }
 
+/* Import d'un proche depuis les contacts du téléphone (TODO.md). Lance le
+   sélecteur SYSTÈME (AndroidBridge.pickContact -> Intent.ACTION_PICK côté
+   natif) — aucune permission READ_CONTACTS, Marsel ne reçoit que le contact
+   choisi. Le résultat arrive via window.onContactPicked, ci-dessous. */
+function pickContactFromPhone() {
+    try {
+        if (window.AndroidBridge && typeof AndroidBridge.pickContact === 'function') {
+            AndroidBridge.pickContact();
+        } else {
+            showToast('Import des contacts indisponible sur cet appareil');
+        }
+    } catch (e) {}
+}
+
+/* Préremplit nom + mobile depuis le contact choisi — l'utilisateur garde la
+   main pour corriger/compléter avant d'enregistrer (le pseudo affiché à
+   l'émetteur reste un champ Marsel distinct, jamais importé). */
+window.onContactPicked = function (contact) {
+    if (!contact) {
+        showToast('Aucun contact sélectionné');
+        return;
+    }
+    var elNom = document.getElementById('contact-nom');
+    if (elNom && contact.nom) elNom.value = contact.nom;
+    var elMobile = document.getElementById('contact-mobile');
+    if (elMobile && contact.mobile) elMobile.value = contact.mobile;
+    showToast('Contact importé — vérifiez et enregistrez');
+};
+
 function saveContact() {
     var idx = parseInt(((document.getElementById('contact-slot-index') || {}).value || '0'), 10);
     var nom = ((document.getElementById('contact-nom') || {}).value || '').trim();

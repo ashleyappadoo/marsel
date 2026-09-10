@@ -540,6 +540,13 @@
 
   <div class="screen-body">
     <input type="hidden" id="contact-slot-index" value="0" />
+    <!-- Import depuis les contacts du téléphone (TODO.md) : sélecteur système
+         (Intent.ACTION_PICK), aucun accès à la liste complète des contacts —
+         préremplit juste nom + mobile, l'utilisateur garde la main pour
+         corriger/compléter avant d'enregistrer. -->
+    <button class="btn-secondary full-width" style="margin-bottom:4px;" onclick="pickContactFromPhone()">
+      Importer depuis mes contacts
+    </button>
     <div class="field-group">
       <label class="field-label blue">Nom</label>
       <input type="text" id="contact-nom" class="field-input editable" placeholder="Nom du proche" />

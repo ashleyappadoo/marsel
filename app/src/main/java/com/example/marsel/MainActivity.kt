@@ -21,6 +21,7 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Environment
 import android.os.ParcelFileDescriptor
+import android.provider.ContactsContract
 import android.provider.MediaStore
 import android.net.Uri
 import android.net.wifi.p2p.WifiP2pConfig
@@ -28,6 +29,7 @@ import android.net.wifi.p2p.WifiP2pDevice
 import android.net.wifi.p2p.WifiP2pManager
 import android.net.wifi.p2p.nsd.WifiP2pDnsSdServiceInfo
 import android.net.wifi.p2p.nsd.WifiP2pDnsSdServiceRequest
+import android.os.BatteryManager
 import android.os.Build
 import android.os.Bundle
 import android.os.Handler
@@ -352,6 +354,50 @@ class MainActivity : FragmentActivity() {
                 "window.onPermissionResult && window.onPermissionResult('$group',$granted,$permanentlyDenied)",
                 null
             )
+        }
+    }
+
+    // Import d'un proche depuis les contacts du téléphone (TODO.md). Le
+    // sélecteur SYSTÈME (Intent.ACTION_PICK) est utilisé à dessein : il ne
+    // nécessite PAS la permission READ_CONTACTS — l'utilisateur choisit un
+    // contact dans l'app Contacts elle-même, et seul ce contact précis est
+    // retourné ici. Aucun accès à la liste complète du carnet d'adresses.
+    private val contactPickerLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        val uri = result.data?.data
+        if (result.resultCode != RESULT_OK || uri == null) {
+            runOnUiThread { webView.evaluateJavascript("window.onContactPicked && window.onContactPicked(null)", null) }
+            return@registerForActivityResult
+        }
+        // QA-FIX : la requête au fournisseur de contacts est un appel bloquant
+        // (IPC + disque) — jamais sur le thread UI (callback d'ActivityResult),
+        // même pattern `thread {}` que le reste du fichier.
+        thread {
+            var nom = ""
+            var mobile = ""
+            try {
+                contentResolver.query(uri, null, null, null, null)?.use { cursor ->
+                    if (cursor.moveToFirst()) {
+                        val nameIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.DISPLAY_NAME)
+                        val numberIdx = cursor.getColumnIndex(ContactsContract.CommonDataKinds.Phone.NUMBER)
+                        if (nameIdx >= 0) nom = cursor.getString(nameIdx) ?: ""
+                        if (numberIdx >= 0) mobile = cursor.getString(numberIdx) ?: ""
+                    }
+                }
+            } catch (e: Exception) {
+                Log.e(TAG, "contactPickerLauncher query: ${e.message}")
+            }
+            // QA-FIX : escapeJs() (déjà utilisé partout ailleurs dans ce fichier
+            // pour injecter du texte arbitraire dans du JS évalué) plutôt qu'un
+            // nettoyage ad-hoc — un nom avec apostrophe (« O'Brien ») n'est plus
+            // corrompu, et un retour à la ligne ne casse plus le literal JS.
+            runOnUiThread {
+                webView.evaluateJavascript(
+                    "window.onContactPicked && window.onContactPicked({nom:${escapeJs(nom)}, mobile:${escapeJs(mobile)}})",
+                    null
+                )
+            }
         }
     }
 
@@ -939,6 +985,12 @@ class MainActivity : FragmentActivity() {
                 if (ownMessageIds.contains(messageId)) return
                 val ackedId = extractJsonString(json, "emergencyId")
                     ?: extractJsonString(json, "id") ?: return
+                // QA-FIX (fiabilité relais SMS) : marquer "sms" comme géré même
+                // sur un relais qui n'a PAS lui-même envoyé — sans ça, un relais
+                // qui reçoit la demande APRÈS avoir vu passer cet accusé pouvait
+                // quand même tenter d'envoyer (son dedup local ne savait rien de
+                // l'envoi effectué par l'autre relais), risque réel de doublon.
+                dedupLedger.checkAndMark("sms", ackedId)
                 runOnUiThread {
                     webView.evaluateJavascript(
                         "window.onSmsRelayAck && window.onSmsRelayAck('${ackedId.replace("'", "")}')",
@@ -1042,6 +1094,69 @@ class MainActivity : FragmentActivity() {
     }
 
     // =========================================================================
+    // Élection d'un seul relais avant envoi SMS (TODO.md — Fiabilité du
+    // relais SMS). Plusieurs relais peuvent recevoir la même demande de
+    // délégation SMS en même temps (diffusion en flood, aucun relais élu à
+    // l'avance). Pour réduire le risque d'envoi en double : chaque relais
+    // candidat calcule un délai avant d'agir — meilleur réseau + batterie
+    // plus haute => délai plus court => plus de chances d'agir en premier —
+    // puis, juste avant d'envoyer, revérifie si un ACK n'est pas déjà arrivé
+    // entre-temps (cf. TYPE_SMS_ACK, qui marque désormais le dedup même sur
+    // un relais qui n'a pas lui-même envoyé) ; si oui, il abandonne. Reste
+    // probabiliste sur un réseau best-effort comme WiFi Direct : ça réduit
+    // fortement le risque de doublon, ça ne l'annule pas à 100 %.
+    // =========================================================================
+    private fun electionDelayMs(quality: String): Long {
+        val qualityPenaltyMs = when (quality) {
+            "WIFI_STABLE" -> 0L
+            "MOBILE_STABLE" -> 500L
+            else -> 1000L
+        }
+        val batteryPct = try {
+            val bm = getSystemService(Context.BATTERY_SERVICE) as? BatteryManager
+            bm?.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)?.coerceIn(0, 100) ?: 50
+        } catch (e: Exception) {
+            50
+        }
+        val batteryPenaltyMs = (100 - batteryPct) * 15L
+        // Jitter : évite que deux relais à réseau/batterie identiques agissent
+        // exactement au même instant.
+        val jitterMs = java.util.concurrent.ThreadLocalRandom.current().nextLong(0, 700)
+        return qualityPenaltyMs + batteryPenaltyMs + jitterMs
+    }
+
+    private fun scheduleElectedSmsSend(messageId: String, mobiles: List<String>, smsMsg: String, quality: String) {
+        val delayMs = electionDelayMs(quality)
+        thread {
+            try {
+                Thread.sleep(delayMs)
+            } catch (ie: InterruptedException) {
+                // QA-FIX : ne jamais laisser messageId marqué "in flight" pour
+                // le reste du process — sans ça, cet appareil ne pourrait plus
+                // JAMAIS retenter ce relais, même s'il redevenait le seul
+                // capable de l'envoyer.
+                smsInFlight.remove(messageId)
+                pendingRelaySends.remove(messageId)
+                return@thread
+            }
+            // Un autre relais a été plus rapide pendant notre attente (son ACK
+            // est arrivé, ou a été marqué directement s'il s'agit du nôtre) :
+            // on abandonne — libérer smsInFlight/pendingRelaySends pour ne pas
+            // les bloquer indéfiniment (onSmsSendResult ne sera jamais appelé
+            // puisqu'on n'envoie rien).
+            if (dedupLedger.isSeen("sms", messageId)) {
+                logToJs("RELAY", "SMS-REQ $messageId : un autre relais a déjà envoyé pendant l'attente — abandon")
+                smsInFlight.remove(messageId)
+                pendingRelaySends.remove(messageId)
+                return@thread
+            }
+            mobiles.forEachIndexed { idx, mobile ->
+                sendSMSDirect(mobile, smsMsg, if (idx == 0) "relay|$messageId" else null)
+            }
+        }
+    }
+
+    // =========================================================================
     // Paquets F (fin d'alerte) / T (timeout 20 min) — SMS relayé silencieux
     // =========================================================================
     // Le téléphone relais avec réseau validé envoie les SMS À LA PLACE de
@@ -1085,9 +1200,7 @@ class MainActivity : FragmentActivity() {
             if (mobiles.isEmpty()) { smsInFlight.remove(messageId); return }
             logToJs("RELAY", "SMS-REQ $msgType : envoi de ${mobiles.size} SMS à la place de l'émetteur")
             pendingRelaySends[messageId] = json
-            mobiles.forEachIndexed { idx, mobile ->
-                sendSMSDirect(mobile, smsMsg, if (idx == 0) "relay|$messageId" else null)
-            }
+            scheduleElectedSmsSend(messageId, mobiles, smsMsg, quality)
         } else {
             // Pas de réseau validé ici non plus : propager plus loin.
             // AUDIT-FIX 1 : propagation UNIQUE. Le paquet F/T n'est pas dédupliqué
@@ -2493,11 +2606,10 @@ class MainActivity : FragmentActivity() {
             val smsMsg = "ALERTE MARSEL\n$pseudo a declenche une alerte d'urgence.\nPosition: $mapsLink"
             logToJs("RELAY", "SMS relais ($quality) : envoi à ${mobiles.size} proche(s) à la place de l'émetteur")
             pendingRelaySends[messageId] = json
-            mobiles.forEachIndexed { idx, mobile ->
-                // Le premier envoi porte le suivi : son accusé fait verdict pour
-                // le lot (même radio) → succès = smsHandled + ACK vers l'émetteur.
-                sendSMSDirect(mobile, smsMsg, if (idx == 0) "relay|$messageId" else null)
-            }
+            // Élection (délai selon réseau/batterie + revérif de l'ACK avant
+            // d'envoyer réellement) : le premier envoi du lot élu porte le
+            // suivi, son accusé fait verdict → succès = smsHandled + ACK.
+            scheduleElectedSmsSend(messageId, mobiles, smsMsg, quality)
         } catch (e: Exception) {
             Log.e(TAG, "forwardEmergencyToContacts: ${e.message}")
         }
@@ -2601,6 +2713,24 @@ class MainActivity : FragmentActivity() {
         @JavascriptInterface
         fun showBiometricPrompt() {
             runOnUiThread { showBiometricPromptInternal() }
+        }
+
+        // -----------------------------------------------------------------------
+        // Import d'un proche depuis les contacts (TODO.md) — Intent.ACTION_PICK,
+        // pas de permission READ_CONTACTS.
+        // -----------------------------------------------------------------------
+
+        @JavascriptInterface
+        fun pickContact() {
+            runOnUiThread {
+                try {
+                    val intent = Intent(Intent.ACTION_PICK, ContactsContract.CommonDataKinds.Phone.CONTENT_URI)
+                    contactPickerLauncher.launch(intent)
+                } catch (e: Exception) {
+                    Log.e(TAG, "pickContact launch failed: ${e.message}")
+                    webView.evaluateJavascript("window.onContactPicked && window.onContactPicked(null)", null)
+                }
+            }
         }
 
         // -----------------------------------------------------------------------

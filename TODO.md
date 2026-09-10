@@ -170,7 +170,7 @@ identifiant anonymisé, jamais le nom réel.
   conséquence tant qu'aucun `API_URL` n'est activé, mais à durcir le jour où
   un backend optionnel est branché.
 
-## Fiabilité du relais SMS — éviter les envois en double (élection d'un seul relais)
+## Fiabilité du relais SMS — éviter les envois en double (élection d'un seul relais) — ✅ fait
 
 **Constat (audit du 09/09/2026, suite à une question utilisateur) :** la
 demande de relais SMS (paquets `F`/`T`, ou `E` avec `relaySms="1"`) est
@@ -190,29 +190,29 @@ moment et reçoivent la demande avant que l'un des deux ait fini d'agir,
 différents, vers les mêmes contacts — ce n'est pas qu'un cas limite
 théorique, c'est une vraie course actuellement non protégée.
 
-**À faire (par ordre de coût croissant) :**
-1. **Correctif rapide** : dans `processRelayMessage` (branche
-   `TYPE_SMS_ACK`, `MainActivity.kt`), appeler
-   `dedupLedger.checkAndMark("sms", ackedId)` dès réception de l'accusé,
-   même sur un relais qui n'a pas lui-même envoyé le SMS. N'élimine pas
-   la course si les deux envois partent quasi simultanément, mais évite
-   qu'un relais envoie *après* avoir vu la preuve que c'est déjà fait.
-2. **Vraie élection d'un seul relais avant envoi** (ce que l'utilisateur
-   demande explicitement) : avant qu'un relais n'envoie, un mécanisme de
-   coordination doit désigner UN SEUL exécutant parmi tous les relais
-   ayant reçu la demande — par ex. un scoring déterministe (force du
-   signal, niveau de batterie, ou simplement l'adresse MAC/deviceAddress
-   la plus basse) calculé indépendamment par chaque relais à partir de
-   données déjà présentes dans le paquet + un court délai d'attente
-   aléatoire avant d'agir (le premier à agir et à faire circuler son ACK
-   coupe l'herbe sous le pied des autres). Effort gros : ça touche le
-   protocole (`MarselProtocol`), `handleSmsRequestPacket` et
-   `forwardEmergencyToContacts`. À noter : même une élection soignée reste
-   probabiliste sur un réseau best-effort comme WiFi Direct — l'objectif
-   réaliste est de réduire drastiquement la probabilité de doublon, pas
-   de l'annuler à 100 %.
+**Fait :**
+1. ✅ **Correctif rapide** : `processRelayMessage` (branche `TYPE_SMS_ACK`,
+   `MainActivity.kt`) appelle désormais `dedupLedger.checkAndMark("sms",
+   ackedId)` dès réception de l'accusé, même sur un relais qui n'a pas
+   lui-même envoyé le SMS — un relais qui reçoit la demande APRÈS avoir vu
+   passer cet accusé ne tente plus d'envoyer.
+2. ✅ **Élection d'un seul relais avant envoi** : nouvelles
+   `electionDelayMs()`/`scheduleElectedSmsSend()`. Chaque relais candidat
+   calcule un délai (réseau WiFi < réseau mobile < défaut, batterie plus
+   haute = délai plus court, + un jitter aléatoire 0-700 ms), puis attend
+   ce délai avant d'envoyer réellement — et revérifie `dedupLedger` juste
+   avant : si un ACK est arrivé entre-temps (point 1), il abandonne
+   proprement (libère `smsInFlight`/`pendingRelaySends`, y compris en cas
+   d'interruption du thread d'attente). Branché sur les deux points
+   d'envoi existants (`handleSmsRequestPacket` pour F/T,
+   `forwardEmergencyToContacts` pour E+`relaySms="1"`).
+   ⚠️ **Limite assumée, comme prévu** : reste probabiliste sur un réseau
+   best-effort comme WiFi Direct — réduit fortement le risque de doublon,
+   ne l'annule pas à 100 % (pas de coordination inter-appareils avant
+   l'attente, seulement après). Non vérifiable par test unitaire (logique
+   100 % Android : threads, réseau, batterie) — à confirmer sur device réel.
 
-## Import des proches depuis les contacts du téléphone (`Intent.ACTION_PICK`)
+## Import des proches depuis les contacts du téléphone (`Intent.ACTION_PICK`) — ✅ fait
 
 **Constat (demande utilisateur du 09/09/2026) :** aujourd'hui, les 5
 contacts de confiance (« proches ») sont saisis entièrement à la main
@@ -226,30 +226,56 @@ Confidentialité ci-dessus).
 téléphone plutôt que de tout retaper, **sans revenir sur cette propriété
 de confidentialité**.
 
-**À faire :**
-1. Utiliser le **sélecteur système** (`Intent.ACTION_PICK` sur
-   `ContactsContract.Contacts.CONTENT_URI`, ou directement
-   `ContactsContract.CommonDataKinds.Phone.CONTENT_URI` pour arriver
-   droit sur un numéro) plutôt qu'une requête directe au fournisseur de
-   contacts. Ce choix est déterminant : le picker système ne nécessite
-   **pas** la permission `READ_CONTACTS` — l'utilisateur choisit UN
-   contact dans l'app Contacts elle-même (app de confiance, hors
-   sandbox Marsel), et seul ce contact précis est retourné à Marsel via
-   l'intent résultat. Aucun accès à la liste complète du carnet
-   d'adresses.
-2. Nouveau bridge natif (`MainActivity.kt`) : lancer l'intent via
-   `ActivityResultContracts.StartActivityForResult` (déjà utilisé pour
-   les permissions dans le projet), lire nom + numéro depuis l'URI
-   retournée (`ContactsContract.CommonDataKinds.Phone`), renvoyer le
-   résultat à la WebView (callback JS, ex. `window.onContactPicked`).
-3. Côté `app.html`/`script.js` : bouton « Importer depuis mes contacts »
-   sur l'écran d'édition d'un proche, qui préremplit `contact-nom` et
-   `contact-mobile` avec le résultat — l'utilisateur garde la main pour
-   corriger/compléter avant d'enregistrer (le pseudo affiché à l'émetteur
-   reste un champ Marsel distinct, non importé).
-4. Le stockage reste inchangé : le proche importé est enregistré comme
+**Fait :**
+1. ✅ Sélecteur **système** (`Intent.ACTION_PICK` sur
+   `ContactsContract.CommonDataKinds.Phone.CONTENT_URI`, droit sur un
+   numéro) plutôt qu'une requête directe au fournisseur de contacts —
+   toujours **aucune permission `READ_CONTACTS`** déclarée ni requise.
+2. ✅ Nouveau bridge natif `pickContact()` (`MainActivity.kt`) : lance
+   l'intent via `ActivityResultContracts.StartActivityForResult`
+   (`contactPickerLauncher`, même pattern que les permissions), lit
+   nom + numéro depuis l'URI retournée sur un thread dédié (jamais sur
+   le thread UI — requête `ContentResolver` bloquante), renvoie le
+   résultat à la WebView via `window.onContactPicked`, texte échappé
+   avec le helper `escapeJs()` déjà utilisé ailleurs dans le fichier
+   (un nom avec apostrophe, ex. « O'Brien », n'est plus corrompu).
+3. ✅ Bouton « Importer depuis mes contacts » sur l'écran d'édition d'un
+   proche (`app.html`/`script.js`, `pickContactFromPhone()` +
+   `window.onContactPicked`) qui préremplit `contact-nom` et
+   `contact-mobile` — l'utilisateur garde la main pour corriger/compléter
+   avant d'enregistrer (le pseudo affiché à l'émetteur reste un champ
+   Marsel distinct, jamais importé).
+4. ✅ Stockage inchangé : le proche importé est enregistré comme
    n'importe quel proche saisi à la main (`marsel_contacts`, chiffré au
    repos — cf. chantier Confidentialité §1.4).
+
+## Icône de l'app — ✅ fait (partiellement, limite assumée)
+
+**Constat :** le manifest ne déclarait `android:icon` nulle part — l'app
+utilisait l'icône par défaut du template Android Studio (robot vert), y
+compris les fichiers `drawable/ic_launcher_background.xml` et
+`drawable-v24/ic_launcher_foreground.xml` (toujours le contenu généré par
+défaut).
+
+**Fait :**
+1. ✅ `AndroidManifest.xml` : ajout de `android:icon="@mipmap/ic_launcher"`
+   et `android:roundIcon="@mipmap/ic_launcher_round"` sur `<application>`.
+2. ✅ Icône adaptative (API 26+, la grande majorité des appareils actifs)
+   redessinée en vecteur pur (`ic_launcher_background.xml` fond blanc,
+   `ic_launcher_foreground.xml`) avec la marque Marsel exacte du `mw-dot`
+   déjà utilisé dans `app.html` (cercle orange `#E84315` + éclair blanc),
+   mise à l'échelle et centrée dans la zone de sécurité 66dp du canevas
+   108dp — aucun asset binaire nécessaire, juste le chemin SVG existant.
+3. ⚠️ **Limite assumée** : les icônes `.webp` historiques par densité
+   (`mipmap-{m,h,xh,xxh,xxxh}dpi/ic_launcher{,_round}.webp`, utilisées en
+   repli sur API < 26 ou par un launcher qui ignore les icônes adaptatives)
+   n'ont **pas** été régénérées — cet environnement n'a aucun outil de
+   rasterisation d'image (ni PIL/Pillow, ni ImageMagick, ni rsvg-convert),
+   et je n'ai pas voulu fabriquer des PNG à la main sans pouvoir vérifier
+   visuellement le rendu. **Action restante, triviale dans Android
+   Studio** : clic droit sur `res` → New → Image Asset → Launcher Icons
+   (Adaptive and Legacy) → réutiliser le foreground/background ci-dessus →
+   Next → Finish (régénère tous les `.webp` automatiquement).
 
 ## MMS audio (5b) — best-effort à fiabiliser
 
