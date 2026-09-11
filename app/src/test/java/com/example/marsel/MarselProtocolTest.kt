@@ -1,0 +1,313 @@
+package com.example.marsel
+
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * Tests unitaires purs du protocole MRN (Section 7). Aucune dépendance Android :
+ * MarselProtocol et DedupLedger sont testables directement en JVM.
+ */
+class MarselProtocolTest {
+
+    // ── Cascade réseau (F1) ─────────────────────────────────────────────
+    @Test
+    fun mobileValidated_isMobileStable() {
+        val q = MarselProtocol.classifyNetworkQuality(
+            hasCellular = true, hasWifi = false, hasEthernet = false,
+            validated = true, hasInternet = true
+        )
+        assertEquals("MOBILE_STABLE", q)
+    }
+
+    @Test
+    fun wifiValidated_isWifiStable() {
+        val q = MarselProtocol.classifyNetworkQuality(
+            hasCellular = false, hasWifi = true, hasEthernet = false,
+            validated = true, hasInternet = true
+        )
+        assertEquals("WIFI_STABLE", q)
+    }
+
+    @Test
+    fun wifiNotValidated_isNone() {
+        // WiFi connecté mais sans accès internet réel (portail captif) → NONE (F1)
+        val q = MarselProtocol.classifyNetworkQuality(
+            hasCellular = false, hasWifi = true, hasEthernet = false,
+            validated = false, hasInternet = true
+        )
+        assertEquals("NONE", q)
+    }
+
+    @Test
+    fun noInternetCapability_isNone() {
+        val q = MarselProtocol.classifyNetworkQuality(
+            hasCellular = true, hasWifi = false, hasEthernet = false,
+            validated = true, hasInternet = false
+        )
+        assertEquals("NONE", q)
+    }
+
+    @Test
+    fun mobilePreferredOverWifi() {
+        val q = MarselProtocol.classifyNetworkQuality(
+            hasCellular = true, hasWifi = true, hasEthernet = false,
+            validated = true, hasInternet = true
+        )
+        assertEquals("MOBILE_STABLE", q)
+    }
+
+    // ── Filtrage des pairs (Section 2) ──────────────────────────────────
+    @Test
+    fun connectTarget_onlyMarselPeer() {
+        val visible = listOf("aa:tv", "bb:printer", "cc:marsel")
+        val marsel = setOf("cc:marsel")
+        assertEquals("cc:marsel", MarselProtocol.selectConnectTarget(visible, marsel))
+    }
+
+    @Test
+    fun connectTarget_noneWhenNoMarselPeer() {
+        // Aucun appareil visible n'est un pair Marsel → jamais de connect() (B1)
+        val visible = listOf("aa:tv", "bb:printer")
+        assertNull(MarselProtocol.selectConnectTarget(visible, emptySet()))
+    }
+
+    @Test
+    fun peerExpiresAfterTtl() {
+        assertFalse(MarselProtocol.isPeerExpired(lastSeenMs = 1_000, nowMs = 40_000, ttlMs = 60_000))
+        assertTrue(MarselProtocol.isPeerExpired(lastSeenMs = 1_000, nowMs = 70_000, ttlMs = 60_000))
+    }
+
+    // ── Déduplication persistée (E1/E2/F3) ──────────────────────────────
+    private class MapStore(val m: MutableMap<String, Long> = mutableMapOf()) : DedupLedger.KeyValueStore {
+        override fun all(): Map<String, Long> = HashMap(m)
+        override fun put(key: String, value: Long) { m[key] = value }
+        override fun remove(key: String) { m.remove(key) }
+    }
+
+    @Test
+    fun dedup_firstUnseenThenSeen() {
+        var now = 1_000L
+        val ledger = DedupLedger(MapStore(), ttlMs = 600_000L) { now }
+        assertFalse(ledger.checkAndMark("msg", "id-1"))  // 1re fois
+        assertTrue(ledger.checkAndMark("msg", "id-1"))   // déjà vu
+    }
+
+    @Test
+    fun dedup_survivesRestart() {
+        // E1 : même store, nouveau ledger (= restart de l'app) → toujours vu
+        val store = MapStore()
+        var now = 1_000L
+        DedupLedger(store, ttlMs = 600_000L) { now }.checkAndMark("sms", "emg-42")
+        val afterRestart = DedupLedger(store, ttlMs = 600_000L) { now }
+        assertTrue(afterRestart.checkAndMark("sms", "emg-42"))
+    }
+
+    @Test
+    fun dedup_expiresByAge() {
+        val store = MapStore()
+        var now = 1_000L
+        val ledger = DedupLedger(store, ttlMs = 10_000L) { now }
+        ledger.checkAndMark("msg", "old")
+        now = 100_000L  // bien au-delà du TTL
+        assertFalse(ledger.checkAndMark("msg", "old"))  // expiré → non vu
+    }
+
+    @Test
+    fun dedup_kindsAreIsolated() {
+        var now = 1_000L
+        val ledger = DedupLedger(MapStore(), ttlMs = 600_000L) { now }
+        ledger.checkAndMark("msg", "x")
+        assertFalse(ledger.isSeen("sms", "x"))  // même id, espace différent
+        assertTrue(ledger.isSeen("msg", "x"))
+    }
+
+    // ── Instances de service distinctes (C3) ────────────────────────────
+    @Test
+    fun distinctAlertInstancesPerEmergency() {
+        val a = MarselProtocol.alertInstanceName("emg-aaaaaaaa")
+        val b = MarselProtocol.alertInstanceName("emg-bbbbbbbb")
+        assertFalse("deux urgences → deux instances distinctes", a == b)
+        assertTrue(a.startsWith("marsel-alert-"))
+    }
+
+    @Test
+    fun shouldReplaceLocalAlert_logic() {
+        assertTrue(MarselProtocol.shouldReplaceLocalAlert(null, "m1"))
+        assertTrue(MarselProtocol.shouldReplaceLocalAlert("m1", "m2"))
+        assertFalse(MarselProtocol.shouldReplaceLocalAlert("m1", "m1"))
+    }
+
+    // ── Timer 20 minutes (Section 4) ────────────────────────────────────
+    @Test
+    fun timeoutRemaining_midway() {
+        val start = 1_000_000L
+        val remaining = MarselProtocol.timeoutRemainingMs(start, start + 5 * 60_000L)
+        assertEquals(15 * 60_000L, remaining)
+    }
+
+    @Test
+    fun timeoutRemaining_pastDeadlineIsZero() {
+        val start = 1_000_000L
+        val remaining = MarselProtocol.timeoutRemainingMs(start, start + 25 * 60_000L)
+        assertEquals(0L, remaining)  // déclenchement immédiat au restart
+    }
+
+    // ── TXT record : encodage/décodage E, P, R, F, T (I4) ───────────────
+    @Test
+    fun txtRoundTrip_emergencyWithContacts() {
+        // TODO.md §2.2 : un E « public » (pas relaySms) ne porte JAMAIS le
+        // vrai pseudo dans le TXT — "Alice" est remplacé par l'alias dérivé
+        // de l'emergencyId, quel que soit le pseudo fourni en entrée.
+        val json = """{"type":"MARSEL_EMERGENCY","messageId":"emg-1","emergencyId":"emg-1","pseudo":"Alice","lat":48.8566,"lng":2.3522,"timestamp":1700000000000,"hopCount":0,"contacts":[{"mobile":"+33611"},{"mobile":"+33622"}]}"""
+        val rec = MarselProtocol.buildTxtRecord("E", json, 0)!!
+        assertEquals("E", rec["y"])
+        assertEquals("emg-1", rec["i"])
+        assertEquals("+33611,+33622", rec["c"])
+
+        val back = MarselProtocol.txtRecordToJson(rec, 0)!!
+        assertEquals("MARSEL_EMERGENCY", MarselProtocol.extractJsonString(back, "type"))
+        assertEquals(MarselProtocol.deriveAlertAlias("emg-1"), MarselProtocol.extractJsonString(back, "pseudo"))
+        assertEquals(listOf("+33611", "+33622"), MarselProtocol.extractContactMobiles(back))
+    }
+
+    @Test
+    fun txtRoundTrip_allTypes() {
+        val types = mapOf(
+            "MARSEL_EMERGENCY" to "E",
+            "MARSEL_POSITION_UPDATE" to "P",
+            "MARSEL_EMERGENCY_RESOLVED" to "R",
+            "MARSEL_RESOLVED_SMS_REQUEST" to "F",
+            "MARSEL_TIMEOUT_SMS_REQUEST" to "T",
+            "MARSEL_SMS_ACK" to "S"
+        )
+        for ((type, short) in types) {
+            val json = """{"type":"$type","messageId":"m","emergencyId":"e","pseudo":"Bob","lat":1.0,"lng":2.0,"timestamp":10,"hopCount":1,"contacts":[]}"""
+            val rec = MarselProtocol.buildTxtRecord(short, json, 0)!!
+            assertEquals(short, rec["y"])
+            val back = MarselProtocol.txtRecordToJson(rec, 0)!!
+            assertEquals(type, MarselProtocol.extractJsonString(back, "type"))
+        }
+    }
+
+    @Test
+    fun maxHopsIsBoundedToFive() {
+        // Le plafond de 5 sauts borne la propagation ET le délai avant le
+        // verdict « SMS impossibles » chez l'émetteur.
+        assertEquals(5, MarselProtocol.MAX_HOPS)
+        val json = """{"type":"MARSEL_EMERGENCY","messageId":"m","emergencyId":"e","pseudo":"Bob","lat":1.0,"lng":2.0,"timestamp":10,"hopCount":0,"contacts":[]}"""
+        val rec = MarselProtocol.buildTxtRecord("E", json, 0)!!
+        val back = MarselProtocol.txtRecordToJson(rec, 0)!!
+        assertEquals(5, MarselProtocol.extractJsonInt(back, "maxHops"))
+    }
+
+    @Test
+    fun longRequestIds_surviveTxtRoundTripIntact() {
+        // ID-FIX : les ids F/T (42-43 caractères) étaient tronqués à 40 dans le
+        // TXT → corrélation d'ACK impossible chez l'émetteur (bug terrain).
+        val longId = "emg-mrklbsgj-n1arldgx_ressms_1784057866915"  // 42 chars
+        val json = """{"type":"MARSEL_RESOLVED_SMS_REQUEST","messageId":"$longId","emergencyId":"emg-mrklbsgj-n1arldgx","pseudo":"Bob","lat":1.0,"lng":2.0,"timestamp":10,"hopCount":0,"contacts":[{"mobile":"+33600"}]}"""
+        val rec = MarselProtocol.buildTxtRecord("F", json, 0)!!
+        assertEquals("id intact dans le TXT", longId, rec["i"])
+        val back = MarselProtocol.txtRecordToJson(rec, 0)!!
+        assertEquals(longId, MarselProtocol.extractJsonString(back, "messageId"))
+    }
+
+    @Test
+    fun ackPacket_preservesAckedRequestId() {
+        // L'ACK transporte l'id de la demande traitée dans emergencyId ;
+        // l'émetteur le compare à ses propres demandes en attente.
+        val ackJson = """{"type":"MARSEL_SMS_ACK","messageId":"req-42_ack","emergencyId":"req-42","pseudo":"Relais","lat":1.0,"lng":2.0,"timestamp":10,"hopCount":0,"contacts":[]}"""
+        val rec = MarselProtocol.buildTxtRecord("S", ackJson, 0)!!
+        val back = MarselProtocol.txtRecordToJson(rec, 0)!!
+        assertEquals("MARSEL_SMS_ACK", MarselProtocol.extractJsonString(back, "type"))
+        assertEquals("req-42", MarselProtocol.extractJsonString(back, "emergencyId"))
+        assertTrue(MarselProtocol.ackInstanceName("req-42_ack").startsWith("marsel-ack-"))
+    }
+
+    @Test
+    fun txtRecord_audioFlagPreserved() {
+        val json = """{"type":"MARSEL_RESOLVED_SMS_REQUEST","messageId":"m","emergencyId":"e","pseudo":"Bob","lat":1.0,"lng":2.0,"timestamp":10,"hopCount":0,"audio":"1","contacts":[{"mobile":"+33600"}]}"""
+        val rec = MarselProtocol.buildTxtRecord("F", json, 0)!!
+        assertEquals("1", rec["u"])
+        val back = MarselProtocol.txtRecordToJson(rec, 0)!!
+        assertEquals("1", MarselProtocol.extractJsonString(back, "audio"))
+    }
+
+    @Test
+    fun txtRecord_relaySmsFlagRoundTrip() {
+        // AUDIT-FIX 2 : le flag relaySms voyage dans le TXT (clé "m")
+        val offlineJson = """{"type":"MARSEL_EMERGENCY","messageId":"m","emergencyId":"e","pseudo":"Bob","lat":1.0,"lng":2.0,"timestamp":10,"hopCount":0,"relaySms":"1","contacts":[{"mobile":"+33600"}]}"""
+        val recOffline = MarselProtocol.buildTxtRecord("E", offlineJson, 0)!!
+        assertEquals("1", recOffline["m"])
+        assertEquals("1", MarselProtocol.extractJsonString(MarselProtocol.txtRecordToJson(recOffline, 0)!!, "relaySms"))
+
+        // Émetteur en réseau → relaySms="0" → pas de clé "m" → décodé "0"
+        val onlineJson = """{"type":"MARSEL_EMERGENCY","messageId":"m","emergencyId":"e","pseudo":"Bob","lat":1.0,"lng":2.0,"timestamp":10,"hopCount":0,"relaySms":"0","contacts":[{"mobile":"+33600"}]}"""
+        val recOnline = MarselProtocol.buildTxtRecord("E", onlineJson, 0)!!
+        assertNull(recOnline["m"])
+        assertEquals("0", MarselProtocol.extractJsonString(MarselProtocol.txtRecordToJson(recOnline, 0)!!, "relaySms"))
+    }
+
+    @Test
+    fun extractJsonString_toleratesEscapedQuotes() {
+        // I4 : un pseudo contenant un guillemet échappé ne casse pas l'extraction
+        val json = """{"pseudo":"Al \" ice","lat":1.0}"""
+        assertEquals("Al \" ice", MarselProtocol.extractJsonString(json, "pseudo"))
+        assertEquals(1.0, MarselProtocol.extractJsonNumber(json, "lat")!!, 0.0001)
+    }
+
+    @Test
+    fun buildTxtRecord_sanitizesPseudoQuotes() {
+        // Un pseudo avec guillemets est nettoyé pour ne pas corrompre le TXT
+        // record — testé sur un paquet relaySms="1" : c'est le seul cas où le
+        // vrai pseudo transite encore dans le TXT (TODO.md §2.2/§2.3), un E
+        // "public" étant de toute façon remplacé par l'alias (cf. test
+        // txtRoundTrip_emergencyWithContacts), sans besoin de sanitisation.
+        val json = """{"type":"MARSEL_EMERGENCY","messageId":"m","emergencyId":"e","pseudo":"a\"b","lat":1.0,"lng":2.0,"timestamp":10,"hopCount":0,"relaySms":"1","contacts":[{"mobile":"+33600"}]}"""
+        val rec = MarselProtocol.buildTxtRecord("E", json, 0)!!
+        assertFalse("pas de guillemet dans le pseudo TXT", rec["p"]!!.contains("\""))
+    }
+
+    // ── Anonymisation (TODO.md §2) ───────────────────────────────────────
+    @Test
+    fun deriveAlertAlias_isDeterministicAndDoesNotLeakEmergencyId() {
+        val alias1 = MarselProtocol.deriveAlertAlias("emg-secret-id-123")
+        val alias2 = MarselProtocol.deriveAlertAlias("emg-secret-id-123")
+        assertEquals("même emergencyId -> même alias", alias1, alias2)
+        assertTrue(alias1.startsWith("Alerte Marsel #"))
+        assertFalse("l'id source ne doit pas apparaître dans l'alias", alias1.contains("secret"))
+
+        val aliasOther = MarselProtocol.deriveAlertAlias("emg-other-id-456")
+        assertNotEquals("des emergencyId différents donnent des alias différents", alias1, aliasOther)
+    }
+
+    @Test
+    fun anonymizePseudoForTransit_publicPacketGetsAlias_delegationPacketKeepsRealPseudo() {
+        // Paquet public (pas relaySms) : le vrai pseudo est remplacé.
+        val publicJson = """{"type":"MARSEL_EMERGENCY","messageId":"m","emergencyId":"emg-1","pseudo":"Alice","lat":1.0,"lng":2.0,"timestamp":10,"hopCount":0,"contacts":[]}"""
+        val anonymized = MarselProtocol.anonymizePseudoForTransit(publicJson)
+        assertEquals(MarselProtocol.deriveAlertAlias("emg-1"), MarselProtocol.extractJsonString(anonymized, "pseudo"))
+
+        // Paquet de délégation SMS (relaySms="1") : le vrai pseudo doit
+        // survivre, le relais en a besoin pour le SMS aux propres contacts.
+        val relayJson = """{"type":"MARSEL_EMERGENCY","messageId":"m","emergencyId":"emg-1","pseudo":"Alice","lat":1.0,"lng":2.0,"timestamp":10,"hopCount":0,"relaySms":"1","contacts":[]}"""
+        assertEquals("Alice", MarselProtocol.extractJsonString(MarselProtocol.anonymizePseudoForTransit(relayJson), "pseudo"))
+
+        // Paquet F (RESOLVED_SMS_REQUEST) : même raison, jamais anonymisé.
+        val fJson = """{"type":"MARSEL_RESOLVED_SMS_REQUEST","messageId":"m","emergencyId":"emg-1","pseudo":"Alice","lat":1.0,"lng":2.0,"timestamp":10,"hopCount":0,"contacts":[{"mobile":"+33600"}]}"""
+        assertEquals("Alice", MarselProtocol.extractJsonString(MarselProtocol.anonymizePseudoForTransit(fJson), "pseudo"))
+    }
+
+    @Test
+    fun anonymizePseudoForDisplay_alwaysUsesAlias_evenForRelaySmsPackets() {
+        // La couche affichage JS n'a JAMAIS besoin du vrai pseudo — l'envoi du
+        // SMS relaySms="1" est entièrement natif (forwardEmergencyToContacts).
+        val relayJson = """{"type":"MARSEL_EMERGENCY","messageId":"m","emergencyId":"emg-1","pseudo":"Alice","lat":1.0,"lng":2.0,"timestamp":10,"hopCount":0,"relaySms":"1","contacts":[]}"""
+        val displayJson = MarselProtocol.anonymizePseudoForDisplay(relayJson)
+        assertEquals(MarselProtocol.deriveAlertAlias("emg-1"), MarselProtocol.extractJsonString(displayJson, "pseudo"))
+    }
+}
