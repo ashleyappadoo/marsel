@@ -204,6 +204,26 @@ class MainActivity : FragmentActivity() {
     // on revient immédiatement à la cadence rapide (kickDiscoveryNow).
     private val consecutiveRelayFailures = java.util.concurrent.atomic.AtomicInteger(0)
 
+    // QA-FIX (analyse blocage reason=2, terrain) : 3 déclencheurs indépendants
+    // (cycle périodique rediscoverRunnable, handleRelayChannelDead sur canal
+    // mort, retour WIFI_P2P_STATE_CHANGED→ENABLED) peuvent chacun lancer une
+    // chaîne clear→add→discover (ou jusqu'à 10 addLocalService via
+    // reRegisterActiveServices) sur le MÊME channel WiFi P2P. En flapping
+    // rapide (déconnexion suivie d'un cycle DISABLED→ENABLED, observé en
+    // test terrain), deux de ces déclencheurs partent quasi simultanément et
+    // chevauchent leurs appels — le framework rejette alors le second en
+    // BUSY (reason=2). Debounce partagé de 3s (largement > un aller-retour
+    // normal de callback WifiP2pManager, largement < la cadence des cycles
+    // légitimes 8-60s) : n'empêche jamais un cycle normal, bloque seulement
+    // les chevauchements de déclencheurs proches dans le temps.
+    @Volatile private var lastDiscoveryChainMs = 0L
+    private fun canStartDiscoveryChain(): Boolean {
+        val now = System.currentTimeMillis()
+        if (now - lastDiscoveryChainMs < 3_000L) return false
+        lastDiscoveryChainMs = now
+        return true
+    }
+
     private val smsSentReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val trackId = intent.getStringExtra("trackId") ?: return
@@ -346,7 +366,7 @@ class MainActivity : FragmentActivity() {
         // immédiatement (re-arm complet + ré-enregistrement des services actifs).
         if (granted && group == "nearby") {
             lastServiceRequestResetMs = 0
-            reRegisterActiveServices()
+            reRegisterActiveServicesSafely()
             kickDiscoveryNow()
         }
         runOnUiThread {
@@ -770,7 +790,7 @@ class MainActivity : FragmentActivity() {
                         // l'alerte cesse d'émettre en silence.
                         logToJs("P2P", "P2P ré-activé — ré-enregistrement des services actifs")
                         lastServiceRequestResetMs = 0  // force un re-arm complet
-                        reRegisterActiveServices()
+                        reRegisterActiveServicesSafely()
                         kickDiscoveryNow()
                     }
                     // Tell JS so the UI can warn the user (WiFi off = relay impossible)
@@ -1353,9 +1373,10 @@ class MainActivity : FragmentActivity() {
         try {
             wifiP2pChannel = wifiP2pManager.initialize(this, mainLooper) { onChannelLost() }
             setupDnsSdListeners()
-            reRegisterActiveServices()
+            reRegisterActiveServicesSafely()
             kickDiscoveryNow()
         } catch (e: Exception) {
+            logToJs("P2P", "onChannelLost recovery failed: ${e.message}")
             Log.e(TAG, "onChannelLost recovery failed: ${e.message}")
         }
     }
@@ -1425,9 +1446,13 @@ class MainActivity : FragmentActivity() {
             wifiP2pChannel = wifiP2pManager.initialize(this, mainLooper) { onChannelLost() }
             setupDnsSdListeners()
             lastServiceRequestResetMs = 0
-            reRegisterActiveServices()
+            reRegisterActiveServicesSafely()
             kickDiscoveryNow()
         } catch (e: Exception) {
+            // QA-FIX : visible aussi côté JS — un échec ici veut dire que le
+            // dernier recours (recréation du channel) a lui-même échoué,
+            // c'est le signal le plus grave de toute cette chaîne de recovery.
+            logToJs("P2P", "recreateP2pChannel exception: ${e.message}")
             Log.e(TAG, "recreateP2pChannel: ${e.message}")
         }
     }
@@ -1441,14 +1466,33 @@ class MainActivity : FragmentActivity() {
         if (!wifiP2pEnabled) return false
         val silentMs = System.currentTimeMillis() - lastDnsSdEventMs
         if (silentMs > 60_000) {
-            lastDnsSdEventMs = System.currentTimeMillis()
-            fullServiceRecovery("aucun événement DNS-SD depuis ${silentMs / 1000}s")
-            return true
+            // QA-FIX : ne réarmer lastDnsSdEventMs QUE si fullServiceRecovery()
+            // démarre réellement — sinon un debounce (chaîne déjà en cours
+            // ailleurs, cf. canStartDiscoveryChain) faisait quand même repartir
+            // le compteur de silence pour 60s complètes, alors qu'aucune
+            // recovery n'a eu lieu : un vrai blocage DNS-SD pouvait alors
+            // durer jusqu'à ~2 minutes avant d'être retenté, au lieu du
+            // plafond de 60s voulu.
+            val started = fullServiceRecovery("aucun événement DNS-SD depuis ${silentMs / 1000}s")
+            if (started) lastDnsSdEventMs = System.currentTimeMillis()
+            // QA-FIX : si fullServiceRecovery() a refusé de démarrer (chaîne
+            // déjà en cours ailleurs), on N'A PAS lancé de recovery — le cycle
+            // appelant doit alors quand même tenter restartServiceDiscovery()
+            // (sinon le cycle ne fait plus rien du tout ce tour-ci).
+            return started
         }
         return false
     }
 
-    private fun fullServiceRecovery(reason: String) {
+    /** Retourne true si la chaîne de récupération a réellement démarré. */
+    private fun fullServiceRecovery(reason: String): Boolean {
+        // QA-FIX (reason=2) : ne jamais chevaucher une chaîne déjà en cours
+        // (cf. canStartDiscoveryChain — flapping rapide + 3 déclencheurs
+        // indépendants = collisions BUSY sur le channel).
+        if (!canStartDiscoveryChain()) {
+            logToJs("DNS-SD", "RECOVERY ($reason) reportée — chaîne déjà en cours")
+            return false
+        }
         logToJs("DNS-SD", "RECOVERY ($reason)")
         lastServiceRequestResetMs = System.currentTimeMillis()
         try {
@@ -1466,12 +1510,35 @@ class MainActivity : FragmentActivity() {
                             }
                         })
                     } catch (e: Exception) {
+                        // QA-FIX : visible aussi côté JS (avant : uniquement Logcat,
+                        // invisible dans l'overlay de debug terrain).
+                        logToJs("DNS-SD", "fullServiceRecovery step2 exception: ${e.message}")
                         Log.e(TAG, "fullServiceRecovery step2: ${e.message}")
                     }
                 }
             })
         } catch (e: Exception) {
+            logToJs("DNS-SD", "fullServiceRecovery exception: ${e.message}")
             Log.e(TAG, "fullServiceRecovery: ${e.message}")
+        }
+        return true
+    }
+
+    // QA-FIX (reason=2) : reRegisterActiveServices() émet jusqu'à ~10 appels
+    // addLocalService d'affilée. Appelée directement (donc hors de la chaîne
+    // déjà protégée de fullServiceRecovery) à des moments rares mais qui
+    // peuvent coïncider avec un autre déclencheur pendant du flapping
+    // (permission accordée, retour ENABLED, channel perdu/recréé) — d'où le
+    // même risque de collision BUSY que la chaîne clear→add→discover.
+    // On ne saute JAMAIS la ré-inscription (une alerte active doit continuer
+    // à être diffusée) : si une autre chaîne tient déjà le jeton, on réessaie
+    // 1s plus tard plutôt que de l'abandonner.
+    private fun reRegisterActiveServicesSafely() {
+        if (canStartDiscoveryChain()) {
+            reRegisterActiveServices()
+        } else {
+            logToJs("DNS-SD", "ré-enregistrement des services différé de 1s (chaîne en cours)")
+            p2pHandler.postDelayed({ reRegisterActiveServices() }, 1_000L)
         }
     }
 
@@ -1924,6 +1991,15 @@ class MainActivity : FragmentActivity() {
             else -> 45_000L
         }
         if (now - lastServiceRequestResetMs > rearmInterval) {
+            // QA-FIX (reason=2) : le re-arm complet (clear→add→discover) est la
+            // chaîne la plus exposée aux collisions BUSY — ne jamais la lancer
+            // par-dessus une chaîne déjà en cours (fullServiceRecovery ou un
+            // précédent restartServiceDiscovery pas encore terminé).
+            if (!canStartDiscoveryChain()) {
+                logToJs("DNS-SD", "re-arm complet reporté (chaîne récente en cours) — discoverServices seul")
+                discoverServicesOnly()
+                return
+            }
             lastServiceRequestResetMs = now
             try {
                 wifiP2pManager.clearServiceRequests(wifiP2pChannel, object : WifiP2pManager.ActionListener {
@@ -1931,6 +2007,7 @@ class MainActivity : FragmentActivity() {
                     override fun onFailure(reason: Int) { addServiceRequestAndDiscover() }
                 })
             } catch (e: Exception) {
+                logToJs("DNS-SD", "restartServiceDiscovery exception: ${e.message}")
                 Log.e(TAG, "restartServiceDiscovery: ${e.message}")
             }
         } else {
@@ -1946,9 +2023,17 @@ class MainActivity : FragmentActivity() {
                 override fun onFailure(reason: Int) {
                     logToJs("DNS-SD", "addServiceRequest ÉCHEC reason=$reason")
                     lastServiceRequestResetMs = 0  // re-arm complet au prochain cycle
+                    // QA-FIX (reason=2) : ce callback ne comptait PAS pour le filet
+                    // de sécurité (recreateP2pChannel après 6 échecs consécutifs) —
+                    // trou confirmé en analysant un blocage réel de 25 minutes en
+                    // test terrain où c'est justement CET appel qui échouait en
+                    // boucle (reason=2/BUSY) sans jamais déclencher la recréation
+                    // du channel.
+                    noteP2pError()
                 }
             })
         } catch (e: Exception) {
+            logToJs("DNS-SD", "addServiceRequestAndDiscover exception: ${e.message}")
             Log.e(TAG, "addServiceRequestAndDiscover: ${e.message}")
         }
     }

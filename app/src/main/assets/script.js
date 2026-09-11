@@ -725,6 +725,46 @@ function loadIncidentsOnMap() {
     }).catch(function () {});
 }
 
+/* Lissage du tracking (analyse terrain) : le canal WiFi Direct coupe et
+   reprend souvent — les positions en attente sont livrées d'un coup à la
+   reconnexion (plusieurs MARSEL_POSITION_UPDATE en quelques dizaines de ms).
+   Sans animation, le marqueur d'un proche "téléportait" d'un point à l'autre,
+   donnant l'impression que le tracking ne fonctionnait pas. Ici, chaque
+   nouvelle position glisse depuis la position ACTUELLEMENT AFFICHÉE (même en
+   cours d'animation) vers la nouvelle — une salve de positions se traduit
+   donc par un seul glissement fluide vers le dernier point, jamais un saut. */
+function animateMarkerTo(marker, lat, lng, durationMs) {
+    if (!marker) return;
+    var start = marker.getLatLng();
+    var fromLat = start.lat, fromLng = start.lng;
+    if (marker._marselAnimFrame) {
+        try { cancelAnimationFrame(marker._marselAnimFrame); } catch (e) {}
+        marker._marselAnimFrame = null;
+    }
+    if (!window.requestAnimationFrame) {
+        marker.setLatLng([lat, lng]); // repli navigateur sans rAF (jamais en pratique en WebView Android)
+        return;
+    }
+    // QA-FIX : startTs est fixé au PREMIER tick avec l'horloge que rAF fournit
+    // lui-même (jamais mélangée avec Date.now()/performance.now() calculée à
+    // part — un décalage d'origine entre les deux ferait extrapoler t bien
+    // en dehors de [0,1] et l'animation ne convergerait jamais).
+    var startTs = null;
+    function step(now) {
+        if (startTs === null) startTs = now;
+        var t = Math.min(1, (now - startTs) / durationMs);
+        var curLat = fromLat + (lat - fromLat) * t;
+        var curLng = fromLng + (lng - fromLng) * t;
+        try { marker.setLatLng([curLat, curLng]); } catch (e) {}
+        if (t < 1) {
+            marker._marselAnimFrame = requestAnimationFrame(step);
+        } else {
+            marker._marselAnimFrame = null;
+        }
+    }
+    marker._marselAnimFrame = requestAnimationFrame(step);
+}
+
 function addIncidentMarker(ev) {
     if (!MARSEL.leafletMap) return;
     if (!ev || !isFinite(ev.lat) || !isFinite(ev.lng)) return; // jamais de marqueur sans vraie position
@@ -1900,13 +1940,19 @@ function handlePositionUpdate(data) {
     var _d = new Date(data.timestamp || Date.now());
     var timeStr = _d.toLocaleTimeString('fr-FR', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
     var dateStr = _d.toLocaleDateString('fr-FR', { day: '2-digit', month: '2-digit', year: 'numeric' });
+    // Lissage (analyse terrain) : si la position date de plus de 20s (liaison
+    // WiFi Direct coupée puis rattrapage par salve à la reconnexion), le
+    // signaler dans le popup — sinon le tracking semble "en panne" alors
+    // qu'il rattrape juste un retard réseau.
+    var ageMs = Date.now() - (data.timestamp || Date.now());
+    var staleNote = ageMs > 20000 ? '<br><i>Position reçue avec retard (liaison instable)</i>' : '';
 
     // Mettre à jour le marqueur existant
     if (MARSEL.incidentMarkers[eId] && MARSEL.leafletMap) {
-        MARSEL.incidentMarkers[eId].setLatLng([fLat, fLng]);
+        animateMarkerTo(MARSEL.incidentMarkers[eId], fLat, fLng, 700);
         MARSEL.incidentMarkers[eId].setPopupContent(
             '<b>🚨 ' + escapeHtml(data.pseudo || 'Utilisateur') + '</b><br>' +
-            'Tracking actif – ' + dateStr + ' ' + timeStr
+            'Tracking actif – ' + dateStr + ' ' + timeStr + staleNote
         );
     } else if (MARSEL.leafletMap) {
         // Première réception pour cet emergency : créer le marqueur
@@ -1940,7 +1986,15 @@ function handleEmergencyResolved(data) {
 
     // Supprimer le marqueur de la carte
     if (MARSEL.incidentMarkers[eId] && MARSEL.leafletMap) {
-        try { MARSEL.leafletMap.removeLayer(MARSEL.incidentMarkers[eId]); } catch (e) {}
+        // QA-FIX : annuler une éventuelle animation de tracking en cours
+        // (animateMarkerTo) — sinon la boucle requestAnimationFrame continue
+        // jusqu'à 700ms sur un marqueur déjà détaché de la carte.
+        var _marker = MARSEL.incidentMarkers[eId];
+        if (_marker._marselAnimFrame) {
+            try { cancelAnimationFrame(_marker._marselAnimFrame); } catch (e) {}
+            _marker._marselAnimFrame = null;
+        }
+        try { MARSEL.leafletMap.removeLayer(_marker); } catch (e) {}
         delete MARSEL.incidentMarkers[eId];
     }
 
