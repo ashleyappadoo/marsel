@@ -2373,8 +2373,15 @@ function openContactDetail(idx) {
 
     el = document.getElementById('contact-pseudo');
     if (el) {
-        var userData = JSON.parse(secureGet('marsel_user') || '{}');
-        el.value = c.pseudo || userData.pseudo || 'Marsel';
+        // QA-FIX : ce champ représente le pseudo MARSEL DU PROCHE (s'il est
+        // lui-même utilisateur), jamais le nôtre — retomber sur son propre
+        // userData.pseudo était trompeur (le proche se retrouvait enregistré
+        // avec le pseudo du titulaire du téléphone). Vide tant qu'inconnu ;
+        // aucun mécanisme ne le remplit encore automatiquement aujourd'hui
+        // (pas d'annuaire pseudo<->numéro — cf. TODO.md, reconnaissance du
+        // proche non résolue), donc ce champ reste à saisir à la main pour
+        // l'instant si le proche a communiqué son pseudo.
+        el.value = c.pseudo || '';
     }
 
     showScreen('screen-contact-detail');
