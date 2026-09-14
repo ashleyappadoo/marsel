@@ -1,0 +1,63 @@
+name: Build Marsel executive summary Word document
+
+on:
+  push:
+    branches:
+      - docs/executive-summary-pro-event
+    paths:
+      - tools/generate_executive_summary_docx.py
+      - .github/workflows/build-executive-summary-docx.yml
+
+permissions:
+  contents: write
+
+jobs:
+  build-docx:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out documentation branch
+        uses: actions/checkout@v4
+        with:
+          ref: docs/executive-summary-pro-event
+          fetch-depth: 0
+
+      - name: Generate native Word document
+        run: python3 tools/generate_executive_summary_docx.py
+
+      - name: Validate Office Open XML package
+        run: |
+          unzip -t docs/Marsel-Pro-Event-Executive-Summary-Business-Developer.docx
+          python3 - <<'PY'
+          from zipfile import ZipFile
+          from xml.etree import ElementTree as ET
+          path = "docs/Marsel-Pro-Event-Executive-Summary-Business-Developer.docx"
+          required = {
+              "[Content_Types].xml",
+              "_rels/.rels",
+              "word/document.xml",
+              "word/styles.xml",
+              "word/numbering.xml",
+              "word/footer1.xml",
+              "word/_rels/document.xml.rels",
+          }
+          with ZipFile(path) as z:
+              names = set(z.namelist())
+              missing = required - names
+              if missing:
+                  raise SystemExit(f"Missing DOCX parts: {sorted(missing)}")
+              for name in [n for n in names if n.endswith(".xml")]:
+                  ET.fromstring(z.read(name))
+          print("DOCX package and XML validation passed")
+          PY
+
+      - name: Commit generated Word document
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/Marsel-Pro-Event-Executive-Summary-Business-Developer.docx
+          if git diff --cached --quiet; then
+            echo "Word document already up to date"
+          else
+            git commit -m "docs: generate native Marsel Pro Event Word summary"
+            git push origin HEAD:docs/executive-summary-pro-event
+          fi
