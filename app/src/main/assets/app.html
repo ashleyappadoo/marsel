@@ -21,19 +21,6 @@
       flex-shrink: 0;
       z-index: 10;
     }
-    .mode-toggle-btn {
-      background: #1A35C8;
-      color: white;
-      border: none;
-      border-radius: 20px;
-      padding: 6px 18px;
-      font-family: 'Nunito', sans-serif;
-      font-weight: 700;
-      font-size: 13px;
-      cursor: pointer;
-      transition: background 0.2s;
-    }
-    .mode-toggle-btn.assistance { background: #E84315; }
     /* Bouton de recentrage sur la position réelle (au-dessus de la carte) */
     .map-recenter-btn {
       position: absolute;
@@ -225,12 +212,9 @@
 
 <!-- ===================== SCREEN 3: HOME ===================== -->
 <div id="screen-home" class="screen">
-  <!-- Mode bar (network badge + mode toggle) -->
+  <!-- Barre réseau (mode Autonomie/Assistance retiré — plus de bouton de bascule) -->
   <div class="mode-bar">
     <span class="network-badge" id="network-badge" style="position:static;padding:4px 10px;font-size:12px;border-radius:12px;">WiFi</span>
-    <button class="mode-toggle-btn" id="mode-toggle-btn" onclick="toggleMode()">
-      <span id="mode-label">Autonome</span>
-    </button>
   </div>
 
   <!-- Settings button -->
@@ -347,13 +331,37 @@
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#E84315" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
     </div>
 
-    <div class="menu-card" onclick="showScreen('screen-subscription')">
+    <!-- Abonnement retiré (version bêta) — remplacé par Feedback. -->
+    <div class="menu-card" onclick="showScreen('screen-feedback')">
       <div class="menu-card-left">
         <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#1A35C8" stroke-width="2">
-          <rect x="1" y="4" width="22" height="16" rx="2" ry="2"/>
-          <line x1="1" y1="10" x2="23" y2="10"/>
+          <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/>
         </svg>
-        <span class="menu-card-title">Abonnement</span>
+        <span class="menu-card-title">Feedback</span>
+      </div>
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#E84315" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
+    </div>
+
+    <div class="menu-card" onclick="openMarselSocial()">
+      <div class="menu-card-left">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#1A35C8" stroke-width="2">
+          <rect x="2" y="2" width="20" height="20" rx="5" ry="5"/>
+          <path d="M16 11.37A4 4 0 1 1 12.63 8 4 4 0 0 1 16 11.37z"/>
+          <line x1="17.5" y1="6.5" x2="17.51" y2="6.5"/>
+        </svg>
+        <span class="menu-card-title">Réseaux sociaux</span>
+      </div>
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#E84315" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
+    </div>
+
+    <div class="menu-card" onclick="openMarselWebsite()">
+      <div class="menu-card-left">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#1A35C8" stroke-width="2">
+          <circle cx="12" cy="12" r="10"/>
+          <line x1="2" y1="12" x2="22" y2="12"/>
+          <path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/>
+        </svg>
+        <span class="menu-card-title">marselapp.com</span>
       </div>
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#E84315" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
     </div>
@@ -567,8 +575,9 @@
   </div>
 </div>
 
-<!-- ===================== SCREEN 9: SUBSCRIPTION ===================== -->
-<div id="screen-subscription" class="screen">
+<!-- ===================== SCREEN 9: FEEDBACK (bêta) ===================== -->
+<!-- Remplace l'écran Abonnement (retiré pour la bêta publique). -->
+<div id="screen-feedback" class="screen">
   <div class="screen-header">
     <button class="back-btn orange" onclick="goBack()" aria-label="Retour">
       <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#E84315" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
@@ -576,132 +585,35 @@
         <path d="M20 20v-7a4 4 0 0 0-4-4H4"/>
       </svg>
     </button>
-    <h2 class="screen-title blue">Abonnement</h2>
+    <h2 class="screen-title blue">Feedback bêta</h2>
     <div style="width:40px;"></div>
   </div>
 
-  <div class="screen-body" style="overflow-y:auto; padding-bottom: 120px;">
-    <!-- Plan cards (horizontal scroll) -->
-    <div class="plan-scroll-wrapper">
-      <div class="plan-cards" id="plan-cards">
-        <!-- Card 1: Autonomie -->
-        <div class="plan-card selected" data-plan="0" onclick="selectPlan(0)">
-          <div class="plan-icon blue-circle">
-            <svg width="28" height="28" viewBox="0 0 24 24" fill="#1A35C8">
-              <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
-              <circle cx="12" cy="7" r="4"/>
-            </svg>
-          </div>
-          <div class="plan-name">Autonomie</div>
-          <div class="plan-price">€0 <span class="plan-period">/ mois</span></div>
-        </div>
-        <!-- Card 2: Autonomie+ -->
-        <div class="plan-card orange-card" data-plan="1" onclick="selectPlan(1)">
-          <div class="plan-icon orange-circle">
-            <svg width="28" height="28" viewBox="0 0 24 24" fill="white">
-              <path d="M10.29 3.86L1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/>
-              <line x1="12" y1="9" x2="12" y2="13"/>
-              <line x1="12" y1="17" x2="12.01" y2="17"/>
-            </svg>
-          </div>
-          <div class="plan-name white-text">Autonomie +</div>
-          <div class="plan-price white-text">€5 <span class="plan-period">/ mois</span></div>
-        </div>
-        <!-- Card 3: Assistance event -->
-        <div class="plan-card" data-plan="2" onclick="selectPlan(2)">
-          <div class="plan-icon grey-circle">
-            <svg width="28" height="28" viewBox="0 0 24 24" fill="#1A35C8">
-              <path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"/>
-              <circle cx="12" cy="7" r="4"/>
-            </svg>
-          </div>
-          <div class="plan-name">Assistance event</div>
-          <div class="plan-price">€15 <span class="plan-period">/ mois</span></div>
-        </div>
-      </div>
+  <div class="screen-body" style="overflow-y:auto;">
+    <p class="sub-legal-text" style="margin-bottom:16px;">
+      Merci de tester Marsel ! Votre avis nous aide à améliorer l'app pendant
+      cette phase bêta. Les journaux techniques de votre session en cours
+      seront joints automatiquement pour nous aider à comprendre le contexte.
+    </p>
+    <div class="field-group">
+      <label class="field-label blue">Nom</label>
+      <input type="text" id="feedback-nom" class="field-input editable" placeholder="Votre nom" />
     </div>
-
-    <!-- Dots -->
-    <div class="plan-dots">
-      <span class="plan-dot active" data-dot="0"></span>
-      <span class="plan-dot" data-dot="1"></span>
-      <span class="plan-dot" data-dot="2"></span>
+    <div class="field-group">
+      <label class="field-label blue">Prénom</label>
+      <input type="text" id="feedback-prenom" class="field-input editable" placeholder="Votre prénom" />
     </div>
-
-    <!-- Features table -->
-    <div class="features-section-header">Fonctionnalités</div>
-    <div class="features-table">
-      <div class="features-header-row">
-        <div class="features-label-col"></div>
-        <div class="features-plan-col blue-text">Auto</div>
-        <div class="features-plan-col blue-text">Auto+</div>
-        <div class="features-plan-col blue-text">Assist</div>
-      </div>
-      <div class="features-row">
-        <div class="features-label">Alerte d'urgence Marsel</div>
-        <div class="features-val check">✓</div>
-        <div class="features-val check">✓</div>
-        <div class="features-val check">✓</div>
-      </div>
-      <div class="features-row">
-        <div class="features-label">Notification aux proches</div>
-        <div class="features-val check">✓</div>
-        <div class="features-val check">✓</div>
-        <div class="features-val check">✓</div>
-      </div>
-      <div class="features-row">
-        <div class="features-label">Affichage Safe Places</div>
-        <div class="features-val check">✓</div>
-        <div class="features-val check">✓</div>
-        <div class="features-val check">✓</div>
-      </div>
-      <div class="features-row">
-        <div class="features-label">Marsel Auto Network <span class="info-badge">ⓘ</span></div>
-        <div class="features-val check">✓</div>
-        <div class="features-val check">✓</div>
-        <div class="features-val check">✓</div>
-      </div>
-      <div class="features-row">
-        <div class="features-label">Tracking Alerte d'urgence</div>
-        <div class="features-val dash">–</div>
-        <div class="features-val check">✓</div>
-        <div class="features-val check">✓</div>
-      </div>
-      <div class="features-row">
-        <div class="features-label">Notification aux alentours</div>
-        <div class="features-val dash">–</div>
-        <div class="features-val check">✓</div>
-        <div class="features-val check">✓</div>
-      </div>
-      <div class="features-row">
-        <div class="features-label">Chat proxy</div>
-        <div class="features-val dash">–</div>
-        <div class="features-val check">✓</div>
-        <div class="features-val check">✓</div>
-      </div>
-      <div class="features-row">
-        <div class="features-label">Localisation des proches</div>
-        <div class="features-val dash">–</div>
-        <div class="features-val check">✓</div>
-        <div class="features-val check">✓</div>
-      </div>
-      <div class="features-row">
-        <div class="features-label">Marsel Relay Network <span class="info-badge">ⓘ</span></div>
-        <div class="features-val dash">–</div>
-        <div class="features-val dash">–</div>
-        <div class="features-val check">✓</div>
-      </div>
-      <div class="features-row">
-        <div class="features-label">Assistance sécurité <span class="info-badge">ⓘ</span></div>
-        <div class="features-val dash">–</div>
-        <div class="features-val dash">–</div>
-        <div class="features-val check">✓</div>
-      </div>
+    <div class="field-group">
+      <label class="field-label blue">Email</label>
+      <input type="email" id="feedback-email" class="field-input editable" placeholder="email@example.com" />
     </div>
-
-    <p class="sub-legal-text">By joining, you agree to our privacy policy and term of service</p>
-    <button class="btn-primary full-width" style="margin-top:12px;">Commencez l'aventure</button>
-    <p class="sub-cancel-text">Cancel anytime</p>
+    <div class="field-group">
+      <label class="field-label blue">Votre avis</label>
+      <textarea id="feedback-avis" class="field-input editable" rows="6"
+        style="resize:vertical; min-height:120px; font-family:'Nunito',sans-serif;"
+        placeholder="Décrivez ce que vous avez observé, un bug, une suggestion..."></textarea>
+    </div>
+    <button class="btn-primary full-width orange-btn" style="margin-top:8px;" onclick="sendFeedback()">Envoyer</button>
   </div>
 </div>
 

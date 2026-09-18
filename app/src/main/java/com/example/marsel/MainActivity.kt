@@ -2396,6 +2396,57 @@ class MainActivity : FragmentActivity() {
     }
 
     // =========================================================================
+    // Feedback bêta — envoi par email via l'app mail de l'utilisateur
+    // =========================================================================
+    // Pas de backend/SMTP : on prépare un brouillon complet (destinataire,
+    // sujet, corps, pièce jointe) dans l'app mail déjà installée, cohérent
+    // avec le choix "aucun serveur Marsel" du reste de l'app. L'utilisateur
+    // garde la main pour l'envoi final.
+    private fun sendFeedbackEmailInternal(nom: String, prenom: String, email: String, avis: String, logText: String) {
+        try {
+            val dateStr = java.text.SimpleDateFormat("dd-MM-yyyy", java.util.Locale.FRANCE).format(java.util.Date())
+            val subject = "Marsel Feedback_${dateStr}_$nom"
+            val body = buildString {
+                append("Nom : ").append(nom).append('\n')
+                append("Prénom : ").append(prenom).append('\n')
+                append("Email : ").append(email).append("\n\n")
+                append("Avis :\n").append(avis)
+            }
+
+            // Fichier de logs joint (cf. res/xml/file_paths.xml — seul ce
+            // sous-dossier du cache est exposé via FileProvider).
+            val feedbackDir = File(cacheDir, "feedback").apply { mkdirs() }
+            // QA-FIX : purger les pièces jointes des envois précédents avant
+            // d'en écrire une nouvelle — sans ça, chaque feedback envoyé
+            // pendant la bêta laissait un fichier orphelin dans le cache,
+            // jamais nettoyé.
+            feedbackDir.listFiles()?.forEach { it.delete() }
+            val logFile = File(feedbackDir, "marsel_logs_${System.currentTimeMillis()}.txt")
+            logFile.writeText(logText)
+            val logUri = androidx.core.content.FileProvider.getUriForFile(
+                this, "$packageName.fileprovider", logFile
+            )
+
+            val intent = Intent(Intent.ACTION_SEND).apply {
+                type = "text/plain"
+                putExtra(Intent.EXTRA_EMAIL, arrayOf("ona.action@gmail.com"))
+                putExtra(Intent.EXTRA_SUBJECT, subject)
+                putExtra(Intent.EXTRA_TEXT, body)
+                putExtra(Intent.EXTRA_STREAM, logUri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            startActivity(Intent.createChooser(intent, "Envoyer le feedback via..."))
+            showNotificationDirect("Marsel", "Merci pour votre retour !")
+        } catch (e: Exception) {
+            Log.e(TAG, "sendFeedbackEmailInternal: ${e.message}")
+            webView.evaluateJavascript(
+                "window.showToast && window.showToast('Impossible de préparer l\\'email')",
+                null
+            )
+        }
+    }
+
+    // =========================================================================
     // Enregistrement audio (Section 5) — emplacement pérenne + segments 5 min
     // =========================================================================
     // Doit tourner sur le main thread (setOnInfoListener + rotation).
@@ -2814,6 +2865,26 @@ class MainActivity : FragmentActivity() {
                 } catch (e: Exception) {
                     Log.e(TAG, "pickContact launch failed: ${e.message}")
                     webView.evaluateJavascript("window.onContactPicked && window.onContactPicked(null)", null)
+                }
+            }
+        }
+
+        // -----------------------------------------------------------------------
+        // Feedback bêta + liens externes (préparation bêta publique)
+        // -----------------------------------------------------------------------
+
+        @JavascriptInterface
+        fun sendFeedbackEmail(nom: String, prenom: String, email: String, avis: String, logText: String) {
+            runOnUiThread { sendFeedbackEmailInternal(nom, prenom, email, avis, logText) }
+        }
+
+        @JavascriptInterface
+        fun openExternalUrl(url: String) {
+            runOnUiThread {
+                try {
+                    startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                } catch (e: Exception) {
+                    Log.e(TAG, "openExternalUrl($url) failed: ${e.message}")
                 }
             }
         }

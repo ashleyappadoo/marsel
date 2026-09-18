@@ -67,6 +67,20 @@
 
         </activity>
 
+        <!-- Feedback bêta (TODO/demande utilisateur) : nécessaire pour joindre
+             le fichier de logs à l'email de feedback — un intent ACTION_SEND
+             vers une autre app (client mail) exige une URI content://, un
+             chemin file:// direct est refusé (FileUriExposedException, API 24+). -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.fileprovider"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
+
     </application>
 
 </manifest>

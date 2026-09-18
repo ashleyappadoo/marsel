@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Feedback bêta : expose UNIQUEMENT le sous-dossier cache/feedback (les
+     logs texte générés pour l'email de feedback) via FileProvider — aucun
+     autre répertoire de l'app n'est partagé. -->
+<paths xmlns:android="http://schemas.android.com/apk/res/android">
+    <cache-path name="feedback_logs" path="feedback/" />
+</paths>

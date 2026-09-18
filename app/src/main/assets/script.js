@@ -111,9 +111,6 @@ var MARSEL = {
     processedMessageIds: {},   // id → true  (Set replacement for ES5)
     resolvedEmergencies: {},   // emergencyId → true — plus jamais de marqueur/notif pour elles
 
-    // Mode
-    mode: 'autonome',          // 'autonome' | 'assistance'
-
     // Navigation
     screenHistory: [],
 
@@ -911,46 +908,6 @@ function updateNetworkBadge(override) {
 }
 
 /* ---------------------------------------------------------
-   MODE TOGGLE
-   --------------------------------------------------------- */
-function setMode(mode) {
-    MARSEL.mode = mode;
-    localStorage.setItem('marsel_mode', mode);
-
-    var modeLabel = document.getElementById('mode-label');
-    var modeBtn = document.getElementById('mode-toggle-btn');
-
-    if (modeLabel) {
-        modeLabel.textContent = mode === 'autonome' ? 'Autonome' : 'Assistance';
-    }
-    if (modeBtn) {
-        if (mode === 'assistance') {
-            modeBtn.classList.add('assistance');
-        } else {
-            modeBtn.classList.remove('assistance');
-        }
-    }
-
-    // Show chat FAB in assistance mode always; in autonome only when emergency active
-    var chatFab = document.getElementById('chat-fab');
-    if (chatFab) {
-        if (mode === 'assistance' || MARSEL.emergencyActive) {
-            chatFab.style.display = 'flex';
-            chatFab.classList.add('visible');
-        } else {
-            chatFab.style.display = 'none';
-            chatFab.classList.remove('visible');
-        }
-    }
-}
-
-function toggleMode() {
-    var newMode = MARSEL.mode === 'autonome' ? 'assistance' : 'autonome';
-    setMode(newMode);
-    showToast('Mode ' + (newMode === 'autonome' ? 'Autonome' : 'Assistance') + ' activé');
-}
-
-/* ---------------------------------------------------------
    EMERGENCY SYSTEM
    --------------------------------------------------------- */
 function startEmergencyHold(e) {
@@ -1055,7 +1012,6 @@ function activateEmergency() {
         lng: pos ? pos.lng : null,
         timestamp: Date.now(),
         contacts: contacts,
-        mode: MARSEL.mode,
         hopCount: 0,
         maxHops: (window.MARSEL_CONFIG && MARSEL_CONFIG.RELAY_HOP_LIMIT) || 5,
         status: 'ACTIVE',
@@ -1218,15 +1174,12 @@ function updateEmergencyUI() {
             label.textContent = 'Activation Marsel';
             label.classList.remove('visible');
         }
-        // Chat FAB: visible only in assistance mode
+        // QA-FIX (retrait du mode Autonomie/Assistance) : le chat FAB n'a
+        // plus qu'un seul déclencheur — une alerte active (géré dans la
+        // branche if ci-dessus). Hors alerte, toujours masqué.
         if (chatFab) {
-            if (MARSEL.mode === 'assistance') {
-                chatFab.style.display = 'flex';
-                chatFab.classList.add('visible');
-            } else {
-                chatFab.style.display = 'none';
-                chatFab.classList.remove('visible');
-            }
+            chatFab.style.display = 'none';
+            chatFab.classList.remove('visible');
         }
         if (inner) {
             inner.innerHTML = [
@@ -2488,61 +2441,64 @@ function saveContact() {
 }
 
 /* ---------------------------------------------------------
-   SUBSCRIPTION
+   FEEDBACK BÊTA + LIENS EXTERNES
    --------------------------------------------------------- */
-var selectedPlan = 0;
-
-function selectPlan(planIdx) {
-    selectedPlan = planIdx;
-    localStorage.setItem('marsel_plan', String(planIdx));
-    updatePlanSelection();
+function resetFeedbackForm() {
+    ['feedback-nom', 'feedback-prenom', 'feedback-email', 'feedback-avis'].forEach(function (id) {
+        var el = document.getElementById(id);
+        if (el) el.value = '';
+    });
 }
 
-function updatePlanSelection() {
-    selectedPlan = parseInt(localStorage.getItem('marsel_plan') || '0', 10);
+function sendFeedback() {
+    var nom = ((document.getElementById('feedback-nom') || {}).value || '').trim();
+    var prenom = ((document.getElementById('feedback-prenom') || {}).value || '').trim();
+    var email = ((document.getElementById('feedback-email') || {}).value || '').trim();
+    var avis = ((document.getElementById('feedback-avis') || {}).value || '').trim();
 
-    var cards = document.querySelectorAll('.plan-card');
-    var dots = document.querySelectorAll('.plan-dot');
-
-    for (var i = 0; i < cards.length; i++) {
-        // Don't touch the always-orange card (index 1)
-        if (i !== 1) {
-            if (i === selectedPlan) {
-                cards[i].classList.add('selected');
-            } else {
-                cards[i].classList.remove('selected');
-            }
-        }
+    if (!nom || !prenom || !email || !avis) {
+        showToast('Veuillez remplir tous les champs');
+        return;
     }
 
-    for (var j = 0; j < dots.length; j++) {
-        if (j === selectedPlan) {
-            dots[j].classList.add('active');
+    // Logs de la session en cours, même format que marselCopyLog() — joints
+    // en pièce jointe pour donner le contexte technique du retour bêta.
+    var logText = _marselLogEntries.map(function (e) {
+        return '[' + e.ts + '] [' + e.src + '][' + e.tag + '] ' + e.msg;
+    }).join('\n');
+
+    try {
+        if (window.AndroidBridge && typeof AndroidBridge.sendFeedbackEmail === 'function') {
+            AndroidBridge.sendFeedbackEmail(nom, prenom, email, avis, logText);
         } else {
-            dots[j].classList.remove('active');
+            showToast('Envoi indisponible sur cet appareil');
+            return;
         }
+    } catch (e) {
+        showToast('Erreur lors de la préparation du mail');
+        return;
     }
-
-    // Attach scroll listener once
-    var wrapper = document.querySelector('.plan-scroll-wrapper');
-    if (wrapper && !wrapper._scrollBound) {
-        wrapper.addEventListener('scroll', onPlanScroll, { passive: true });
-        wrapper._scrollBound = true;
-    }
+    goBack();
 }
 
-function onPlanScroll(e) {
-    var wrapper = e.target;
-    var scrollLeft = wrapper.scrollLeft;
-    var cardWidth = 214; // 200px card + 14px gap
-    var idx = Math.round(scrollLeft / cardWidth);
-    idx = Math.max(0, Math.min(2, idx));
+/* Réseaux sociaux + site web : toujours ouverts via une app externe/le
+   navigateur (AndroidBridge.openExternalUrl), jamais chargés dans la
+   WebView elle-même — un lien direct la ferait quitter app.html et
+   perdrait tout l'état JS de la session. */
+function openMarselSocial() {
+    try {
+        if (window.AndroidBridge && typeof AndroidBridge.openExternalUrl === 'function') {
+            AndroidBridge.openExternalUrl('https://www.instagram.com/marsel_app/');
+        }
+    } catch (e) {}
+}
 
-    var dots = document.querySelectorAll('.plan-dot');
-    for (var i = 0; i < dots.length; i++) {
-        if (i === idx) dots[i].classList.add('active');
-        else dots[i].classList.remove('active');
-    }
+function openMarselWebsite() {
+    try {
+        if (window.AndroidBridge && typeof AndroidBridge.openExternalUrl === 'function') {
+            AndroidBridge.openExternalUrl('https://marselapp.com');
+        }
+    } catch (e) {}
 }
 
 /* ---------------------------------------------------------
@@ -2578,7 +2534,6 @@ function showScreen(id, isBack) {
     // Screen-specific initialisation
     if (id === 'screen-home') {
         updateNetworkBadge();
-        setMode(MARSEL.mode); // re-apply mode UI
         setTimeout(function () { initMap(); }, 200);
         updateEmergencyUI();
         updateProfileMenu();
@@ -2600,8 +2555,8 @@ function showScreen(id, isBack) {
     if (id === 'screen-messaging') {
         renderChatMessages();
     }
-    if (id === 'screen-subscription') {
-        updatePlanSelection();
+    if (id === 'screen-feedback') {
+        resetFeedbackForm();
     }
 }
 
@@ -2634,7 +2589,6 @@ function goBack() {
         updateNetworkBadge();
         updateEmergencyUI();
         updateProfileMenu();
-        setMode(MARSEL.mode);
     }
     if (prev === 'screen-profile-menu') {
         updateProfileMenu();
@@ -2888,8 +2842,6 @@ document.addEventListener('DOMContentLoaded', function () {
         console.warn('DB init failed:', e);
     });
 
-    // 2. Load persisted mode
-    MARSEL.mode = localStorage.getItem('marsel_mode') || 'autonome';
 
     // 3. Check if emergency was active when app was killed
     var savedEmergency = null;
