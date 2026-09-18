@@ -19,6 +19,16 @@ jobs:
 
       - name: Set up Android SDK
         uses: android-actions/setup-android@v3
+        with:
+          # QA-FIX (CI cassée sur toute la plateforme, pas lié à ce commit) :
+          # le "packages" par défaut de cette action inclut le paquet SDK
+          # "tools", retiré du dépôt Google (legacy, remplacé par
+          # cmdline-tools) — sdkmanager échoue désormais avec "Failed to
+          # find package 'tools'" partout où cette action tourne sans
+          # override. platform-tools suffit : Gradle/AGP installe lui-même
+          # la plateforme et les build-tools dont il a besoin.
+          # cf. https://github.com/android-actions/setup-android/issues/537
+          packages: platform-tools
 
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
