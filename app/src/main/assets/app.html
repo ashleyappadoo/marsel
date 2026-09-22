@@ -207,6 +207,11 @@
         mot de passe est vérifié uniquement sur cet appareil.</p>
       <button class="btn-primary full-width" onclick="doRegister()">Créer mon accès</button>
     </div>
+
+    <!-- Visible quelle que soit la forme active (connexion ou création) -->
+    <button type="button" class="auth-howto-link" onclick="showScreen('screen-how-it-works')">
+      Comment fonctionne Marsel ?
+    </button>
   </div>
 </div>
 
@@ -509,6 +514,20 @@
         </label>
       </div>
     </div>
+
+    <!-- Section Aide -->
+    <h3 class="section-heading blue" style="margin-top:24px;">Aide</h3>
+    <div class="menu-card" onclick="showScreen('screen-how-it-works')">
+      <div class="menu-card-left">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#1A35C8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="10"/>
+          <path d="M9.09 9a3 3 0 0 1 5.83 1c0 2-3 2-3 4"/>
+          <line x1="12" y1="17" x2="12.01" y2="17"/>
+        </svg>
+        <span class="menu-card-title">Fonctionnement</span>
+      </div>
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#E84315" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
+    </div>
   </div>
 </div>
 
@@ -614,6 +633,64 @@
         placeholder="Décrivez ce que vous avez observé, un bug, une suggestion..."></textarea>
     </div>
     <button class="btn-primary full-width orange-btn" style="margin-top:8px;" onclick="sendFeedback()">Envoyer</button>
+  </div>
+</div>
+
+<!-- ===================== SCREEN: FONCTIONNEMENT ===================== -->
+<!-- Accessible depuis l'écran d'authentification (avant connexion) et
+     depuis Réglages > Aide (après connexion) — contenu 100% statique,
+     décrit uniquement des fonctionnalités réellement implémentées. -->
+<div id="screen-how-it-works" class="screen">
+  <div class="screen-header">
+    <button class="back-btn orange" onclick="goBack()" aria-label="Retour">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#E84315" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="9 14 4 9 9 4"/>
+        <path d="M20 20v-7a4 4 0 0 0-4-4H4"/>
+      </svg>
+    </button>
+    <h2 class="screen-title blue">Fonctionnement</h2>
+    <div style="width:40px;"></div>
+  </div>
+
+  <div class="screen-body" style="overflow-y:auto;">
+    <div class="howto-card">
+      <h3 class="howto-title">1. Ajoutez vos proches</h3>
+      <p class="howto-text">Avant toute urgence, enregistrez jusqu'à 5 proches de confiance avec leur numéro mobile (Réglages &gt; Ajout d'un proche). Ce sont eux qui recevront vos alertes.</p>
+    </div>
+
+    <div class="howto-card">
+      <h3 class="howto-title">2. Déclenchez l'urgence</h3>
+      <p class="howto-text">Sur l'écran d'accueil, maintenez le bouton <strong>S</strong> appuyé pendant 5 secondes. Votre position GPS est récupérée et une alerte est envoyée immédiatement à vos proches.</p>
+    </div>
+
+    <div class="howto-card">
+      <h3 class="howto-title">3. Comment l'alerte est transmise</h3>
+      <p class="howto-text">Avec du réseau (WiFi ou données mobiles), l'alerte part par SMS directement depuis votre carte SIM.</p>
+      <p class="howto-text" style="margin-top:10px;">Sans aucun réseau, Marsel utilise le <strong>Marsel Relay Network</strong> : les téléphones Marsel à proximité (50 à 100&nbsp;m environ) relaient automatiquement votre alerte de proche en proche, sans connexion internet. Pour que ce relais fonctionne, gardez le WiFi activé même sans connexion internet.</p>
+    </div>
+
+    <div class="howto-card">
+      <h3 class="howto-title">4. Suivi de votre position</h3>
+      <p class="howto-text">Vos proches reçoivent un lien de localisation par SMS au déclenchement de l'alerte, puis un dernier lien au moment où vous vous mettez en sécurité — ce ne sont pas des positions mises à jour en continu.</p>
+      <p class="howto-text" style="margin-top:10px;">En revanche, les téléphones Marsel à proximité (proches ou non) voient votre position se mettre à jour en temps réel sur leur carte tant que l'urgence est active, via le Marsel Relay Network.</p>
+    </div>
+
+    <div class="howto-card">
+      <h3 class="howto-title">5. Terminez l'alerte</h3>
+      <p class="howto-text">Une fois en sécurité, appuyez de nouveau sur le bouton <strong>S</strong> (« Alerte en cours – Appuyer pour annuler ») : un SMS est envoyé à vos proches pour les rassurer, et le suivi de position s'arrête.</p>
+    </div>
+
+    <div class="howto-card">
+      <h3 class="howto-title">Réglages utiles</h3>
+      <p class="howto-text">
+        Dans <strong>Réglages</strong>, vous pouvez activer :<br>
+        • la <strong>localisation</strong>, indispensable pour partager votre position avec vos proches ;<br>
+        • le <strong>flash LED discret</strong>, pour signaler votre position sans bruit ;<br>
+        • l'<strong>enregistrement audio discret</strong>, pour garder une trace de la situation.
+      </p>
+    </div>
+
+    <p class="sub-legal-text">Version bêta — un souci, une idée ? Utilisez le bouton Feedback dans les Réglages pour nous écrire.</p>
   </div>
 </div>
 

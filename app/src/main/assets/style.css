@@ -198,6 +198,22 @@ body {
   -webkit-overflow-scrolling: touch;
 }
 
+.auth-howto-link {
+  display: block;
+  width: 100%;
+  margin-top: 18px;
+  padding: 4px;
+  background: none;
+  border: none;
+  font-family: 'Nunito', sans-serif;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--blue);
+  text-decoration: underline;
+  text-align: center;
+  cursor: pointer;
+}
+
 .auth-form {
   display: none;
   flex-direction: column;
@@ -940,6 +956,31 @@ body {
   text-align: center;
   margin-top: 16px;
   line-height: 1.5;
+}
+
+/* =========================================================
+   HOW IT WORKS SCREEN (Fonctionnement)
+   ========================================================= */
+
+.howto-card {
+  background: white;
+  border-radius: 16px;
+  padding: 16px 20px;
+  box-shadow: 0 1px 4px rgba(0,0,0,0.08);
+  margin-bottom: 14px;
+}
+
+.howto-title {
+  font-size: 15px;
+  font-weight: 800;
+  color: var(--blue);
+  margin-bottom: 6px;
+}
+
+.howto-text {
+  font-size: 13.5px;
+  color: var(--text-dark);
+  line-height: 1.6;
 }
 
 /* =========================================================
