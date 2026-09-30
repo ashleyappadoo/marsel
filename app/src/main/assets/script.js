@@ -2210,6 +2210,15 @@ function doRegister() {
 }
 
 function doLogout() {
+    // QA-FIX (audit sécurité, critique) : une urgence active ne doit jamais
+    // être abandonnée silencieusement à la déconnexion. Avant ce correctif,
+    // se déconnecter pendant une alerte laissait le flash et l'enregistrement
+    // audio actifs en arrière-plan, et n'informait ni les proches (pas de SMS
+    // de fin) ni les téléphones Marsel voisins (pas de paquet RESOLVED) que
+    // l'alerte était terminée.
+    if (MARSEL.emergencyActive) {
+        deactivateEmergency();
+    }
     MARSEL.emergencyActive = false;
     MARSEL.emergencyId = null;
     MARSEL.currentUser = null;
@@ -2562,7 +2571,18 @@ function showScreen(id, isBack) {
 
 function goBack() {
     if (MARSEL.screenHistory.length <= 1) {
-        if (!MARSEL.screenHistory.length || MARSEL.screenHistory[0] !== 'screen-home') {
+        var only = MARSEL.screenHistory[0];
+        // SÉCURITÉ (TODO.md §1.3) : l'écran de verrouillage ne doit JAMAIS
+        // être contourné par le bouton retour — un appui ici ne doit rien
+        // déverrouiller. Avant ce correctif, ce bloc retombait sur
+        // showScreen('screen-home', ...) sans aucune vérification de mot de
+        // passe/biométrie dès que l'historique ne contenait que
+        // 'screen-auth' (cas du tout premier écran après le splash ou après
+        // une déconnexion) — un simple appui sur "retour" ouvrait l'accueil.
+        if (only === 'screen-auth' || !only) {
+            return;
+        }
+        if (only !== 'screen-home') {
             showScreen('screen-home', true);
             MARSEL.screenHistory = ['screen-home'];
         }

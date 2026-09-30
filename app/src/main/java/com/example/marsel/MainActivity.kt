@@ -1060,12 +1060,15 @@ class MainActivity : FragmentActivity() {
                 )
             }
 
-            if (hopCount >= maxHops) {
-                logToJs("RELAY", "DROP $messageId: maxHops=$maxHops reached")
-                return
-            }
-
-            // Show system notification only for actual emergency (not position/resolved)
+            // QA-FIX (audit sécurité, critique) : la notification système et le
+            // SMS aux proches doivent s'exécuter AVANT le "return" du
+            // maxHops ci-dessous, jamais après — sinon le dernier maillon
+            // autorisé du relais (qui peut justement être le seul à avoir du
+            // réseau cellulaire, toute la raison d'être du mesh) ne prévenait
+            // personne : ni notification locale, ni SMS aux contacts déclarés.
+            // Seule la PROPAGATION plus loin dans le mesh doit s'arrêter au
+            // hop-count max, pas l'avertissement de l'utilisateur de CET
+            // appareil.
             if (msgType == MarselProtocol.TYPE_EMERGENCY) {
                 // ANONYMISATION (TODO.md §2) : la notification « alerte à
                 // proximité » est un affichage PUBLIC (tout utilisateur Marsel
@@ -1079,16 +1082,19 @@ class MainActivity : FragmentActivity() {
                 val alias = MarselProtocol.deriveAlertAlias(emergencyId)
                 logToJs("RELAY", "NOTIF: showing system notification for $alias")
                 showNotificationDirect("🚨 Alerte Marsel", "$alias a été déclenchée à proximité")
+
+                // SMS aux proches : uniquement pour une vraie alerte, avec dédup
+                // persistée smsHandled (F3) — le réseau est vérifié dans la fonction.
+                forwardEmergencyToContacts(json)
+            }
+
+            if (hopCount >= maxHops) {
+                logToJs("RELAY", "DROP $messageId: maxHops=$maxHops reached (no further propagation, but notification/SMS already sent above)")
+                return
             }
 
             val updatedJson = """"hopCount"\s*:\s*$hopCount""".toRegex()
                 .replace(json, "\"hopCount\":${hopCount + 1}")
-
-            // SMS aux proches : uniquement pour une vraie alerte, avec dédup
-            // persistée smsHandled (F3) — le réseau est vérifié dans la fonction.
-            if (msgType == MarselProtocol.TYPE_EMERGENCY) {
-                forwardEmergencyToContacts(json)
-            }
 
             // C4 : hop-forwarding — propriété EXCLUSIVE du Kotlin.
             // E et R sont re-diffusés en DNS-SD (instances distinctes, C3) pour

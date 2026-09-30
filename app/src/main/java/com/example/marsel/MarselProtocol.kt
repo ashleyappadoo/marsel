@@ -232,7 +232,13 @@ object MarselProtocol {
 
     // ── Décodage TXT record (map → paquet JSON complet) ─────────────────
     fun txtRecordToJson(record: Map<String, String?>, nowMs: Long): String? {
-        val msgId = record["i"] ?: return null
+        // QA-FIX (audit sécurité, critique) : "i" et "e" viennent d'un TXT
+        // record annoncé par un pair WiFi Direct NON authentifié — sans
+        // sanitizeTxtValue (déjà appliqué à "p" et à chaque numéro de "c"),
+        // un pair malveillant pouvait injecter des guillemets/antislash pour
+        // casser le gabarit JSON ci-dessous et forger d'autres champs
+        // (pseudo, lat/lng, hopCount...) lus ensuite via extractJsonString.
+        val msgId = sanitizeTxtValue(record["i"] ?: return null, 64)
         val shortType = record["y"] ?: return null
         val type = typeOfShort(shortType) ?: return null
         val pseudo = sanitizeTxtValue(record["p"] ?: "Utilisateur")
@@ -240,7 +246,7 @@ object MarselProtocol {
         val lng = record["o"]?.toDoubleOrNull() ?: return null
         val ts = record["s"]?.toLongOrNull() ?: nowMs
         val hop = record["h"]?.toIntOrNull() ?: 0
-        val emergencyId = record["e"] ?: msgId
+        val emergencyId = sanitizeTxtValue(record["e"] ?: msgId, 64)
         val audio = if (record["u"] == "1") "1" else "0"
         val relaySms = if (record["m"] == "1") "1" else "0"
 
