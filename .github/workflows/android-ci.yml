@@ -1,0 +1,45 @@
+name: Android CI
+
+on:
+  push:
+    branches: [ test/experimentation ]
+  pull_request:
+
+jobs:
+  unit-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+        with:
+          # QA-FIX (CI cassée sur toute la plateforme, pas lié à ce commit) :
+          # le "packages" par défaut de cette action inclut le paquet SDK
+          # "tools", retiré du dépôt Google (legacy, remplacé par
+          # cmdline-tools) — sdkmanager échoue désormais avec "Failed to
+          # find package 'tools'" partout où cette action tourne sans
+          # override. platform-tools suffit : Gradle/AGP installe lui-même
+          # la plateforme et les build-tools dont il a besoin.
+          # cf. https://github.com/android-actions/setup-android/issues/537
+          packages: platform-tools
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      # Tests unitaires purs du protocole MRN (Section 7)
+      - name: Run unit tests
+        run: ./gradlew testDebugUnitTest --stacktrace
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-report
+          path: app/build/reports/tests/testDebugUnitTest
