@@ -60,6 +60,89 @@ Le service doit couvrir **deux cas**, pas seulement l'émetteur :
    d'un service always-on, et consentement utilisateur explicite (opt-in) pour
    « prêter » son téléphone comme relais/point de sortie SMS.
 
+### Prérequis : file unique des opérations WiFi Direct (à faire EN PREMIER)
+
+Le ForegroundService va reprendre toute la pile WiFi P2P. C'est le moment
+de remplacer le système actuel d'anti-chevauchement, fragile, par une
+**file unique** : une seule opération `WifiP2pManager` à la fois, la
+suivante démarrée depuis le callback (`onSuccess` / `onFailure`) de la
+précédente.
+
+**Pourquoi (historique réel) :**
+- Plusieurs déclencheurs indépendants (cycle périodique `rediscoverRunnable`,
+  `PEERS_CHANGED`, `CONNECTION_CHANGED`, retour `STATE_CHANGED → ENABLED`,
+  watchdog `fullServiceRecovery`, permission accordée, canal recréé, envoi
+  d'une alerte) lancent chacun des appels sur le **même** canal.
+  Quand ils se chevauchent, le framework répond `reason=2` (BUSY) ou
+  `reason=3` (requête de service effacée en plein vol).
+- 1er correctif (debounce partagé de 3 s) : il a **causé une régression** vue
+  en test terrain (commit `ddf1e5d`). Le ré-enregistrement des services
+  prenait le jeton, la relance de découverte qui suit était toujours refusée,
+  et un voisin ne recevait plus jamais la fin d'alerte.
+- État actuel (`ddf1e5d`) : deux fenêtres de temps (chaîne 3 s, rafale 1,5 s),
+  deux `Runnable` différés, une remise à zéro manuelle aux 4 sites d'appel
+  (`invalidateInFlightP2pChains`) et un anti-boucle `reason=3` de 15 s.
+  Ça marche en lecture de code mais reste une **approximation par
+  chronomètre**, pas un vrai signal de fin d'opération. Chaque nouveau
+  déclencheur doit penser à toutes ces règles, ce qui est fragile.
+
+**Design visé :**
+1. `P2pOpQueue` (classe dédiée, testable en JVM pur comme `MarselProtocol`) :
+   - opérations typées : `ClearServiceRequests`, `AddServiceRequest`,
+     `DiscoverServices`, `AddLocalService(info)`, `RemoveLocalService(info)`,
+     `ClearLocalServices`, `Connect(device)`, `RequestPeers`,
+     `RequestConnectionInfo` ;
+   - **une seule opération en vol**, la suivante part du callback de la
+     précédente ;
+   - **timeout par opération** (≈ 5 s) : un callback qui n'arrive jamais ne
+     bloque pas la file. Un timeout compte comme un échec pour `noteP2pError()` ;
+   - **regroupement** : un « re-arm complet » (clear → add → discover)
+     demandé alors qu'un autre est déjà en file n'est pas ajouté deux fois.
+     Même règle pour « ré-enregistrer les services actifs » ;
+   - **priorité** : les opérations d'une alerte (enregistrer `E` / `R`)
+     passent devant un re-arm de routine ;
+   - **génération de canal** : à `onChannelLost` / `recreateP2pChannel`, la
+     file est vidée et les opérations en vol de l'ancien canal sont ignorées.
+2. Tous les appels directs à `wifiP2pManager.*` dans `MainActivity` passent
+   par la file. Plus aucun appel hors file.
+3. Supprimer ensuite les mécanismes devenus inutiles : `canStartDiscoveryChain`,
+   `lastDiscoveryChainMs` / `lastServiceBurstMs`, `deferredRearmRunnable` /
+   `deferredReRegisterRunnable`, `invalidateInFlightP2pChains`,
+   `lastNoRequestRearmMs`. ⚠️ Les retirer **dans le même commit** que la mise
+   en service de la file, pas avant.
+
+**Comportements à conserver tels quels (validés en terrain) :**
+- fin d'alerte de l'émetteur diffusée 5 min (`RESOLVED_BROADCAST_MS`) et
+  ré-enregistrée après chaque récupération (`activeResolvedRecord`) ;
+- ré-annonce anti-zombie (`reannounceResolvedIfOwned`) sur les deux canaux,
+  DNS-SD et socket ;
+- la purge de la file socket ne retire que les `E` / `P`
+  (`purgePendingForEmergency`) ; durée de vie de 10 min sur horloge monotone
+  (`purgeStalePendingMessages`) ;
+- fin d'alerte relayée gardée 10 min, comme l'alerte relayée ;
+- `noteP2pError()` → `recreateP2pChannel()` après 6 échecs consécutifs.
+
+**Points de l'audit complet réglés par la file (encore ouverts) :**
+- `connectToPeer()` (`PEERS_CHANGED`) est rappelé à chaque événement, sans
+  garde ni `noteP2pError()` sur échec. Risque : BUSY, et la fenêtre
+  d'invitation qui réapparaît chez le voisin ;
+- `requestPeers()` / `connect()` sans vérification de permission ni
+  try/catch : crash possible si la permission « appareils à proximité » est
+  retirée en cours de session ;
+- `onDestroy()` ne ferme pas le canal (`channel.close()`,
+  `clearLocalServices`) : canaux et services orphelins si l'Activity est
+  recréée.
+
+**Critères de validation (test terrain A/B, logs de l'overlay) :**
+- plus aucun `reason=2` ni `reason=3` en fonctionnement normal, y compris
+  pendant l'onboarding des permissions et les rebonds P2P Samsung ;
+- alerte reçue par B en moins de 15 s, positions suivies, **fin d'alerte
+  reçue par B et notification remplacée par « résolue »** ;
+- B hors de portée pendant la fin d'alerte puis de retour dans les 5 min :
+  B reçoit quand même la fin d'alerte (diffusion prolongée ou anti-zombie) ;
+- même scénario écran éteint / app en arrière-plan, une fois le service en
+  place.
+
 ## Confidentialité & sécurité des données — chantier différé
 
 Constat de l'audit du 22/07/2026 (auth actuelle + stockage) : l'absence de
