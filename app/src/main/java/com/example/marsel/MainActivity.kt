@@ -21,6 +21,7 @@ import android.net.ConnectivityManager
 import android.net.NetworkCapabilities
 import android.os.Environment
 import android.os.ParcelFileDescriptor
+import android.os.SystemClock
 import android.provider.ContactsContract
 import android.provider.MediaStore
 import android.net.Uri
@@ -43,6 +44,7 @@ import android.webkit.GeolocationPermissions
 import android.webkit.JavascriptInterface
 import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
+import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
 import androidx.activity.result.contract.ActivityResultContracts
@@ -126,9 +128,21 @@ class MainActivity : FragmentActivity() {
     // Rate-limit position broadcasts: max 1 per 8s (interval fires every 10s)
     private var lastPositionBroadcastMs: Long = 0
 
-    // A2 : runnable différé qui retire le service marsel-res après 2 min.
-    // Tracké pour être annulé/exécuté immédiatement si une nouvelle urgence démarre.
+    // A2 : runnable différé qui retire le service marsel-res à expiration.
     private var resolvedClearRunnable: Runnable? = null
+
+    // FIX terrain (fin d'alerte jamais reçue par le voisin) : la fin d'alerte
+    // de CE téléphone n'était mémorisée nulle part — une RECOVERY
+    // (clearLocalServices) ou un rebond P2P DISABLED→ENABLED l'effaçait et
+    // reRegisterActiveServices() ne la ré-enregistrait pas (vu en test : la
+    // diffusion du marsel-res n'a duré que quelques millisecondes). Le
+    // record est conservé jusqu'à la prochaine fin d'alerte (sert aussi à la
+    // ré-annonce anti-zombie) ; activeResolvedUntilMs borne la diffusion.
+    private var activeResolvedRecord: Map<String, String>? = null
+    private var activeResolvedJson: String? = null
+    private var activeResolvedServiceInfo: WifiP2pDnsSdServiceInfo? = null
+    @Volatile private var activeResolvedUntilMs = 0L
+    private var lastResolvedReannounceMs = NO_WINDOW
 
     // C3/C4 : alertes RELAYÉES (urgences d'autres téléphones re-diffusées par nous).
     // Instances de service distinctes (marsel-alert-<suffix>) : elles coexistent
@@ -216,13 +230,63 @@ class MainActivity : FragmentActivity() {
     // normal de callback WifiP2pManager, largement < la cadence des cycles
     // légitimes 8-60s) : n'empêche jamais un cycle normal, bloque seulement
     // les chevauchements de déclencheurs proches dans le temps.
-    @Volatile private var lastDiscoveryChainMs = 0L
+    // Horloge MONOTONE (elapsedRealtime) : avec l'heure murale, un recul
+    // d'horloge (resynchro réseau après une période hors couverture) gardait
+    // ces fenêtres « en cours » pendant toute la durée du recul — plus aucune
+    // découverte ni ré-enregistrement possible.
+    // NO_WINDOW = « aucune fenêtre » (Long.MIN_VALUE/2 : aucun débordement
+    // possible dans les soustractions ci-dessous).
+    @Volatile private var lastDiscoveryChainMs = NO_WINDOW
+    // FIX régression : une rafale de ré-enregistrement (reRegisterActiveServices,
+    // jusqu'à ~10 addLocalService) a sa PROPRE fenêtre (1,5 s), distincte de
+    // celle des chaînes de découverte. Avant, elle consommait le jeton des
+    // chaînes et ses 4 appelants (qui enchaînent toujours kickDiscoveryNow())
+    // voyaient leur re-arm complet systématiquement refusé.
+    @Volatile private var lastServiceBurstMs = NO_WINDOW
+    private fun discoveryChainInFlight(): Boolean =
+        SystemClock.elapsedRealtime() - lastDiscoveryChainMs < 3_000L
+    private fun serviceBurstInFlight(): Boolean =
+        SystemClock.elapsedRealtime() - lastServiceBurstMs < 1_500L
+    /** Temps restant avant la fin de la fenêtre chaîne/rafale en cours (0 si libre). */
+    private fun p2pWindowWaitMs(): Long {
+        val now = SystemClock.elapsedRealtime()
+        return maxOf(3_000L - (now - lastDiscoveryChainMs), 1_500L - (now - lastServiceBurstMs), 0L)
+    }
+    /** Un changement d'état P2P (canal neuf, ENABLED, permission) invalide toute chaîne en vol. */
+    private fun invalidateInFlightP2pChains() {
+        lastDiscoveryChainMs = NO_WINDOW
+        lastServiceRequestResetMs = 0
+    }
+
     private fun canStartDiscoveryChain(): Boolean {
-        val now = System.currentTimeMillis()
-        if (now - lastDiscoveryChainMs < 3_000L) return false
-        lastDiscoveryChainMs = now
+        if (discoveryChainInFlight() || serviceBurstInFlight()) return false
+        lastDiscoveryChainMs = SystemClock.elapsedRealtime()
+        // Une chaîne complète démarre : un re-arm différé encore en attente
+        // ferait doublon et couperait la découverte qu'elle vient de lancer.
+        p2pHandler.removeCallbacks(deferredRearmRunnable)
         return true
     }
+
+    // FIX régression (terrain : « re-arm complet reporté » en boucle +
+    // « discoverServices ÉCHEC reason=3 ») : un re-arm complet refusé n'est
+    // plus jamais REMPLACÉ par un discoverServices seul — lancé pendant une
+    // chaîne clear→add→discover en vol, il échouait en NO_SERVICE_REQUESTS
+    // (reason=3, requête effacée en plein vol) et, au démarrage, aucune
+    // requête de service n'était jamais ajoutée. Le re-arm est DIFFÉRÉ à la
+    // fin de la fenêtre en cours (coalescé : un seul en attente), jamais perdu.
+    private val deferredRearmRunnable = Runnable { restartServiceDiscovery() }
+    private fun scheduleDeferredRearm(): Long {
+        lastServiceRequestResetMs = 0  // le prochain passage fera le re-arm complet
+        val wait = p2pWindowWaitMs() + 300L
+        p2pHandler.removeCallbacks(deferredRearmRunnable)
+        p2pHandler.postDelayed(deferredRearmRunnable, wait)
+        return wait
+    }
+    // Ré-enregistrement différé : un seul en attente à la fois (plusieurs
+    // déclencheurs simultanés ne produisent qu'UNE rafale addLocalService).
+    private val deferredReRegisterRunnable = Runnable { reRegisterActiveServicesSafely() }
+    // Anti-boucle reason=3 : au plus un re-arm immédiat par 15 s sur cet échec.
+    private var lastNoRequestRearmMs = NO_WINDOW
 
     private val smsSentReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
@@ -245,6 +309,7 @@ class MainActivity : FragmentActivity() {
         override fun run() {
             purgeExpiredMarselPeers()
             purgeExpiredRelayedServices()
+            purgeStalePendingMessages()
             // BUG-4 : si le watchdog lance un recovery (clear→add→discover
             // asynchrone), NE PAS lancer restartServiceDiscovery en parallèle —
             // la collision produisait des « discoverServices ÉCHEC reason=3 »
@@ -336,6 +401,15 @@ class MainActivity : FragmentActivity() {
         private const val MARSEL_ALERT_ID = 1001
         private const val TAG = "MARSEL"
         private const val MARSEL_PEER_TTL_MS = 60_000L
+        private const val NO_WINDOW = Long.MIN_VALUE / 2
+        // Fin d'alerte de l'émetteur diffusée 5 min (au lieu de 2) : en test
+        // terrain, un voisin pouvait rester > 70 s sans re-arm DNS-SD réussi
+        // (flapping Samsung) et rater une fenêtre de 2 min.
+        private const val RESOLVED_BROADCAST_MS = 5 * 60_000L
+        private const val OSM_TILE_HOST = "tile.openstreetmap.org"
+        private const val TILE_REFRESH_MS = 7L * 24 * 3600 * 1000     // re-téléchargée après 7 j
+        private const val TILE_CACHE_MAX_AGE_MS = 30L * 24 * 3600 * 1000
+        private const val TILE_CACHE_MAX_BYTES = 60L * 1024 * 1024
         private const val AUDIO_SEGMENT_MS = 5 * 60 * 1000       // rotation 5 min
         private const val AUDIO_MMS_MAX_BYTES = 1_000_000L       // 1 Mo (spec 5b)
         private const val AUDIO_DIR = "Marsel"
@@ -365,7 +439,7 @@ class MainActivity : FragmentActivity() {
         // PERM-FIX : permission proximité tout juste accordée → relancer le MRN
         // immédiatement (re-arm complet + ré-enregistrement des services actifs).
         if (granted && group == "nearby") {
-            lastServiceRequestResetMs = 0
+            invalidateInFlightP2pChains()  // les chaînes sans permission ont échoué
             reRegisterActiveServicesSafely()
             kickDiscoveryNow()
         }
@@ -535,6 +609,16 @@ class MainActivity : FragmentActivity() {
         webView.settings.mediaPlaybackRequiresUserGesture = false
 
         webView.webViewClient = object : WebViewClient() {
+            // Tuiles OpenStreetMap : récupérées côté natif (thread de fond de la
+            // WebView), cf. fetchOsmTile(). Toute autre requête suit son cours.
+            override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? {
+                val uri = request.url
+                if (request.method == "GET" && uri.scheme == "https" && uri.host == OSM_TILE_HOST) {
+                    return fetchOsmTile(uri)
+                }
+                return super.shouldInterceptRequest(view, request)
+            }
+
             override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean {
                 val url = request.url.toString()
                 return when {
@@ -548,6 +632,17 @@ class MainActivity : FragmentActivity() {
                     }
                     url.startsWith("sms:") -> {
                         startActivity(Intent(Intent.ACTION_SENDTO, Uri.parse(url)))
+                        true
+                    }
+                    // Lien web cliqué dans la page (ex. attribution OpenStreetMap
+                    // de la carte) : navigateur externe. Sans ça, la WebView
+                    // quittait l'application Marsel pour afficher le site.
+                    url.startsWith("https://") || url.startsWith("http://") -> {
+                        try {
+                            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                        } catch (e: Exception) {
+                            Log.e(TAG, "lien externe ($url): ${e.message}")
+                        }
                         true
                     }
                     else -> false
@@ -574,6 +669,154 @@ class MainActivity : FragmentActivity() {
         // --- Start servers ---
         startWifiServer()       // legacy port 8888
         startRelayServer()      // relay port 8890
+
+        trimTileCache()
+    }
+
+    // =========================================================================
+    // Tuiles OpenStreetMap (fond de carte)
+    // =========================================================================
+    // Politique d'usage OSM : une page web doit envoyer un Referer — la page
+    // Marsel est chargée en file://, donc sans Referer, et OSM la bloque. Une
+    // APPLI doit en revanche s'identifier par un User-Agent propre et mettre
+    // les tuiles en cache : c'est ce que fait ce proxy natif. Bonus sécurité :
+    // les zones déjà consultées restent affichées hors connexion.
+    private val tileUserAgent: String by lazy {
+        val version = try {
+            packageManager.getPackageInfo(packageName, 0).versionName ?: "?"
+        } catch (e: Exception) { "?" }
+        "Marsel/$version (Android ${Build.VERSION.RELEASE}; $packageName; +https://marselapp.com)"
+    }
+
+    private fun tileResponse(bytes: ByteArray): WebResourceResponse =
+        WebResourceResponse("image/png", null, 200, "OK",
+            mapOf("Cache-Control" to "max-age=86400"), java.io.ByteArrayInputStream(bytes))
+
+    private fun tileUnavailable(code: Int, reason: String): WebResourceResponse =
+        WebResourceResponse("text/plain", "utf-8", code, reason, null, java.io.ByteArrayInputStream(ByteArray(0)))
+
+    private fun fetchOsmTile(uri: Uri): WebResourceResponse {
+        // Chemin attendu : /{z}/{x}/{y}.png, chiffres uniquement (aucune
+        // traversée de répertoire possible dans le cache).
+        val segs = uri.pathSegments
+        if (segs.size != 3 || !segs[2].endsWith(".png") ||
+            segs.any { s -> val n = s.removeSuffix(".png"); n.isEmpty() || !n.all { it.isDigit() } }
+        ) {
+            return tileUnavailable(400, "Bad tile path")
+        }
+        val path = "${segs[0]}/${segs[1]}/${segs[2]}"
+        val cacheFile = File(cacheDir, "tiles/$path")
+        // Tuile en cache, même ancienne : servie TOUT DE SUITE (jamais de
+        // réseau bloquant quand on a déjà une image — sur un WiFi sans
+        // internet, chaque tuile aurait sinon attendu les délais réseau avant
+        // l'affichage). Si elle a plus de 7 jours, rafraîchie en arrière-plan.
+        if (cacheFile.exists()) {
+            try {
+                val bytes = cacheFile.readBytes()
+                if (System.currentTimeMillis() - cacheFile.lastModified() > TILE_REFRESH_MS &&
+                    tileRefreshInFlight.add(path)
+                ) {
+                    try {
+                        tileRefreshExecutor.execute {
+                            try { downloadOsmTile(path, cacheFile) } finally { tileRefreshInFlight.remove(path) }
+                        }
+                    } catch (e: java.util.concurrent.RejectedExecutionException) {
+                        tileRefreshInFlight.remove(path)  // activité en cours de destruction
+                    }
+                }
+                return tileResponse(bytes)
+            } catch (e: Exception) { /* fichier illisible : re-téléchargement */ }
+        }
+        val bytes = downloadOsmTile(path, cacheFile) ?: return tileUnavailable(504, "Tile unavailable")
+        return tileResponse(bytes)
+    }
+
+    private val tileRefreshInFlight: MutableSet<String> = ConcurrentHashMap.newKeySet()
+    // Rafraîchissements en arrière-plan : un seul thread, file d'attente.
+    private val tileRefreshExecutor = java.util.concurrent.Executors.newSingleThreadExecutor()
+    // Politique OSM : au plus 2 connexions simultanées vers le serveur de tuiles
+    // (les threads de la WebView peuvent en demander bien plus d'un coup).
+    private val tileDownloadSlots = java.util.concurrent.Semaphore(2)
+
+    /** Télécharge une tuile OSM et l'enregistre en cache ; null si indisponible. */
+    private fun downloadOsmTile(path: String, cacheFile: File): ByteArray? {
+        try {
+            if (!tileDownloadSlots.tryAcquire(15, java.util.concurrent.TimeUnit.SECONDS)) return null
+        } catch (e: InterruptedException) {
+            return null
+        }
+        try {
+            return downloadOsmTileLocked(path, cacheFile)
+        } finally {
+            tileDownloadSlots.release()
+        }
+    }
+
+    private fun downloadOsmTileLocked(path: String, cacheFile: File): ByteArray? {
+        try {
+            val conn = java.net.URL("https://$OSM_TILE_HOST/$path")
+                .openConnection() as java.net.HttpURLConnection
+            try {
+                conn.connectTimeout = 6_000
+                conn.readTimeout = 8_000
+                conn.setRequestProperty("User-Agent", tileUserAgent)
+                if (conn.responseCode != 200) {
+                    Log.w(TAG, "tuile OSM HTTP ${conn.responseCode} pour $path")
+                    return null
+                }
+                val bytes = conn.inputStream.use { it.readBytes() }
+                try {
+                    cacheFile.parentFile?.mkdirs()
+                    val tmp = File(cacheFile.parentFile, cacheFile.name + ".tmp")
+                    tmp.writeBytes(bytes)
+                    if (!tmp.renameTo(cacheFile)) {
+                        tmp.delete()
+                        Log.w(TAG, "cache tuile : renommage impossible pour $path")
+                    }
+                } catch (e: Exception) {
+                    Log.w(TAG, "cache tuile: ${e.message}")
+                }
+                return bytes
+            } finally {
+                conn.disconnect()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "tuile OSM indisponible (${e.message})")
+            return null
+        }
+    }
+
+    // Borne le cache de tuiles : supprime les tuiles de plus de 30 jours, puis
+    // les plus anciennes tant que le total dépasse 60 Mo.
+    private fun trimTileCache() {
+        thread {
+            try {
+                val root = File(cacheDir, "tiles")
+                if (!root.exists()) return@thread
+                val now = System.currentTimeMillis()
+                val cutoff = now - TILE_CACHE_MAX_AGE_MS
+                val files = root.walkTopDown().filter { it.isFile }.toMutableList()
+                // .tmp : seulement les orphelins (> 10 min) — un .tmp récent est
+                // une tuile en cours d'écriture par fetchOsmTile au même moment.
+                files.filter {
+                    it.lastModified() < cutoff ||
+                        (it.name.endsWith(".tmp") && now - it.lastModified() > 10 * 60_000L)
+                }.forEach {
+                    it.delete()
+                    files.remove(it)
+                }
+                var total = files.sumOf { it.length() }
+                if (total > TILE_CACHE_MAX_BYTES) {
+                    for (f in files.sortedBy { it.lastModified() }) {
+                        if (total <= TILE_CACHE_MAX_BYTES) break
+                        total -= f.length()
+                        f.delete()
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "trimTileCache: ${e.message}")
+            }
+        }
     }
 
     // =========================================================================
@@ -605,6 +848,7 @@ class MainActivity : FragmentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         p2pHandler.removeCallbacksAndMessages(null)
+        tileRefreshExecutor.shutdownNow()
         stopLocationUpdatesInternal()
         // D2 : arrêt propre des serveurs — sinon la recréation d'activité
         // laisse un serveur zombie lié à l'ancienne instance (BindException
@@ -789,7 +1033,9 @@ class MainActivity : FragmentActivity() {
                         // EFFACE les services locaux — sans ré-enregistrement,
                         // l'alerte cesse d'émettre en silence.
                         logToJs("P2P", "P2P ré-activé — ré-enregistrement des services actifs")
-                        lastServiceRequestResetMs = 0  // force un re-arm complet
+                        // Force un re-arm complet ; une chaîne lancée avant le
+                        // rebond a échoué avec lui et ne couvre plus rien.
+                        invalidateInFlightP2pChains()
                         reRegisterActiveServicesSafely()
                         kickDiscoveryNow()
                     }
@@ -977,6 +1223,17 @@ class MainActivity : FragmentActivity() {
                 return
             }
 
+            // ANTI-ZOMBIE, canal socket (principal quand le groupe P2P est
+            // connecté) : même logique que handleServiceTxtRecord — placé AVANT
+            // la déduplication, car l'écho de notre propre alerte y serait
+            // abandonné en silence.
+            if (msgType == MarselProtocol.TYPE_EMERGENCY || msgType == MarselProtocol.TYPE_POSITION) {
+                val zombieKey = extractJsonString(json, "emergencyId") ?: extractJsonString(json, "id")
+                if (zombieKey != null && dedupLedger.isSeen("res", zombieKey)) {
+                    runOnUiThread { reannounceResolvedIfOwned(zombieKey) }
+                }
+            }
+
             // Dédup niveau 1 : set en RAM (rapide, durée de vie de la session)
             synchronized(processedMessageIds) {
                 if (processedMessageIds.contains(messageId)) {
@@ -1036,7 +1293,18 @@ class MainActivity : FragmentActivity() {
             val emergencyKey = extractJsonString(json, "emergencyId")
                 ?: extractJsonString(json, "id") ?: messageId
             if (msgType == MarselProtocol.TYPE_RESOLVED) {
-                dedupLedger.checkAndMark("res", emergencyKey)
+                val alreadyResolved = dedupLedger.checkAndMark("res", emergencyKey)
+                // FIX terrain : quel que soit le canal (DNS-SD OU socket), une
+                // fin d'alerte doit arrêter NOTRE re-diffusion de l'alerte
+                // correspondante. Avant, seul le chemin DNS-SD le faisait : une
+                // fin d'alerte reçue par socket laissait l'alerte relayée
+                // continuer jusqu'à 10 min (notification « zombie » ailleurs).
+                // Idempotent si déjà fait par handleServiceTxtRecord.
+                if (!alreadyResolved) remoteAlertActiveUntilMs = 0
+                // Thread UI : relayedRecords/relayedServiceInfos sont aussi
+                // parcourus par reRegisterActiveServices() sur le main looper ;
+                // processRelayMessage tourne ici sur un thread socket.
+                runOnUiThread { removeRelayedForEmergency(emergencyKey) }
             }
             // BUG-6 : le filtre couvre aussi les POSITION — des paquets de position
             // périmés rejoués par le canal socket APRÈS la résolution recréaient
@@ -1379,6 +1647,9 @@ class MainActivity : FragmentActivity() {
         try {
             wifiP2pChannel = wifiP2pManager.initialize(this, mainLooper) { onChannelLost() }
             setupDnsSdListeners()
+            // Canal neuf : aucune requête de service n'y existe encore, et une
+            // chaîne « en vol » sur l'ancien canal (mort) ne doit rien bloquer.
+            invalidateInFlightP2pChains()
             reRegisterActiveServicesSafely()
             kickDiscoveryNow()
         } catch (e: Exception) {
@@ -1451,7 +1722,7 @@ class MainActivity : FragmentActivity() {
         try {
             wifiP2pChannel = wifiP2pManager.initialize(this, mainLooper) { onChannelLost() }
             setupDnsSdListeners()
-            lastServiceRequestResetMs = 0
+            invalidateInFlightP2pChains()  // la chaîne « en vol » visait l'ancien canal
             reRegisterActiveServicesSafely()
             kickDiscoveryNow()
         } catch (e: Exception) {
@@ -1537,14 +1808,22 @@ class MainActivity : FragmentActivity() {
     // (permission accordée, retour ENABLED, channel perdu/recréé) — d'où le
     // même risque de collision BUSY que la chaîne clear→add→discover.
     // On ne saute JAMAIS la ré-inscription (une alerte active doit continuer
-    // à être diffusée) : si une autre chaîne tient déjà le jeton, on réessaie
-    // 1s plus tard plutôt que de l'abandonner.
+    // à être diffusée). Elle ne chevauche ni une chaîne de découverte, ni une
+    // autre rafale : si l'une est en vol, on réessaie à la fin de sa fenêtre
+    // (re-vérifié à ce moment — tout s'exécute sur le main looper).
+    // FIX régression : elle marque sa propre fenêtre (lastServiceBurstMs) au
+    // lieu de consommer le jeton des chaînes ; le kickDiscoveryNow() que ses
+    // 4 appelants enchaînent est alors DIFFÉRÉ (re-arm juste après la rafale)
+    // au lieu d'être refusé comme avant.
     private fun reRegisterActiveServicesSafely() {
-        if (canStartDiscoveryChain()) {
+        val wait = p2pWindowWaitMs()
+        p2pHandler.removeCallbacks(deferredReRegisterRunnable)
+        if (wait <= 0L) {
+            lastServiceBurstMs = SystemClock.elapsedRealtime()
             reRegisterActiveServices()
         } else {
-            logToJs("DNS-SD", "ré-enregistrement des services différé de 1s (chaîne en cours)")
-            p2pHandler.postDelayed({ reRegisterActiveServices() }, 1_000L)
+            logToJs("DNS-SD", "ré-enregistrement des services différé de ${wait + 300L}ms (chaîne en cours)")
+            p2pHandler.postDelayed(deferredReRegisterRunnable, wait + 300L)
         }
     }
 
@@ -1569,6 +1848,68 @@ class MainActivity : FragmentActivity() {
             relayedServiceInfos[msgId] = info
             addLocalServiceSafe(info, "relayed-${msgId.takeLast(8)}")
         }
+        // FIX terrain : la fin d'alerte de CE téléphone fait partie des services
+        // actifs pendant sa fenêtre de diffusion — sinon toute RECOVERY
+        // (clearLocalServices) l'effaçait définitivement.
+        activeResolvedRecord?.let { rec ->
+            if (SystemClock.elapsedRealtime() < activeResolvedUntilMs) {
+                val info = WifiP2pDnsSdServiceInfo.newInstance(
+                    MarselProtocol.resolvedInstanceName(rec["i"] ?: "x"), "_marsel._tcp", rec
+                )
+                activeResolvedServiceInfo = info
+                addLocalServiceSafe(info, "marsel-resolved (ré-enregistré)")
+            }
+        }
+    }
+
+    // Programme (ou reprogramme) le retrait du service marsel-res à la fin de
+    // sa fenêtre de diffusion. Retrait ciblé : ne touche à aucun autre service.
+    private fun scheduleResolvedExpiry() {
+        resolvedClearRunnable?.let { p2pHandler.removeCallbacks(it) }
+        val runnable = Runnable {
+            activeResolvedServiceInfo?.let { safeRemoveLocalService(it, "resolved-expiry") }
+            activeResolvedServiceInfo = null
+            resolvedClearRunnable = null
+        }
+        resolvedClearRunnable = runnable
+        val delay = (activeResolvedUntilMs - SystemClock.elapsedRealtime()).coerceAtLeast(1_000L)
+        p2pHandler.postDelayed(runnable, delay)
+    }
+
+    // ANTI-ZOMBIE (terrain : l'émetteur recevait sa propre alerte, terminée,
+    // encore relayée toutes les ~20 s par le voisin, et l'ignorait en
+    // silence) : tant qu'un voisin re-diffuse une alerte que NOUS avons
+    // terminée, c'est qu'il n'a pas reçu la fin d'alerte — on la ré-annonce
+    // (DNS-SD + file socket), au plus une fois toutes les 30 s.
+    private fun reannounceResolvedIfOwned(emergencyId: String) {
+        val rec = activeResolvedRecord ?: return
+        if (rec["e"] != emergencyId) return
+        val now = SystemClock.elapsedRealtime()
+        if (now - lastResolvedReannounceMs < 30_000L) return
+        lastResolvedReannounceMs = now
+        logToJs("DNS-SD", "ANTI-ZOMBIE : alerte $emergencyId terminée mais encore relayée par un voisin — ré-annonce de la fin d'alerte")
+        activeResolvedUntilMs = maxOf(activeResolvedUntilMs, now + RESOLVED_BROADCAST_MS)
+        val info = WifiP2pDnsSdServiceInfo.newInstance(
+            MarselProtocol.resolvedInstanceName(rec["i"] ?: "x"), "_marsel._tcp", rec
+        )
+        val old = activeResolvedServiceInfo
+        activeResolvedServiceInfo = info
+        if (old != null) {
+            safeRemoveLocalService(old, "resolved-refresh") { addLocalServiceSafe(info, "marsel-resolved (ré-annonce)") }
+        } else {
+            addLocalServiceSafe(info, "marsel-resolved (ré-annonce)")
+        }
+        activeResolvedJson?.let { j ->
+            // GO : les clients la récupèrent à leur prochain poll (file).
+            synchronized(pendingRelayMessages) {
+                if (!pendingRelayMessages.contains(j)) pendingRelayMessages.add(j)
+            }
+            // Client : la file n'est vidée qu'à une NOUVELLE connexion — envoi
+            // direct au GO, comme sendEmergencyViaRelay().
+            val goAddr = groupOwnerAddress
+            if (goAddr != null && !isGroupOwner) sendRelayToPeer(goAddr, j)
+        }
+        scheduleResolvedExpiry()
     }
 
     // =========================================================================
@@ -1638,10 +1979,22 @@ class MainActivity : FragmentActivity() {
     // TEST-FIX : match par VALEUR d'identifiant (couvre id / messageId /
     // emergencyId) — les paquets E d'origine ne portent pas de champ emergencyId
     // et échappaient à la purge, d'où une vieille E rejouée par socket en test.
+    // FIX terrain : seules les ALERTES (E) et POSITIONS (P) sont purgées. Avant,
+    // tout paquet portant l'identifiant partait — y compris la fin d'alerte R
+    // elle-même : sendEmergencyViaRelay() ajoute R à la file sur son thread
+    // pendant que la branche "R" de broadcastViaService() purge sur le thread
+    // UI, donc R était presque toujours retirée aussitôt ajoutée et ne
+    // partait jamais par socket (le voisin connecté en client, vu en test, ne
+    // pouvait plus la récupérer). Les demandes de SMS (F/T) et accusés (S) de
+    // la même urgence doivent aussi continuer à circuler.
     private fun purgePendingForEmergency(emergencyId: String) {
         if (emergencyId.isEmpty()) return
         synchronized(pendingRelayMessages) {
-            pendingRelayMessages.removeAll { it.contains("\"$emergencyId\"") }
+            pendingRelayMessages.removeAll { msg ->
+                if (!msg.contains("\"$emergencyId\"")) return@removeAll false
+                val t = extractJsonString(msg, "type")
+                t == MarselProtocol.TYPE_EMERGENCY || t == MarselProtocol.TYPE_POSITION
+            }
         }
     }
 
@@ -1658,13 +2011,51 @@ class MainActivity : FragmentActivity() {
         }
     }
 
-    /** Expiration des services relayés : E après 10 min, R/F/T après 3 min. */
+    /** Expiration des services relayés : E et R après 10 min, F/T/S après 3 min. */
     private fun purgeExpiredRelayedServices() {
         val now = System.currentTimeMillis()
         for ((msgId, rec) in relayedRecords) {
             val ts = rec["s"]?.toLongOrNull() ?: continue
-            val ttl = if (rec["y"] == MarselProtocol.SHORT_EMERGENCY) 10 * 60_000L else 3 * 60_000L
+            // FIX terrain : une fin d'alerte relayée vit aussi longtemps qu'une
+            // alerte relayée (avant : 3 min contre 10). Sinon un téléphone hors
+            // de portée de l'émetteur, qui relaie encore l'alerte, ne pouvait
+            // plus apprendre sa fin une fois les 3 min écoulées.
+            val ttl = when (rec["y"]) {
+                MarselProtocol.SHORT_EMERGENCY, MarselProtocol.SHORT_RESOLVED -> 10 * 60_000L
+                else -> 3 * 60_000L
+            }
             if (now - ts > ttl) dropRelayedService(msgId, "expiré")
+        }
+    }
+
+    // FIX QA : la file socket ne garde plus de paquets indéfiniment. Avant, une
+    // R (ou une alerte relayée dont la fin n'arrivait jamais) restée en file
+    // maintenait `hasPending` vrai pour toujours → connect() vers chaque
+    // voisin Marsel à chaque PEERS_CHANGED, et le GO repoussait de vieilles
+    // positions à chaque client. Règles :
+    //  - notre propre alerte EN COURS (E/P) : jamais purgée ici (la fin
+    //    d'alerte s'en charge, cf. purgePendingForEmergency) ;
+    //  - notre propre fin d'alerte : tant que sa fenêtre de diffusion est ouverte ;
+    //  - tout le reste : 10 min après sa PREMIÈRE apparition dans la file,
+    //    mesurée sur l'horloge MONOTONE locale (l'horodatage d'un autre
+    //    téléphone peut être décalé de plusieurs minutes).
+    private val pendingFirstSeenMs = HashMap<String, Long>()  // sous synchronized(pendingRelayMessages)
+    private fun purgeStalePendingMessages() {
+        val now = SystemClock.elapsedRealtime()
+        val ownResolved = activeResolvedJson
+        val ownResolvedAlive = now < activeResolvedUntilMs
+        val ownEmergencyId = activeEmergencyRecord?.get("e")
+        synchronized(pendingRelayMessages) {
+            pendingRelayMessages.removeAll { msg ->
+                if (msg == ownResolved) return@removeAll !ownResolvedAlive
+                val t = extractJsonString(msg, "type")
+                if ((t == MarselProtocol.TYPE_EMERGENCY || t == MarselProtocol.TYPE_POSITION) &&
+                    ownEmergencyId != null && msg.contains("\"$ownEmergencyId\"")
+                ) return@removeAll false
+                val firstSeen = pendingFirstSeenMs.getOrPut(msg) { now }
+                now - firstSeen > 10 * 60_000L
+            }
+            pendingFirstSeenMs.keys.retainAll(pendingRelayMessages.toHashSet())
         }
     }
 
@@ -1772,6 +2163,18 @@ class MainActivity : FragmentActivity() {
             val emergencyId = MarselProtocol.extractJsonString(json, "emergencyId")
             logToJs("DNS-SD", "RX TXT type=$type pseudo=$pseudo hop=$hop")
 
+            // ANTI-ZOMBIE : alerte/position d'une urgence DÉJÀ TERMINÉE encore
+            // diffusée par un voisin → il a raté la fin d'alerte. Si c'est la
+            // nôtre, on la ré-annonce ; dans tous les cas, on ne bascule pas en
+            // mode « alerte distante active » pour une urgence finie
+            // (processRelayMessage l'ignorerait de toute façon).
+            if ((type == MarselProtocol.TYPE_EMERGENCY || type == MarselProtocol.TYPE_POSITION) &&
+                emergencyId != null && dedupLedger.isSeen("res", emergencyId)
+            ) {
+                reannounceResolvedIfOwned(emergencyId)
+                return
+            }
+
             // A4/3a : suivi d'alerte distante pour l'intervalle adaptatif.
             // Bascule immédiate veille→actif à la première réception.
             when (type) {
@@ -1781,7 +2184,14 @@ class MainActivity : FragmentActivity() {
                     if (!wasActive) kickDiscoveryNow()
                 }
                 MarselProtocol.TYPE_RESOLVED -> {
-                    remoteAlertActiveUntilMs = 0
+                    // Seulement pour une fin d'alerte NOUVELLE : une fin d'alerte
+                    // déjà connue, re-diffusée à chaque cycle (fenêtre 5-10 min),
+                    // ne doit pas remettre à zéro, en boucle, l'état « alerte
+                    // distante active » d'une AUTRE alerte en cours (cadence
+                    // de découverte ralentie en pleine alerte).
+                    if (emergencyId == null || !dedupLedger.isSeen("res", emergencyId)) {
+                        remoteAlertActiveUntilMs = 0
+                    }
                     emergencyId?.let { removeRelayedForEmergency(it) }
                 }
             }
@@ -1830,11 +2240,13 @@ class MainActivity : FragmentActivity() {
                             return@runOnUiThread
                         }
 
-                        // A2 : annuler tout clear différé d'une résolution précédente
-                        // AVANT d'enregistrer la nouvelle alerte, sinon le runnable
-                        // de 2 min effacerait le marsel-alert fraîchement posé.
-                        resolvedClearRunnable?.let { p2pHandler.removeCallbacks(it) }
-                        resolvedClearRunnable = null
+                        // A2 : la fin d'alerte PRÉCÉDENTE continue d'être diffusée
+                        // jusqu'au bout de sa fenêtre, à côté de la nouvelle alerte
+                        // (instances distinctes) : un voisin qui l'a ratée doit
+                        // encore pouvoir la recevoir. Son retrait différé est
+                        // CIBLÉ (seul marsel-res-*) — il ne peut pas effacer la
+                        // nouvelle alerte, on ne l'annule donc plus (l'annuler
+                        // laissait le marsel-res diffusé indéfiniment).
 
                         // C3 : instance distincte par urgence (marsel-alert-<suffix>).
                         // On retire proprement l'ancienne alerte locale (removeLocalService,
@@ -1899,20 +2311,23 @@ class MainActivity : FragmentActivity() {
                         activeAlertServiceInfo = null
                         activePositionServiceInfo = null
                         logToJs("DNS-SD", "RESOLVED: broadcasting ${MarselProtocol.resolvedInstanceName(msgId)}")
+                        // Une fin d'alerte précédente encore diffusée est remplacée.
+                        activeResolvedServiceInfo?.let { safeRemoveLocalService(it, "old-resolved") }
                         val resolvedInfo = WifiP2pDnsSdServiceInfo.newInstance(
                             MarselProtocol.resolvedInstanceName(msgId), "_marsel._tcp", record
                         )
-                        val resInfoRef = resolvedInfo
+                        // FIX terrain : mémorisée pour survivre aux RECOVERY /
+                        // rebonds P2P (reRegisterActiveServices) et pour la
+                        // ré-annonce anti-zombie.
+                        activeResolvedRecord = record
+                        activeResolvedJson = json
+                        activeResolvedServiceInfo = resolvedInfo
+                        activeResolvedUntilMs = SystemClock.elapsedRealtime() + RESOLVED_BROADCAST_MS
+                        lastResolvedReannounceMs = NO_WINDOW
                         addLocalServiceSafe(resolvedInfo, "marsel-resolved")
                         kickDiscoveryNow()
-                        // A2 : clear ciblé du SEUL service resolved après 2 min,
-                        // tracké pour annulation si une nouvelle urgence démarre avant.
-                        val runnable = Runnable {
-                            safeRemoveLocalService(resInfoRef, "resolved-expiry")
-                            resolvedClearRunnable = null
-                        }
-                        resolvedClearRunnable = runnable
-                        p2pHandler.postDelayed(runnable, 120_000)
+                        // A2 : retrait ciblé du SEUL service resolved à expiration.
+                        scheduleResolvedExpiry()
                     }
                     // BUG-1 : diffusion des demandes de SMS relayé (fin d'alerte F /
                     // relance 20 min T) émises par CE téléphone. Avant ce correctif
@@ -2002,8 +2417,16 @@ class MainActivity : FragmentActivity() {
             // par-dessus une chaîne déjà en cours (fullServiceRecovery ou un
             // précédent restartServiceDiscovery pas encore terminé).
             if (!canStartDiscoveryChain()) {
-                logToJs("DNS-SD", "re-arm complet reporté (chaîne récente en cours) — discoverServices seul")
-                discoverServicesOnly()
+                if (discoveryChainInFlight()) {
+                    // Un re-arm complet vient déjà de démarrer (< 3 s) : il
+                    // couvre ce besoin. Rien par-dessus (collision reason=3),
+                    // et pas de re-arm différé qui couperait sa découverte.
+                    Log.d(TAG, "re-arm complet déjà en cours — rien à ajouter")
+                    return
+                }
+                // Rafale de ré-enregistrement en cours : re-arm juste après.
+                val wait = scheduleDeferredRearm()
+                logToJs("DNS-SD", "re-arm complet différé de ${wait}ms (ré-enregistrement en cours)")
                 return
             }
             lastServiceRequestResetMs = now
@@ -2016,6 +2439,11 @@ class MainActivity : FragmentActivity() {
                 logToJs("DNS-SD", "restartServiceDiscovery exception: ${e.message}")
                 Log.e(TAG, "restartServiceDiscovery: ${e.message}")
             }
+        } else if (discoveryChainInFlight() || serviceBurstInFlight()) {
+            // Une chaîne clear→add→discover est encore en vol (elle se termine
+            // elle-même par discoverServices — un second appel échouerait en
+            // reason=3) ou une rafale addLocalService est en cours (BUSY).
+            Log.d(TAG, "discoverServices sauté : chaîne/ré-enregistrement en cours")
         } else {
             discoverServicesOnly()
         }
@@ -2055,9 +2483,23 @@ class MainActivity : FragmentActivity() {
                 override fun onFailure(reason: Int) {
                     // Échec visible dans l'overlay (avant : Log.w invisible en test
                     // mobile) + re-arm complet au prochain cycle.
-                    logToJs("DNS-SD", "discoverServices ÉCHEC reason=$reason — re-arm au prochain cycle")
                     lastServiceRequestResetMs = 0
                     noteP2pError()
+                    val nowMono = SystemClock.elapsedRealtime()
+                    if (reason == WifiP2pManager.NO_SERVICE_REQUESTS &&
+                        nowMono - lastNoRequestRearmMs > 15_000L
+                    ) {
+                        // Aucune requête de service : la découverte ne peut rien
+                        // recevoir tant qu'un re-arm complet n'a pas eu lieu —
+                        // ne pas attendre le prochain cycle (8-20 s). Au plus une
+                        // fois par 15 s : si l'échec persiste, on retombe sur la
+                        // cadence normale (pas de boucle de re-arm toutes les 3 s).
+                        lastNoRequestRearmMs = nowMono
+                        val wait = scheduleDeferredRearm()
+                        logToJs("DNS-SD", "discoverServices ÉCHEC reason=3 (aucune requête de service) — re-arm complet dans ${wait}ms")
+                    } else {
+                        logToJs("DNS-SD", "discoverServices ÉCHEC reason=$reason — re-arm au prochain cycle")
+                    }
                 }
             })
         } catch (e: SecurityException) {

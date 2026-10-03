@@ -641,7 +641,13 @@ function initMap() {
             MARSEL.leafletMap.setView([20, 0], 2);
         }
 
-        // Tile layer: Mapbox if token, else CartoDB light
+        // Fond de carte : Mapbox si jeton, CARTO si clé, sinon OpenStreetMap.
+        // FIX terrain : CARTO renvoie désormais, sans clé, des tuiles barrées
+        // de « API KEY REQUIRED » (HTTP 200, aucune erreur côté Leaflet).
+        // Les tuiles OSM sont interceptées par le natif (shouldInterceptRequest) :
+        // OSM refuse les requêtes d'une page file:// sans Referer, le natif les
+        // récupère avec un User-Agent Marsel et les met en cache (carte encore
+        // visible hors connexion pour les zones déjà consultées).
         if (window.MARSEL_CONFIG && MARSEL_CONFIG.MAPBOX_TOKEN) {
             L.tileLayer('https://api.mapbox.com/styles/v1/{id}/tiles/{z}/{x}/{y}?access_token={accessToken}', {
                 attribution: '© Mapbox',
@@ -651,13 +657,22 @@ function initMap() {
                 accessToken: MARSEL_CONFIG.MAPBOX_TOKEN,
                 maxZoom: 19
             }).addTo(MARSEL.leafletMap);
-        } else {
-            L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png', {
-                attribution: '© OpenStreetMap contributors',
+        } else if (window.MARSEL_CONFIG && MARSEL_CONFIG.CARTO_API_KEY) {
+            L.tileLayer('https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png?key=' +
+                encodeURIComponent(MARSEL_CONFIG.CARTO_API_KEY), {
+                attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors © <a href="https://carto.com/attributions">CARTO</a>',
                 subdomains: 'abcd',
                 maxZoom: 19
             }).addTo(MARSEL.leafletMap);
+        } else {
+            L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', {
+                attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+                maxZoom: 19
+            }).addTo(MARSEL.leafletMap);
         }
+        // Attribution obligatoire (licence OSM) — en bas à gauche pour ne pas
+        // passer sous le bouton de recentrage (bas droite).
+        L.control.attribution({ position: 'bottomleft', prefix: false }).addTo(MARSEL.leafletMap);
 
         // Marqueur utilisateur : créé UNIQUEMENT si on a une vraie position.
         // Sinon il apparaîtra au premier vrai fix (dans onLocationUpdate).
@@ -673,8 +688,9 @@ function initMap() {
                 .bindPopup('<b>Ma position</b>');
         }
 
-        // Zoom control bottom right
-        L.control.zoom({ position: 'bottomright' }).addTo(MARSEL.leafletMap);
+        // Zoom en haut à gauche : en bas à droite il passait sous le bouton de
+        // recentrage (le « − » était masqué, visible sur la capture terrain).
+        L.control.zoom({ position: 'topleft' }).addTo(MARSEL.leafletMap);
 
         // Load data from DB (lieux sûrs réels déjà en cache + incidents)
         loadSafePlacesOnMap();

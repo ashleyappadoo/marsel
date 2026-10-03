@@ -21,8 +21,12 @@ var MARSEL_CONFIG = {
     FCM_SERVER_KEY: '',             // Firebase Cloud Messaging server key
 
     // === MAP (optional) ===
-    // Leave empty to use OpenStreetMap/CartoDB (free, no key required)
+    // Tout vide = OpenStreetMap (gratuit, sans clé), tuiles récupérées par le
+    // code natif avec un User-Agent Marsel et mises en cache sur l'appareil.
     MAPBOX_TOKEN: '',               // MapBox public token for better maps
+    // CARTO exige désormais une clé (gratuite, carto.com/basemaps/apikey) :
+    // sans clé, ses tuiles s'affichent barrées de « API KEY REQUIRED ».
+    CARTO_API_KEY: '',
 
     // === APP SETTINGS ===
     EMERGENCY_RELAY_PORT: 8890,     // WiFi Direct relay port (must match Android)
