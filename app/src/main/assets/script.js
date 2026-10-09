@@ -2687,12 +2687,13 @@ function escapeHtml(str) {
 /* ---------------------------------------------------------
    ONBOARDING PERMISSIONS (Section 6)
    Flow séquencé : explique PUIS demande chaque groupe, dans l'ordre.
-   La position en arrière-plan est demandée SEULE et en dernier (G1).
+   La position en arrière-plan n'est plus demandée (permission retirée du
+   manifeste pour la publication Play — cf. TODO.md, ForegroundService).
    Un refus ne bloque pas l'app : on affiche l'impact fonctionnel.
    --------------------------------------------------------- */
 var MARSEL_PERM_GROUPS = [
     { key: 'location',            icon: '📍', title: 'Position',
-      desc: 'Pour partager ta position en cas d\'alerte',
+      desc: 'Pour partager ta position en cas d\'alerte (pour l\'instant, garde Marsel ouvert pendant l\'alerte : le suivi écran éteint arrive dans une prochaine version)',
       impact: 'Sans position, tes proches ne sauront pas où te trouver.' },
     { key: 'nearby',              icon: '📶', title: 'Appareils à proximité',
       desc: 'Pour le réseau Marsel entre téléphones',
@@ -2708,10 +2709,7 @@ var MARSEL_PERM_GROUPS = [
       impact: 'Sans micro, l\'enregistrement de protection est indisponible.' },
     { key: 'camera',              icon: '💡', title: 'Caméra',
       desc: 'Pour le flash SOS',
-      impact: 'Sans caméra, le flash SOS est indisponible.' },
-    { key: 'background_location', icon: '🗺️', title: 'Position en arrière-plan',
-      desc: 'Pour continuer à partager ta position même écran éteint',
-      impact: 'Sans ça, le partage de position s\'arrête quand l\'écran s\'éteint.', last: true }
+      impact: 'Sans caméra, le flash SOS est indisponible.' }
 ];
 var _onbIndex = 0;
 var _onbStarted = false;
@@ -2744,16 +2742,8 @@ function _onbEnsureOverlay() {
 }
 
 function _renderOnboarding() {
-    // Sauter la position en arrière-plan si la localisation n'a pas été accordée (G1)
-    var g = MARSEL_PERM_GROUPS[_onbIndex];
-    if (g && g.key === 'background_location' &&
-        window.AndroidBridge && typeof AndroidBridge.hasPermissionGroup === 'function') {
-        try {
-            if (!AndroidBridge.hasPermissionGroup('location')) { _onbNext(); return; }
-        } catch (e) {}
-    }
     if (_onbIndex >= MARSEL_PERM_GROUPS.length) { _finishOnboarding(); return; }
-    g = MARSEL_PERM_GROUPS[_onbIndex];
+    var g = MARSEL_PERM_GROUPS[_onbIndex];
     var ov = _onbEnsureOverlay();
     var step = (_onbIndex + 1) + ' / ' + MARSEL_PERM_GROUPS.length;
     ov.innerHTML = [

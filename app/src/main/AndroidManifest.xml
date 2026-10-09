@@ -8,7 +8,12 @@
     <!-- Location -->
     <uses-permission android:name="android.permission.ACCESS_FINE_LOCATION" />
     <uses-permission android:name="android.permission.ACCESS_COARSE_LOCATION" />
-    <uses-permission android:name="android.permission.ACCESS_BACKGROUND_LOCATION" />
+    <!-- ACCESS_BACKGROUND_LOCATION retirée (publication Play) : aucun code ne
+         l'utilise tant que le ForegroundService n'existe pas, et la déclarer
+         impose une déclaration + vidéo de justification sur la Play Console.
+         Un ForegroundService de type « location » démarré app ouverte n'en a
+         pas besoin (cf. TODO.md). -->
+
 
     <!-- WiFi -->
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />

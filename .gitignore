@@ -13,3 +13,8 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# Clé d'upload Google Play : ne JAMAIS la versionner
+keystore.properties
+*.jks
+*.keystore

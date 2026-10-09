@@ -288,6 +288,10 @@ class MainActivity : FragmentActivity() {
     // Anti-boucle reason=3 : au plus un re-arm immédiat par 15 s sur cet échec.
     private var lastNoRequestRearmMs = NO_WINDOW
 
+    // Action interne des accusés d'envoi SMS : préfixée par l'identifiant de
+    // l'appli (com.marselapp.marsel), jamais par un nom qui ne nous appartient pas.
+    private val smsSentAction: String get() = "$packageName.SMS_SENT"
+
     private val smsSentReceiver = object : BroadcastReceiver() {
         override fun onReceive(context: Context, intent: Intent) {
             val trackId = intent.getStringExtra("trackId") ?: return
@@ -413,7 +417,6 @@ class MainActivity : FragmentActivity() {
         private const val AUDIO_SEGMENT_MS = 5 * 60 * 1000       // rotation 5 min
         private const val AUDIO_MMS_MAX_BYTES = 1_000_000L       // 1 Mo (spec 5b)
         private const val AUDIO_DIR = "Marsel"
-        private const val SMS_SENT_ACTION = "com.example.marsel.SMS_SENT"
     }
 
     // -------------------------------------------------------------------------
@@ -509,8 +512,8 @@ class MainActivity : FragmentActivity() {
             listOf(Manifest.permission.POST_NOTIFICATIONS) else emptyList()
         "microphone" -> listOf(Manifest.permission.RECORD_AUDIO)
         "camera" -> listOf(Manifest.permission.CAMERA)
-        "background_location" -> if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q)
-            listOf(Manifest.permission.ACCESS_BACKGROUND_LOCATION) else emptyList()
+        // "background_location" retiré : permission supprimée du manifeste
+        // (publication Play, cf. AndroidManifest.xml / TODO.md).
         else -> emptyList()
     }
 
@@ -524,13 +527,6 @@ class MainActivity : FragmentActivity() {
         if (perms.isEmpty() || notGranted.isEmpty()) {
             webView.evaluateJavascript(
                 "window.onPermissionResult && window.onPermissionResult('$group',true,false)", null
-            )
-            return
-        }
-        // G1 : background location seulement si la localisation fine est accordée
-        if (group == "background_location" && !hasLocationPermission()) {
-            webView.evaluateJavascript(
-                "window.onPermissionResult && window.onPermissionResult('$group',false,false)", null
             )
             return
         }
@@ -566,7 +562,7 @@ class MainActivity : FragmentActivity() {
         createNotificationChannel()
 
         // --- Accusés d'envoi SMS (verdict réel du système) ---
-        val smsFilter = IntentFilter(SMS_SENT_ACTION)
+        val smsFilter = IntentFilter(smsSentAction)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             registerReceiver(smsSentReceiver, smsFilter, Context.RECEIVER_NOT_EXPORTED)
         } else {
@@ -577,8 +573,8 @@ class MainActivity : FragmentActivity() {
         // Section 6 : les permissions ne sont PLUS demandées en un bloc ici.
         // Le flow d'onboarding JS (window) les demande groupe par groupe, dans
         // l'ordre, avec explication, via MarselBridge.requestPermissionGroup().
-        // ACCESS_BACKGROUND_LOCATION est demandée séparément et en dernier (G1) ;
-        // plus aucune permission Bluetooth (G3).
+        // ACCESS_BACKGROUND_LOCATION n'est plus demandée (retirée du manifeste
+        // pour la publication Play) ; plus aucune permission Bluetooth (G3).
 
         // --- WiFi P2P setup ---
         // A1/3e : ChannelListener obligatoire — un channel mort sans listener
@@ -2691,7 +2687,7 @@ class MainActivity : FragmentActivity() {
                 return
             }
             val sentPi = trackId?.let {
-                val intent = Intent(SMS_SENT_ACTION)
+                val intent = Intent(smsSentAction)
                     .setPackage(packageName)
                     .putExtra("trackId", it)
                 PendingIntent.getBroadcast(
@@ -3126,7 +3122,7 @@ class MainActivity : FragmentActivity() {
             } ?: return
             try { grantUriPermission("com.android.mms", uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) } catch (e: Exception) {}
             val sentPi = PendingIntent.getBroadcast(
-                this, 0, Intent("com.example.marsel.MMS_SENT"),
+                this, 0, Intent("$packageName.MMS_SENT").setPackage(packageName),
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M)
                     PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
                 else PendingIntent.FLAG_UPDATE_CURRENT

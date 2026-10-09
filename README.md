@@ -207,11 +207,32 @@ test/experimentation
 
 La branche `main` contient le code initial. Tous les correctifs et fonctionnalités actifs sont sur `test/experimentation`.
 
-### Build release (APK signé)
+### Build release pour Google Play (AAB signé)
 
+Identifiant Play : **`com.marselapp.marsel`** (`applicationId`, définitif une
+fois publié). Le Play Store exige un **Android App Bundle (`.aab`)** signé
+avec une **clé d'upload**.
+
+**Option A — Android Studio (le plus simple)** :
+`Build → Generate Signed Bundle / APK → Android App Bundle`, puis
+« Create new… » la première fois pour créer la clé d'upload (`.jks`).
+Fichier produit : `app/release/app-release.aab`.
+
+**Option B — ligne de commande** : créer `keystore.properties` à la racine
+du projet (ignoré par Git, ne jamais le committer) :
+
+```properties
+storeFile=upload-keystore.jks
+storePassword=...
+keyAlias=upload
+keyPassword=...
 ```
-Build → Generate Signed Bundle/APK → APK
-```
+
+puis `./gradlew bundleRelease` → `app/build/outputs/bundle/release/app-release.aab`.
+
+⚠️ Sauvegarder la clé `.jks` et ses mots de passe hors du dépôt : sans elle,
+plus aucune mise à jour possible (sauf procédure de réinitialisation de la
+clé d'upload via la Play Console). Incrémenter `versionCode` à chaque envoi.
 
 Note : `isMinifyEnabled = false` — ProGuard désactivé pour l'instant.
 
@@ -225,7 +246,6 @@ Toutes déclarées dans `AndroidManifest.xml` et demandées dynamiquement au run
 |------------|-------|
 | `ACCESS_FINE_LOCATION` | GPS précis pour l'alerte d'urgence |
 | `ACCESS_COARSE_LOCATION` | GPS approximatif (fallback) |
-| `ACCESS_BACKGROUND_LOCATION` | Tracking position pendant urgence |
 | `SEND_SMS` | Envoi direct d'alerte SMS via SIM |
 | `CHANGE_WIFI_STATE` | WiFi Direct P2P |
 | `NEARBY_WIFI_DEVICES` | WiFi Direct sur Android 13+ (API 33+) |
@@ -463,14 +483,14 @@ Accès dans `script.js` via la variable globale `MARSEL.db`.
 Les enregistrements sont sauvegardés en **AAC/M4A** à :
 
 ```
-/sdcard/Android/data/com.example.marsel/cache/marsel_record_[timestamp].m4a
+/sdcard/Android/data/com.marselapp.marsel/cache/marsel_record_[timestamp].m4a
 ```
 
 Pour y accéder :
-- **Android Studio** : Device File Explorer → `sdcard/Android/data/com.example.marsel/cache/`
+- **Android Studio** : Device File Explorer → `sdcard/Android/data/com.marselapp.marsel/cache/`
 - **ADB** :
   ```bash
-  adb pull /sdcard/Android/data/com.example.marsel/cache/ ./recordings/
+  adb pull /sdcard/Android/data/com.marselapp.marsel/cache/ ./recordings/
   ```
 
 ---

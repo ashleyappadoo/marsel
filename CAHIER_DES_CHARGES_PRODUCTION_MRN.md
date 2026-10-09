@@ -250,7 +250,7 @@ Cette architecture rend les régressions difficiles à isoler et les tests compl
 
 Le projet utilise encore :
 
-* `applicationId = "com.example.marsel"` ;
+* `applicationId = "com.marselapp.marsel"` (✅ remplacé, cf. §17.3) ;
 * `versionCode = 1` ;
 * `versionName = "1.0"` ;
 * `isMinifyEnabled = false` en release ;
@@ -1651,19 +1651,16 @@ Les permissions doivent être demandées au moment de l’usage :
 
 ## 17.3 Identifiant d’application
 
-Remplacer avant publication :
+✅ **Fait** : l'identifiant `com.example.marsel` (refusé par la Play Console)
+a été remplacé par l'identifiant définitif :
 
 ```text
-com.example.marsel
+com.marselapp.marsel
 ```
 
-par un identifiant définitif, par exemple :
-
-```text
-com.marsel.app
-```
-
-Ce changement doit être décidé avant la mise en production afin d’éviter une migration de package tardive.
+(`applicationId` dans `app/build.gradle.kts` ; le `namespace` Kotlin interne
+reste `com.example.marsel`, sans incidence sur la publication). Il ne doit
+plus changer : une fois publié sur Google Play, il est définitif.
 
 ---
 

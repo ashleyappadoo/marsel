@@ -28,6 +28,12 @@ pendant une alerte.
 5. Manifest : déclarer le `<service>` + `FOREGROUND_SERVICE_LOCATION` /
    `FOREGROUND_SERVICE_MICROPHONE` (API 34+). La permission `FOREGROUND_SERVICE`
    est déjà présente.
+   ⚠️ `ACCESS_BACKGROUND_LOCATION` a été **retirée** pour la publication Play
+   (inutilisée, et elle impose une déclaration + vidéo sur la Play Console).
+   Un service de type `location` démarré pendant que l'app est au premier plan
+   n'en a pas besoin : ne la réintroduire que si un cas l'exige vraiment.
+   Les types de foreground service utilisés devront aussi être déclarés
+   dans la Play Console (« Contenu de l'application »).
 
 La permission `RECEIVE_BOOT_COMPLETED` a été retirée (aucun redémarrage au boot
 prévu). Si un jour on veut relancer un service après reboot, il faudra la

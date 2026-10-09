@@ -37,9 +37,18 @@ jobs:
       - name: Run unit tests
         run: ./gradlew testDebugUnitTest --stacktrace
 
+      # Variante release = celle envoyée sur Google Play : vérifie qu'elle se
+      # construit (lintVitalRelease peut bloquer la génération du .aab).
+      # Non signée ici — la clé d'upload n'est jamais sur GitHub.
+      - name: Build release bundle (unsigned)
+        run: ./gradlew bundleRelease --stacktrace
+
       - name: Upload test report
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: unit-test-report
-          path: app/build/reports/tests/testDebugUnitTest
+          path: |
+            app/build/reports/tests/testDebugUnitTest
+            app/build/reports/lint-results-release*
+            app/build/intermediates/lint_vital_intermediate_text_output
