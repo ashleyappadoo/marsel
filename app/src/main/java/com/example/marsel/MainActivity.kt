@@ -125,7 +125,7 @@ class MainActivity : FragmentActivity() {
     // without ever touching the alert service (avoids the clear→gap→re-add cycle).
     private var activeAlertServiceInfo: WifiP2pDnsSdServiceInfo? = null
     private var activePositionServiceInfo: WifiP2pDnsSdServiceInfo? = null
-    // Rate-limit position broadcasts: max 1 per 8s (interval fires every 10s)
+    // Rate-limit position broadcasts: max 1 per 5s (JS : 1re à +2 s, puis toutes les 10 s)
     private var lastPositionBroadcastMs: Long = 0
 
     // A2 : runnable différé qui retire le service marsel-res à expiration.
@@ -191,6 +191,16 @@ class MainActivity : FragmentActivity() {
 
     // BUG-5 : découverte déclenchée par événement PEERS_CHANGED (throttle 3s)
     @Volatile private var lastPeerTriggeredDiscoverMs = 0L
+    // Surdité DNS-SD (watchdogCheck) : récupérations consécutives sans aucun
+    // événement reçu entre elles, dernier pair Marsel vu, dernière recréation.
+    // Tout sur le main looper.
+    private var silentRecoveries = 0
+    private var lastMarselPeerSeenMono = NO_WINDOW
+    private var lastPeersVisibleMono = NO_WINDOW
+    private var lastDeafnessRecreateMono = NO_WINDOW
+    // Anti-blocage de la découverte : au plus un connect() par minute (cf.
+    // WIFI_P2P_PEERS_CHANGED_ACTION).
+    private var lastConnectAttemptMono = NO_WINDOW
 
     // BUG « storm » : le broadcast sticky WIFI_P2P_STATE_CHANGED est re-délivré
     // à chaque onResume (chaque dialogue de permission) — ne réagir qu'aux
@@ -1069,6 +1079,7 @@ class MainActivity : FragmentActivity() {
                             peerDevices.clear()
                             peerDevices.addAll(peers.deviceList)
                         }
+                        if (peers.deviceList.isNotEmpty()) lastPeersVisibleMono = SystemClock.elapsedRealtime()
                         // L'UI ne reçoit QUE les pairs Marsel confirmés via DNS-SD,
                         // jamais la liste brute (TV, imprimantes, téléphones sans Marsel).
                         notifyMarselPeersToJs()
@@ -1079,10 +1090,29 @@ class MainActivity : FragmentActivity() {
                         // FILTRAGE STRICT : jamais de connect() vers un appareil absent
                         // de marselPeers — un appareil non-Marsel ne répondra jamais et
                         // bloque le framework P2P (BUSY) pendant toute la négociation.
-                        val hasPending = synchronized(pendingRelayMessages) { pendingRelayMessages.isNotEmpty() }
-                        if (hasPending && groupOwnerAddress == null) {
+                        // FIX terrain (latence) : une négociation connect() met la
+                        // découverte DNS-SD en pause chez Android. Elle était relancée
+                        // à CHAQUE PEERS_CHANGED, et aussi pour de simples restes en
+                        // file (fin d'alerte, accusés) — qui passent déjà par DNS-SD.
+                        // Désormais : au plus une tentative par minute, et seulement
+                        // pour un paquet urgent (alerte, position, demande de SMS).
+                        val connectAllowed = groupOwnerAddress == null &&
+                            SystemClock.elapsedRealtime() - lastConnectAttemptMono > 60_000L
+                        // Parcours de la file seulement si un connect() est permis.
+                        val hasUrgentPending = connectAllowed && synchronized(pendingRelayMessages) {
+                            pendingRelayMessages.any { m ->
+                                when (extractJsonString(m, "type")) {
+                                    MarselProtocol.TYPE_EMERGENCY, MarselProtocol.TYPE_POSITION,
+                                    MarselProtocol.TYPE_RESOLVED_SMS_REQUEST,
+                                    MarselProtocol.TYPE_TIMEOUT_SMS_REQUEST -> true
+                                    else -> false
+                                }
+                            }
+                        }
+                        if (hasUrgentPending) {
                             val target = peers.deviceList.firstOrNull { marselPeers.containsKey(it.deviceAddress) }
                             if (target != null) {
+                                lastConnectAttemptMono = SystemClock.elapsedRealtime()
                                 connectToPeer(target)
                             } else if (peers.deviceList.isNotEmpty()) {
                                 Log.d(TAG, "Peers visibles (${peers.deviceList.size}) mais aucun pair Marsel confirmé — pas de connect()")
@@ -1415,8 +1445,22 @@ class MainActivity : FragmentActivity() {
         return qualityPenaltyMs + batteryPenaltyMs + jitterMs
     }
 
-    private fun scheduleElectedSmsSend(messageId: String, mobiles: List<String>, smsMsg: String, quality: String) {
-        val delayMs = electionDelayMs(quality)
+    // abortIfResolvedId : emergencyId à revérifier juste avant l'envoi. FIX
+    // terrain : un relais qui recevait l'alerte EN RETARD (souvent dans la même
+    // salve DNS-SD que sa fin d'alerte) envoyait quand même « ALERTE MARSEL »
+    // aux proches alors que la personne était déjà en sécurité. Pour l'alerte
+    // (E) et la relance 20 min (T) : abandon si l'urgence est résolue entre-
+    // temps. Pas pour la fin d'alerte (F), qui EST le message de résolution.
+    // Les 1,5 s de base laissent à une fin d'alerte de la même salve le temps
+    // d'être traitée (l'ordre relatif des relais, lui, reste inchangé).
+    private fun scheduleElectedSmsSend(
+        messageId: String,
+        mobiles: List<String>,
+        smsMsg: String,
+        quality: String,
+        abortIfResolvedId: String? = null
+    ) {
+        val delayMs = 1_500L + electionDelayMs(quality)
         thread {
             try {
                 Thread.sleep(delayMs)
@@ -1436,6 +1480,12 @@ class MainActivity : FragmentActivity() {
             // puisqu'on n'envoie rien).
             if (dedupLedger.isSeen("sms", messageId)) {
                 logToJs("RELAY", "SMS-REQ $messageId : un autre relais a déjà envoyé pendant l'attente — abandon")
+                smsInFlight.remove(messageId)
+                pendingRelaySends.remove(messageId)
+                return@thread
+            }
+            if (abortIfResolvedId != null && dedupLedger.isSeen("res", abortIfResolvedId)) {
+                logToJs("RELAY", "SMS relais $messageId : alerte terminée entre-temps — SMS d'alerte NON envoyé")
                 smsInFlight.remove(messageId)
                 pendingRelaySends.remove(messageId)
                 return@thread
@@ -1490,7 +1540,12 @@ class MainActivity : FragmentActivity() {
             if (mobiles.isEmpty()) { smsInFlight.remove(messageId); return }
             logToJs("RELAY", "SMS-REQ $msgType : envoi de ${mobiles.size} SMS à la place de l'émetteur")
             pendingRelaySends[messageId] = json
-            scheduleElectedSmsSend(messageId, mobiles, smsMsg, quality)
+            // T (« toujours en cours ») : caduque si l'urgence est résolue ;
+            // F (fin d'alerte) : toujours envoyée.
+            val abortId = if (msgType == MarselProtocol.TYPE_TIMEOUT_SMS_REQUEST) {
+                extractJsonString(json, "emergencyId") ?: extractJsonString(json, "id")
+            } else null
+            scheduleElectedSmsSend(messageId, mobiles, smsMsg, quality, abortId)
         } else {
             // Pas de réseau validé ici non plus : propager plus loin.
             // AUDIT-FIX 1 : propagation UNIQUE. Le paquet F/T n'est pas dédupliqué
@@ -1579,14 +1634,25 @@ class MainActivity : FragmentActivity() {
             deviceAddress = device.deviceAddress
             groupOwnerIntent = 0  // prefer client role so we reliably send to GO's relay server
         }
-        wifiP2pManager.connect(wifiP2pChannel, config, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() {
-                Log.d(TAG, "Connecting to ${device.deviceName}")
-            }
-            override fun onFailure(reason: Int) {
-                Log.e(TAG, "Connect to ${device.deviceName} failed: reason=$reason")
-            }
-        })
+        // Visible dans l'overlay (avant : Log.d/Log.e seulement, invisible en
+        // test terrain — impossible de corréler une négociation avec un trou de
+        // découverte).
+        logToJs("P2P", "connect() vers ${device.deviceName} (paquet urgent en attente)")
+        try {
+            wifiP2pManager.connect(wifiP2pChannel, config, object : WifiP2pManager.ActionListener {
+                override fun onSuccess() {
+                    Log.d(TAG, "Connecting to ${device.deviceName}")
+                }
+                override fun onFailure(reason: Int) {
+                    logToJs("P2P", "connect() vers ${device.deviceName} ÉCHEC reason=$reason")
+                    // BUSY (2) est banal pendant une découverte : ne pas le
+                    // compter vers la recréation du canal (6 échecs).
+                    if (reason != WifiP2pManager.BUSY) noteP2pError()
+                }
+            })
+        } catch (e: SecurityException) {
+            logToJs("P2P", "connect() refusé (permission appareils à proximité ?) : ${e.message}")
+        }
     }
 
     // =========================================================================
@@ -1617,6 +1683,7 @@ class MainActivity : FragmentActivity() {
             wifiP2pChannel,
             { instanceName, registrationType, device ->
                 lastDnsSdEventMs = System.currentTimeMillis()  // watchdog 3f
+                silentRecoveries = 0
                 Log.d(TAG, "DNS-SD service found: $instanceName ($registrationType) from ${device.deviceName}")
                 if (registrationType.contains("_marsel._tcp", ignoreCase = true) ||
                     instanceName.startsWith("marsel", ignoreCase = true)
@@ -1626,6 +1693,7 @@ class MainActivity : FragmentActivity() {
             },
             { fullDomain, txtRecord, device ->
                 lastDnsSdEventMs = System.currentTimeMillis()  // watchdog 3f
+                silentRecoveries = 0
                 if (fullDomain.contains("marsel", ignoreCase = true)) {
                     Log.d(TAG, "Marsel TXT record from ${device.deviceName}: $txtRecord")
                     markMarselPeer(device)
@@ -1739,6 +1807,42 @@ class MainActivity : FragmentActivity() {
         if (!wifiP2pEnabled) return false
         val silentMs = System.currentTimeMillis() - lastDnsSdEventMs
         if (silentMs > 60_000) {
+            // FIX terrain (« surdité » DNS-SD) : Tel A n'a plus rien reçu pendant
+            // 6 min alors que Tel B, à côté, diffusait son alerte — 6 RECOVERY
+            // d'affilée sans effet. Ces appels réussissent (aucune erreur), donc
+            // le filet « 6 échecs → recréation du canal » ne se déclenchait
+            // jamais. Après 3 récupérations silencieuses alors qu'un téléphone
+            // est visible à proximité (sinon le silence est normal : personne
+            // autour), on recrée le canal WiFi P2P (au plus toutes les 5 min).
+            val nowMono = SystemClock.elapsedRealtime()
+            // « Quelqu'un autour » = un appareil WiFi Direct vu par un
+            // PEERS_CHANGED RÉCENT (la liste peerDevices elle-même peut rester
+            // périmée indéfiniment) ou un pair Marsel entendu < 10 min.
+            val someoneAround = nowMono - lastPeersVisibleMono < 2 * 60_000L ||
+                nowMono - lastMarselPeerSeenMono < 10 * 60_000L
+            if (silentRecoveries >= 3 && someoneAround && nowMono - lastDeafnessRecreateMono > 5 * 60_000L) {
+                lastDeafnessRecreateMono = nowMono
+                silentRecoveries = 0
+                lastDnsSdEventMs = System.currentTimeMillis()
+                val why = "surdité DNS-SD : ${silentMs / 1000}s sans rien recevoir malgré un appareil à proximité"
+                // Une négociation connect() restée en suspens met la découverte
+                // en pause côté framework, et fermer NOTRE canal ne l'annule pas
+                // forcément : on l'annule explicitement d'abord.
+                if (groupOwnerAddress == null) {
+                    try {
+                        wifiP2pManager.cancelConnect(wifiP2pChannel, object : WifiP2pManager.ActionListener {
+                            override fun onSuccess() { logToJs("P2P", "négociation connect() en suspens annulée") }
+                            override fun onFailure(reason: Int) { /* rien en cours : normal */ }
+                        })
+                    } catch (e: Exception) { Log.v(TAG, "cancelConnect: ${e.message}") }
+                }
+                // Posté, PAS appelé ici : recreateP2pChannel() appelle
+                // kickDiscoveryNow(), qui re-poste rediscoverRunnable — exécuté
+                // DEPUIS rediscoverRunnable.run(), ça créait une seconde boucle
+                // de découverte permanente (run() se re-poste aussi à la fin).
+                p2pHandler.post { recreateP2pChannel(why) }
+                return true
+            }
             // QA-FIX : ne réarmer lastDnsSdEventMs QUE si fullServiceRecovery()
             // démarre réellement — sinon un debounce (chaîne déjà en cours
             // ailleurs, cf. canStartDiscoveryChain) faisait quand même repartir
@@ -1747,7 +1851,10 @@ class MainActivity : FragmentActivity() {
             // durer jusqu'à ~2 minutes avant d'être retenté, au lieu du
             // plafond de 60s voulu.
             val started = fullServiceRecovery("aucun événement DNS-SD depuis ${silentMs / 1000}s")
-            if (started) lastDnsSdEventMs = System.currentTimeMillis()
+            if (started) {
+                lastDnsSdEventMs = System.currentTimeMillis()
+                silentRecoveries++
+            }
             // QA-FIX : si fullServiceRecovery() a refusé de démarrer (chaîne
             // déjà en cours ailleurs), on N'A PAS lancé de recovery — le cycle
             // appelant doit alors quand même tenter restartServiceDiscovery()
@@ -2105,6 +2212,7 @@ class MainActivity : FragmentActivity() {
     private fun markMarselPeer(device: WifiP2pDevice?) {
         val addr = device?.deviceAddress ?: return
         if (addr.isEmpty()) return
+        lastMarselPeerSeenMono = SystemClock.elapsedRealtime()
         val existing = marselPeers[addr]
         if (existing == null) {
             marselPeers[addr] = MarselPeer(addr, device.deviceName ?: "?", System.currentTimeMillis())
@@ -2270,9 +2378,11 @@ class MainActivity : FragmentActivity() {
                             logToJs("DNS-SD", "POSITION: no active emergency, skip")
                             return@runOnUiThread
                         }
-                        // Rate-limit: skip if < 8s since last broadcast
+                        // Rate-limit 5 s (avant : 8 s). FIX terrain : la 1re position part à
+                        // +2 s et la 2e à +10 s, soit 8 s d'écart à quelques ms près — elle était
+                        // jetée (« skip (7996ms) ») et le suivi perdait 10 s dès le début.
                         val now = System.currentTimeMillis()
-                        if (now - lastPositionBroadcastMs < 8_000) {
+                        if (now - lastPositionBroadcastMs < 5_000) {
                             logToJs("DNS-SD", "POSITION: rate-limited, skip (${now - lastPositionBroadcastMs}ms)")
                             return@runOnUiThread
                         }
@@ -3189,7 +3299,8 @@ class MainActivity : FragmentActivity() {
             // Élection (délai selon réseau/batterie + revérif de l'ACK avant
             // d'envoyer réellement) : le premier envoi du lot élu porte le
             // suivi, son accusé fait verdict → succès = smsHandled + ACK.
-            scheduleElectedSmsSend(messageId, mobiles, smsMsg, quality)
+            val emergencyId = extractJsonString(json, "emergencyId") ?: extractJsonString(json, "id")
+            scheduleElectedSmsSend(messageId, mobiles, smsMsg, quality, emergencyId)
         } catch (e: Exception) {
             Log.e(TAG, "forwardEmergencyToContacts: ${e.message}")
         }
