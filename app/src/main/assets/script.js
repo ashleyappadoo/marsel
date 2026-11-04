@@ -2469,6 +2469,7 @@ function saveContact() {
    FEEDBACK BÊTA + LIENS EXTERNES
    --------------------------------------------------------- */
 function resetFeedbackForm() {
+    _feedbackScreenGen++;
     ['feedback-nom', 'feedback-prenom', 'feedback-email', 'feedback-avis'].forEach(function (id) {
         var el = document.getElementById(id);
         if (el) el.value = '';
@@ -2492,18 +2493,104 @@ function sendFeedback() {
         return '[' + e.ts + '] [' + e.src + '][' + e.tag + '] ' + e.msg;
     }).join('\n');
 
+    // ENVOI DIRECT (sans passer par l'appli mail du testeur) si un point de
+    // réception est configuré (config.js FEEDBACK_ENDPOINT_URL — script
+    // Google Apps Script d'ONA, cf. outils/feedback-google-apps-script).
+    // Sinon, ou en cas d'échec : comportement historique (appli mail).
+    var endpoint = (window.MARSEL_CONFIG && MARSEL_CONFIG.FEEDBACK_ENDPOINT_URL) || '';
+    if (endpoint && window.AndroidBridge && typeof AndroidBridge.submitFeedback === 'function') {
+        if (_feedbackSending) return;  // double appui sur « Envoyer »
+        _feedbackSending = true;
+        _pendingFeedback = { nom: nom, prenom: prenom, email: email, avis: avis, logText: logText,
+                             gen: _feedbackScreenGen };
+        _setFeedbackButtonBusy(true);
+        showToast('Envoi en cours…');
+        try {
+            AndroidBridge.submitFeedback(endpoint, (MARSEL_CONFIG.FEEDBACK_TOKEN || ''),
+                nom, prenom, email, avis, logText);
+        } catch (e) {
+            window.onFeedbackSubmitted(false, 'bridge');
+        }
+        return;
+    }
+    _sendFeedbackViaMailApp(nom, prenom, email, avis, logText);
+}
+
+var _feedbackSending = false;
+var _pendingFeedback = null;
+// Incrémenté à chaque ouverture de l'écran Feedback (resetFeedbackForm) :
+// une réponse tardive ne doit ni vider ni fermer un NOUVEAU brouillon.
+var _feedbackScreenGen = 0;
+
+function _setFeedbackButtonBusy(busy) {
+    var btn = document.getElementById('feedback-send-btn');
+    if (!btn) return;
+    btn.disabled = busy;
+    btn.textContent = busy ? 'Envoi…' : 'Envoyer';
+    btn.style.opacity = busy ? '0.6' : '';
+}
+
+/* Repli historique : brouillon pré-rempli dans l'appli mail du testeur. */
+function _sendFeedbackViaMailApp(nom, prenom, email, avis, logText, closeScreen) {
     try {
         if (window.AndroidBridge && typeof AndroidBridge.sendFeedbackEmail === 'function') {
             AndroidBridge.sendFeedbackEmail(nom, prenom, email, avis, logText);
         } else {
             showToast('Envoi indisponible sur cet appareil');
-            return;
+            return false;
         }
     } catch (e) {
         showToast('Erreur lors de la préparation du mail');
+        return false;
+    }
+    if (closeScreen !== false && _isScreenActive('screen-feedback')) goBack();
+    return true;
+}
+
+function _isScreenActive(id) {
+    var el = document.getElementById(id);
+    return !!(el && el.classList.contains('active'));
+}
+
+/* Callback natif de AndroidBridge.submitFeedback (thread de fond → UI). */
+window.onFeedbackSubmitted = function (ok, detail) {
+    var p = _pendingFeedback;
+    _feedbackSending = false;
+    _pendingFeedback = null;
+    _setFeedbackButtonBusy(false);
+    mLog('J', 'NET', 'feedback direct ' + (ok ? 'envoyé' : 'ÉCHEC (' + detail + ')'));
+    var sameScreen = !!p && p.gen === _feedbackScreenGen && _isScreenActive('screen-feedback');
+    if (ok) {
+        showToast('✅ Merci ! Votre retour a bien été envoyé.');
+        if (sameScreen) {
+            resetFeedbackForm();
+            goBack();
+        }
         return;
     }
-    goBack();
+    // Pas de connexion, quota, point de réception injoignable… : on ne perd
+    // pas le retour du testeur, on bascule sur son application mail.
+    showToast('Envoi direct impossible — votre application mail va s\'ouvrir');
+    if (p) _sendFeedbackViaMailApp(p.nom, p.prenom, p.email, p.avis, p.logText, sameScreen);
+};
+
+/* Lien « politique de confidentialité » de la case à cocher : ouvre la page
+   sans cocher/décocher la case (le lien est dans le <label>). */
+function openPrivacyPolicy(ev) {
+    if (ev) {
+        ev.preventDefault();
+        ev.stopPropagation();
+    }
+    showScreen('screen-privacy');
+    return false;
+}
+
+function openOnaWebsite() {
+    try {
+        if (window.AndroidBridge && typeof AndroidBridge.openExternalUrl === 'function') {
+            AndroidBridge.openExternalUrl('https://www.ona-asso.fr');
+        }
+    } catch (e) {}
 }
 
 /* Réseaux sociaux + site web : toujours ouverts via une app externe/le

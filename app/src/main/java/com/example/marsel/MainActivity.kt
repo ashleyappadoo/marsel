@@ -687,11 +687,14 @@ class MainActivity : FragmentActivity() {
     // APPLI doit en revanche s'identifier par un User-Agent propre et mettre
     // les tuiles en cache : c'est ce que fait ce proxy natif. Bonus sécurité :
     // les zones déjà consultées restent affichées hors connexion.
-    private val tileUserAgent: String by lazy {
-        val version = try {
+    private val appVersionName: String by lazy {
+        try {
             packageManager.getPackageInfo(packageName, 0).versionName ?: "?"
         } catch (e: Exception) { "?" }
-        "Marsel/$version (Android ${Build.VERSION.RELEASE}; $packageName; +https://marselapp.com)"
+    }
+
+    private val tileUserAgent: String by lazy {
+        "Marsel/$appVersionName (Android ${Build.VERSION.RELEASE}; $packageName; +https://marselapp.com)"
     }
 
     private fun tileResponse(bytes: ByteArray): WebResourceResponse =
@@ -2950,12 +2953,68 @@ class MainActivity : FragmentActivity() {
     }
 
     // =========================================================================
-    // Feedback bêta — envoi par email via l'app mail de l'utilisateur
+    // Feedback bêta
     // =========================================================================
-    // Pas de backend/SMTP : on prépare un brouillon complet (destinataire,
-    // sujet, corps, pièce jointe) dans l'app mail déjà installée, cohérent
-    // avec le choix "aucun serveur Marsel" du reste de l'app. L'utilisateur
-    // garde la main pour l'envoi final.
+    // 1) Envoi DIRECT (postFeedback) vers le script Google Apps Script d'ONA,
+    //    qui transmet formulaire + journaux par Gmail — aucun serveur Marsel.
+    // 2) Repli (sendFeedbackEmailInternal) : brouillon complet dans l'appli
+    //    mail du testeur, qui garde la main pour l'envoi final.
+    /**
+     * POST JSON vers le script Apps Script d'ONA. Retourne (succès, détail).
+     * Le script répond {"ok":true} ; Google répond d'abord par une redirection
+     * 302 vers script.googleusercontent.com, suivie automatiquement (le POST
+     * est déjà traité par le script à ce stade).
+     */
+    private fun postFeedback(
+        endpoint: String, token: String,
+        nom: String, prenom: String, email: String, avis: String, logText: String
+    ): Pair<Boolean, String> {
+        if (!endpoint.startsWith("https://")) return false to "endpoint non https"
+        return try {
+            // Même date (fuseau du téléphone) que l'envoi par appli mail, pour
+            // un objet identique « Marsel Feedback_dd-MM-yyyy_Nom ».
+            val dateStr = java.text.SimpleDateFormat("dd-MM-yyyy", java.util.Locale.FRANCE).format(java.util.Date())
+            val body = org.json.JSONObject().apply {
+                put("token", token)
+                put("date", dateStr)
+                put("nom", nom)
+                put("prenom", prenom)
+                put("email", email)
+                put("avis", avis)
+                put("logs", logText)
+                put("appVersion", appVersionName)
+                put("android", Build.VERSION.RELEASE ?: "?")
+                put("device", "${Build.MANUFACTURER} ${Build.MODEL}")
+            }.toString().toByteArray(Charsets.UTF_8)
+            val conn = java.net.URL(endpoint).openConnection() as java.net.HttpURLConnection
+            try {
+                conn.requestMethod = "POST"
+                conn.doOutput = true
+                conn.instanceFollowRedirects = true
+                conn.connectTimeout = 15_000
+                // Généreux : le script envoie l'e-mail AVANT de répondre ; un
+                // délai trop court (démarrage à froid d'Apps Script) ferait
+                // conclure à un échec et ouvrir l'appli mail → doublon.
+                conn.readTimeout = 60_000
+                conn.setRequestProperty("Content-Type", "text/plain; charset=utf-8")
+                conn.setFixedLengthStreamingMode(body.size)
+                conn.outputStream.use { it.write(body) }
+                val code = conn.responseCode
+                val text = try {
+                    (if (code in 200..299) conn.inputStream else conn.errorStream)
+                        ?.bufferedReader()?.use { it.readText() } ?: ""
+                } catch (e: Exception) { "" }
+                val ok = code in 200..299 && Regex(""""ok"\s*:\s*true""").containsMatchIn(text)
+                if (ok) true to "ok" else false to "HTTP $code ${text.take(120)}"
+            } finally {
+                conn.disconnect()
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "postFeedback: ${e.message}")
+            false to (e.message ?: e.javaClass.simpleName)
+        }
+    }
+
     private fun sendFeedbackEmailInternal(nom: String, prenom: String, email: String, avis: String, logText: String) {
         try {
             val dateStr = java.text.SimpleDateFormat("dd-MM-yyyy", java.util.Locale.FRANCE).format(java.util.Date())
@@ -3431,6 +3490,31 @@ class MainActivity : FragmentActivity() {
         @JavascriptInterface
         fun sendFeedbackEmail(nom: String, prenom: String, email: String, avis: String, logText: String) {
             runOnUiThread { sendFeedbackEmailInternal(nom, prenom, email, avis, logText) }
+        }
+
+        // Envoi DIRECT du feedback (formulaire + logs) vers le point de
+        // réception d'ONA (script Google Apps Script), sans passer par
+        // l'appli mail du testeur. Réseau sur un thread de fond ; le verdict
+        // revient au JS via window.onFeedbackSubmitted(ok, détail).
+        @JavascriptInterface
+        fun submitFeedback(
+            endpoint: String, token: String,
+            nom: String, prenom: String, email: String, avis: String, logText: String
+        ) {
+            thread {
+                val (ok, rawDetail) = postFeedback(endpoint, token, nom, prenom, email, avis, logText)
+                // Détail = extrait de réponse serveur / message d'exception : on
+                // ne garde que des caractères sûrs, pour que le JS généré ne
+                // puisse jamais échouer à l'analyse (sinon le bouton resterait
+                // bloqué sur « Envoi… » sans repli vers l'appli mail).
+                val detail = rawDetail.replace(Regex("[^\\p{L}\\p{N} .,:;_/()=+-]"), " ").take(160)
+                runOnUiThread {
+                    webView.evaluateJavascript(
+                        "window.onFeedbackSubmitted && window.onFeedbackSubmitted($ok, ${escapeJs(detail)})",
+                        null
+                    )
+                }
+            }
         }
 
         @JavascriptInterface

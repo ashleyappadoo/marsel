@@ -236,6 +236,23 @@ clé d'upload via la Play Console). Incrémenter `versionCode` à chaque envoi.
 
 Note : `isMinifyEnabled = false` — ProGuard désactivé pour l'instant.
 
+### Feedback bêta : réception directe par e-mail
+
+Quand un testeur appuie sur **Envoyer** (Réglages → Feedback), l'application
+envoie directement le formulaire et les journaux de la session à un petit
+script **Google Apps Script** hébergé sur le compte Google d'ONA. Ce script
+transmet le tout par Gmail à `ona.action@gmail.com`, journaux en pièce jointe,
+avec pour objet `Marsel Feedback_<date>_<Nom>`. « Répondre » écrit au testeur.
+
+Installation, une seule fois : suivre l'en-tête de
+`outils/feedback-google-apps-script/Code.gs`, puis coller l'URL obtenue
+(`…/exec`) dans `app/src/main/assets/config.js` → `FEEDBACK_ENDPOINT_URL`.
+`TOKEN` (script) et `FEEDBACK_TOKEN` (config.js) doivent rester identiques.
+
+Tant que `FEEDBACK_ENDPOINT_URL` est vide, ou si l'envoi direct échoue (pas
+de connexion, quota…), l'application ouvre l'appli mail du testeur avec un
+brouillon pré-rempli, comme avant.
+
 ---
 
 ## Permissions Android

@@ -28,6 +28,16 @@ var MARSEL_CONFIG = {
     // sans clé, ses tuiles s'affichent barrées de « API KEY REQUIRED ».
     CARTO_API_KEY: '',
 
+    // === FEEDBACK BÊTA (envoi direct) ===
+    // URL du script Google Apps Script d'ONA (« Déployer → Application Web »,
+    // se termine par /exec) — cf. outils/feedback-google-apps-script/Code.gs.
+    // Vide = le testeur passe par son application mail (comportement d'origine).
+    FEEDBACK_ENDPOINT_URL: '',
+    // Doit être IDENTIQUE à la constante TOKEN du script Apps Script.
+    // Ce n'est pas un secret fort (il est lisible dans l'APK) : il écarte
+    // seulement les envois au hasard ; le script limite aussi le débit.
+    FEEDBACK_TOKEN: 'mrsl-fb-9982b100b6844288b9a434f6',
+
     // === APP SETTINGS ===
     EMERGENCY_RELAY_PORT: 8890,     // WiFi Direct relay port (must match Android)
     RELAY_HOP_LIMIT: 5,             // Max 5 sauts : borne la propagation ET le délai

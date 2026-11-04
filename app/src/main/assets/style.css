@@ -984,6 +984,48 @@ body {
 }
 
 /* =========================================================
+   POLITIQUE DE CONFIDENTIALITÉ + CRÉDIT ONA
+   ========================================================= */
+
+.privacy-list {
+  margin: 8px 0 0 18px;
+  font-size: 13.5px;
+  color: var(--text-dark);
+  line-height: 1.6;
+}
+
+.privacy-list li {
+  margin-bottom: 4px;
+}
+
+/* Lien dans le libellé de la case à cocher (écran d'authentification) */
+.auth-privacy-link {
+  color: var(--blue);
+  font-weight: 700;
+  text-decoration: underline;
+}
+
+.ona-credit-link {
+  display: block;
+  width: 100%;
+  margin-top: 16px;
+  padding: 8px;
+  background: none;
+  border: none;
+  font-family: 'Nunito', sans-serif;
+  font-size: 13px;
+  color: var(--text-grey);
+  text-align: center;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.ona-credit-link strong {
+  color: var(--blue);
+  text-decoration: underline;
+}
+
+/* =========================================================
    MESSAGING SCREEN
    ========================================================= */
 

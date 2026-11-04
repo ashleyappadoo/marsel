@@ -201,7 +201,9 @@
       </div>
       <label class="checkbox-label" style="margin-top:4px;">
         <input type="checkbox" id="agree-tnc" />
-        <span>J'accepte les conditions d'utilisation &amp; la politique de confidentialité</span>
+        <!-- Le lien ouvre screen-privacy SANS cocher/décocher la case
+             (openPrivacyPolicy bloque l'activation du label). -->
+        <span>J'accepte les conditions d'utilisation &amp; la <a href="#" class="auth-privacy-link" onclick="openPrivacyPolicy(event)">politique de confidentialité</a></span>
       </label>
       <p class="auth-lock-hint">Aucun compte serveur, aucune connexion Google/Facebook — votre
         mot de passe est vérifié uniquement sur cet appareil.</p>
@@ -370,6 +372,11 @@
       </div>
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#E84315" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
     </div>
+
+    <!-- Crédit développeur : ouvre www.ona-asso.fr dans le navigateur -->
+    <button type="button" class="ona-credit-link" onclick="openOnaWebsite()">
+      Développé par <strong>ONA</strong>
+    </button>
   </div>
 
   <!-- Logout button -->
@@ -528,6 +535,15 @@
       </div>
       <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#E84315" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
     </div>
+    <div class="menu-card" onclick="showScreen('screen-privacy')">
+      <div class="menu-card-left">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="#1A35C8" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/>
+        </svg>
+        <span class="menu-card-title">Politique de confidentialité</span>
+      </div>
+      <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="#E84315" stroke-width="2.5" stroke-linecap="round"><polyline points="9 18 15 12 9 6"/></svg>
+    </div>
   </div>
 </div>
 
@@ -612,7 +628,9 @@
     <p class="sub-legal-text" style="margin-bottom:16px;">
       Merci de tester Marsel ! Votre avis nous aide à améliorer l'app pendant
       cette phase bêta. Les journaux techniques de votre session en cours
-      seront joints automatiquement pour nous aider à comprendre le contexte.
+      (événements du réseau Marsel, positions GPS de la session, et le cas
+      échéant numéros de vos proches) seront joints automatiquement pour nous
+      aider à comprendre le contexte.
     </p>
     <div class="field-group">
       <label class="field-label blue">Nom</label>
@@ -632,7 +650,7 @@
         style="resize:vertical; min-height:120px; font-family:'Nunito',sans-serif;"
         placeholder="Décrivez ce que vous avez observé, un bug, une suggestion..."></textarea>
     </div>
-    <button class="btn-primary full-width orange-btn" style="margin-top:8px;" onclick="sendFeedback()">Envoyer</button>
+    <button id="feedback-send-btn" class="btn-primary full-width orange-btn" style="margin-top:8px;" onclick="sendFeedback()">Envoyer</button>
   </div>
 </div>
 
@@ -691,6 +709,133 @@
     </div>
 
     <p class="sub-legal-text">Version bêta — un souci, une idée ? Utilisez le bouton Feedback dans les Réglages pour nous écrire.</p>
+  </div>
+</div>
+
+<!-- ===================== SCREEN: POLITIQUE DE CONFIDENTIALITÉ ===================== -->
+<!-- Accessible depuis l'écran d'authentification (lien de la case à cocher)
+     et depuis Réglages > Aide. Contenu statique, rédigé d'après le
+     fonctionnement RÉEL de l'application : à mettre à jour à chaque
+     changement de traitement de données. -->
+<div id="screen-privacy" class="screen">
+  <div class="screen-header">
+    <button class="back-btn orange" onclick="goBack()" aria-label="Retour">
+      <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="#E84315" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round">
+        <polyline points="9 14 4 9 9 4"/>
+        <path d="M20 20v-7a4 4 0 0 0-4-4H4"/>
+      </svg>
+    </button>
+    <h2 class="screen-title blue">Confidentialité</h2>
+    <div style="width:40px;"></div>
+  </div>
+
+  <div class="screen-body" style="overflow-y:auto;">
+    <div class="howto-card">
+      <h3 class="howto-title">Politique de confidentialité de Marsel</h3>
+      <p class="howto-text">Version du 4 novembre 2026 — application en phase bêta.</p>
+      <p class="howto-text" style="margin-top:10px;">Marsel est une application de sécurité personnelle. Elle a été conçue pour que vos données restent sur votre téléphone : il n'y a <strong>ni compte en ligne, ni serveur Marsel</strong>. Cette politique explique, sans détour, quelles données sont utilisées, quand elles quittent votre téléphone, vers qui, et quels sont vos droits.</p>
+      <p class="howto-text" style="margin-top:10px;"><strong>En cas de danger immédiat, appelez le 17 ou le 112</strong> (114 par SMS pour les personnes sourdes ou malentendantes). Violences conjugales : 3919 (gratuit et anonyme). Marsel ne remplace pas les services d'urgence.</p>
+    </div>
+
+    <div class="howto-card">
+      <h3 class="howto-title">1. Responsable du traitement</h3>
+      <p class="howto-text">L'application Marsel est développée et éditée par l'association <strong>ONA</strong> (www.ona-asso.fr). Pour toute question relative à vos données ou à cette politique : <strong>ona.action@gmail.com</strong>.</p>
+    </div>
+
+    <div class="howto-card">
+      <h3 class="howto-title">2. Données conservées sur votre téléphone</h3>
+      <p class="howto-text">Les données suivantes sont enregistrées uniquement sur votre appareil :</p>
+      <ul class="privacy-list">
+        <li>votre <strong>pseudo</strong> et, si vous les renseignez, votre numéro de mobile et votre adresse e-mail ;</li>
+        <li>votre <strong>mot de passe</strong> : il n'est jamais enregistré en clair, seule une empreinte cryptographique (PBKDF2) est conservée pour vérifier votre saisie ;</li>
+        <li>vos <strong>proches de confiance</strong> (5 au maximum) : nom et numéro de téléphone. Ils sont choisis via le sélecteur de contacts d'Android : Marsel n'a pas accès à votre carnet d'adresses ;</li>
+        <li>l'<strong>alerte en cours</strong> et l'<strong>historique des alertes</strong> envoyées ou reçues : identifiants, positions, heures, numéros de vos proches de confiance et, pour les alertes reçues d'autres téléphones Marsel, les numéros de leurs proches ;</li>
+        <li>vos <strong>réglages</strong> (localisation, flash, enregistrement audio) ;</li>
+        <li>les <strong>enregistrements audio</strong>, si vous avez activé cette option : ils sont enregistrés dans le dossier Musique/Marsel de votre téléphone ;</li>
+        <li>les <strong>morceaux de carte</strong> déjà consultés (cache de 30 jours au plus), pour que la carte reste visible sans connexion ;</li>
+        <li>des <strong>identifiants techniques</strong> de messages, gardés 10 minutes pour éviter de traiter deux fois la même alerte, et un identifiant propre à votre installation de Marsel.</li>
+      </ul>
+      <p class="howto-text" style="margin-top:10px;">Votre profil, vos proches, votre accès et l'alerte en cours sont <strong>chiffrés</strong> (AES-256, clé protégée par le système Android). L'historique des alertes et la file d'attente du réseau Marsel sont enregistrés dans l'espace privé de l'application, <strong>sans chiffrement supplémentaire</strong> à ce stade de la bêta. La sauvegarde automatique d'Android vers le cloud est désactivée pour Marsel.</p>
+    </div>
+
+    <div class="howto-card">
+      <h3 class="howto-title">3. Quand vos données quittent votre téléphone</h3>
+      <p class="howto-text"><strong>a) Lorsque vous déclenchez une alerte</strong>, un SMS est envoyé depuis votre carte SIM à vos proches de confiance. Il contient votre pseudo, un lien de localisation (Google Maps) et l'heure. Si l'alerte est toujours active au bout de 20 minutes, un nouveau SMS leur est envoyé avec votre position du moment. À la fin de l'alerte, un SMS les en informe, avec votre dernière position connue. Si l'enregistrement audio est activé, il peut leur être envoyé par MMS. Lorsque votre téléphone ne peut pas envoyer ces SMS, un téléphone Marsel voisin les envoie à sa place (voir b).</p>
+      <p class="howto-text" style="margin-top:10px;"><strong>b) Sur le réseau Marsel</strong> (WiFi Direct, sans internet), votre alerte est diffusée aux téléphones Marsel situés à proximité (environ 50 à 100 m), qui peuvent la relayer de proche en proche (5 relais au plus). Sont transmis : un identifiant d'alerte aléatoire, un identifiant technique propre à votre installation de Marsel (il permet de relier entre elles les alertes d'un même téléphone), un alias (« Alerte Marsel #XXXX ») à la place de votre pseudo, votre position GPS et ses mises à jour pendant l'alerte, l'heure, le fait qu'un enregistrement audio existe, et <strong>les numéros de vos proches de confiance</strong>. Ces numéros permettent à un téléphone voisin d'envoyer les SMS à votre place si le vôtre ne le peut pas ; dans ce cas, votre pseudo est aussi transmis, pour que vos proches sachent qui les alerte.</p>
+      <p class="howto-text" style="margin-top:10px;">Les autres utilisateurs ne voient que l'alias et la position sur leur carte. Ces informations peuvent rester temporairement enregistrées sur leurs appareils. À ce stade de la bêta, ces échanges <strong>ne sont pas chiffrés</strong> : un appareil à proximité pourrait techniquement les capter.</p>
+      <p class="howto-text" style="margin-top:10px;"><strong>c) Votre téléphone aide aussi les autres.</strong> Lorsque Marsel est ouvert, il reçoit et relaie les alertes des téléphones Marsel voisins. S'il dispose d'une carte SIM et d'un réseau, il peut envoyer automatiquement, depuis votre SIM et sans affichage, les SMS d'alerte ou de fin d'alerte d'une personne qui n'a pas de réseau. Ces SMS suivent les conditions de votre forfait. Vous pouvez vous y opposer en refusant l'autorisation SMS ou en fermant l'application.</p>
+      <p class="howto-text" style="margin-top:10px;"><strong>d) La carte</strong> est fournie par OpenStreetMap. Pour l'afficher, votre téléphone demande aux serveurs de la Fondation OpenStreetMap les zones consultées, ce qui leur transmet votre adresse IP, ces zones et une identification technique de l'application (nom, version de Marsel et d'Android). Marsel ne leur envoie aucune autre donnée.</p>
+      <p class="howto-text" style="margin-top:10px;"><strong>e) Le feedback bêta</strong> (facultatif) envoie à ONA votre nom, votre prénom, votre adresse e-mail, votre message, la version de l'application, la version d'Android et le modèle de votre téléphone, ainsi que les <strong>journaux techniques de la session</strong> : événements du réseau Marsel, positions GPS de la session, identifiants d'alertes et, le cas échéant, les numéros de vos proches de confiance ainsi que les alias ou pseudos d'autres utilisateurs reçus par le réseau Marsel. L'envoi passe par le service Google Apps Script / Gmail du compte d'ONA ou, à défaut, par votre propre application e-mail.</p>
+      <p class="howto-text" style="margin-top:10px;"><strong>f) Les liens externes</strong> (Instagram, marselapp.com, ona-asso.fr) s'ouvrent dans votre navigateur ou l'application concernée, dont les propres politiques s'appliquent.</p>
+    </div>
+
+    <div class="howto-card">
+      <h3 class="howto-title">4. Ce que Marsel ne fait pas</h3>
+      <ul class="privacy-list">
+        <li>aucune publicité, aucun outil de mesure d'audience ni traceur publicitaire ;</li>
+        <li>aucune vente, location ou cession de vos données ;</li>
+        <li>aucun compte en ligne ni serveur Marsel qui stockerait vos données ;</li>
+        <li>aucune localisation lorsque l'application est fermée ;</li>
+        <li>aucune photo ni vidéo : la caméra sert uniquement au flash ;</li>
+        <li>aucun accès à votre carnet d'adresses complet.</li>
+      </ul>
+    </div>
+
+    <div class="howto-card">
+      <h3 class="howto-title">5. Autorisations demandées</h3>
+      <ul class="privacy-list">
+        <li><strong>Position</strong> : partager votre position en cas d'alerte et l'afficher sur la carte ;</li>
+        <li><strong>Appareils à proximité</strong> : faire fonctionner le réseau Marsel entre téléphones (WiFi Direct) ;</li>
+        <li><strong>SMS</strong> : prévenir vos proches, ou ceux d'une personne hors réseau ;</li>
+        <li><strong>Notifications</strong> : vous avertir d'une alerte à proximité ;</li>
+        <li><strong>Microphone</strong> : enregistrement audio de protection, si vous l'activez ;</li>
+        <li><strong>Caméra</strong> : flash SOS uniquement.</li>
+      </ul>
+      <p class="howto-text" style="margin-top:10px;">Chaque autorisation peut être refusée ou retirée dans les réglages d'Android. Les fonctions correspondantes sont alors indisponibles.</p>
+    </div>
+
+    <div class="howto-card">
+      <h3 class="howto-title">6. Bases légales</h3>
+      <p class="howto-text">Conformément au Règlement général sur la protection des données (RGPD), les traitements reposent sur votre <strong>consentement</strong> (autorisations, enregistrement audio, feedback) et, pour la transmission et le relais des alertes d'urgence, sur la <strong>sauvegarde des intérêts vitaux</strong> des personnes concernées (article 6.1.d du RGPD). Le déclenchement d'une alerte peut révéler une situation de danger : il ne se fait que par votre action volontaire.</p>
+    </div>
+
+    <div class="howto-card">
+      <h3 class="howto-title">7. Durées de conservation</h3>
+      <ul class="privacy-list">
+        <li>données sur votre téléphone : jusqu'à leur modification ou suppression par vous, ou jusqu'à la désinstallation de l'application ou l'effacement de ses données ;</li>
+        <li>carte en cache : 30 jours au plus ;</li>
+        <li>identifiants anti-doublon : 10 minutes ;</li>
+        <li>historique des alertes et file d'attente du réseau Marsel : sur votre téléphone, jusqu'à l'effacement des données de l'application ou sa désinstallation (une alerte restée ouverte plus de 2 heures est marquée terminée au démarrage suivant de l'application) ;</li>
+        <li>messages de feedback et journaux reçus par ONA : pendant la phase bêta, et au plus 12 mois après leur réception ;</li>
+        <li>SMS et MMS : conservés par les opérateurs et sur les téléphones des destinataires, en dehors du contrôle de Marsel.</li>
+      </ul>
+    </div>
+
+    <div class="howto-card">
+      <h3 class="howto-title">8. Sécurité</h3>
+      <p class="howto-text">Accès local protégé par mot de passe (et biométrie si vous l'activez), demandé à chaque ouverture ; chiffrement des données sensibles ; aucune sauvegarde cloud ; aucun serveur centralisé. Aucune mesure n'est infaillible : protégez l'accès à votre téléphone, en particulier si une autre personne peut le manipuler.</p>
+    </div>
+
+    <div class="howto-card">
+      <h3 class="howto-title">9. Transferts hors de l'Union européenne</h3>
+      <p class="howto-text">Le feedback envoyé via Google (Google LLC) peut être traité aux États-Unis, dans le cadre du Data Privacy Framework UE–États-Unis. Les serveurs de cartes OpenStreetMap peuvent être servis par un réseau de distribution situé hors de l'Union européenne. Aucune autre donnée n'est transférée par Marsel.</p>
+    </div>
+
+    <div class="howto-card">
+      <h3 class="howto-title">10. Vos droits</h3>
+      <p class="howto-text">Vous disposez d'un droit d'accès, de rectification, d'effacement, de limitation, d'opposition et de portabilité, ainsi que du droit de retirer votre consentement à tout moment. Comme vos données sont sur votre téléphone, vous pouvez les consulter, les modifier ou les supprimer directement dans l'application, ou en la désinstallant. Pour les données de feedback détenues par ONA, écrivez à <strong>ona.action@gmail.com</strong> : nous répondons dans un délai d'un mois.</p>
+      <p class="howto-text" style="margin-top:10px;">Vous pouvez aussi adresser une réclamation à la CNIL (www.cnil.fr).</p>
+    </div>
+
+    <div class="howto-card">
+      <h3 class="howto-title">11. Mineurs</h3>
+      <p class="howto-text">Marsel s'adresse aux personnes de 15 ans et plus. Si tu as moins de 15 ans et que tu es en danger, parle à un adulte de confiance ou appelle le 119 (Allô Enfance en Danger, gratuit, 24 h/24).</p>
+    </div>
+
+    <div class="howto-card">
+      <h3 class="howto-title">12. Modifications</h3>
+      <p class="howto-text">Cette politique peut évoluer, notamment à la fin de la phase bêta. La date de mise à jour figure en haut de cette page. En cas de changement important, vous en serez informé·e dans l'application.</p>
+    </div>
   </div>
 </div>
 
