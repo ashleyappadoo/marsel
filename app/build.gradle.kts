@@ -31,8 +31,8 @@ android {
         minSdk = 24
         targetSdk = 36
         // À incrémenter à CHAQUE envoi sur la Play Console.
-        versionCode = 3
-        versionName = "1.0.2"
+        versionCode = 4
+        versionName = "1.0.3"
     }
 
     signingConfigs {
