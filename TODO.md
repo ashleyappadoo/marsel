@@ -66,6 +66,65 @@ Le service doit couvrir **deux cas**, pas seulement l'émetteur :
    d'un service always-on, et consentement utilisateur explicite (opt-in) pour
    « prêter » son téléphone comme relais/point de sortie SMS.
 
+### Décisions validées avec l'utilisateur (spécification)
+
+**A. Mode « alerte en cours » — AUTOMATIQUE, sans interrupteur**
+- Démarre tout seul à l'appui sur le bouton d'alerte (maintien 5 s) et
+  s'arrête à la fin de l'alerte, y compris à l'arrêt auto, à la
+  déconnexion, etc.
+- Maintient, écran éteint et application en arrière-plan : le suivi GPS,
+  la diffusion sur le réseau Marsel (alerte + positions), la relance
+  20 min (`AlarmManager.setExactAndAllowWhileIdle`), et la réception des
+  ACK SMS relais.
+- Notification permanente « Alerte Marsel active » avec une action
+  « Terminer l'alerte ».
+- Pas de réglage pour le désactiver : ce serait rendre l'alerte peu fiable
+  écran éteint, soit l'inverse du but de l'application.
+- Batterie : consommation forte (GPS précis + scan WiFi Direct toutes les
+  8 s) mais limitée à la durée de l'alerte. À MESURER en test terrain.
+
+**B. Mode « relais en arrière-plan » — OPT-IN, dans Réglages**
+Nouvelle section « Réseau Marsel » dans Réglages :
+1. **Interrupteur « Relais en arrière-plan »** — **désactivé par défaut**.
+   Texte d'explication clair, affiché avant activation :
+   - à quoi ça sert : aider les personnes à proximité, en relayant leurs
+     alertes et, si votre téléphone a une SIM et du réseau, en envoyant
+     leurs SMS d'alerte à votre place, même application fermée ;
+   - impact batterie (scan WiFi Direct permanent) ;
+   - une notification permanente « Marsel — relais actif » sera affichée
+     (obligation Android, impossible à masquer).
+   L'activation vaut consentement explicite à « prêter » son téléphone et
+   sa SIM (à tracer : date d'activation, stockée en local).
+2. **Option « Uniquement en charge »** (visible quand l'interrupteur est
+   actif) : le relais ne tourne que lorsque le téléphone est branché, donc
+   sans coût batterie. Idéal la nuit. Écouter
+   `ACTION_POWER_CONNECTED` / `ACTION_POWER_DISCONNECTED` (et l'état au
+   démarrage) pour démarrer / arrêter le service.
+3. **Arrêt automatique sous 20 % de batterie** (toujours actif quand le
+   relais l'est) : le service s'arrête sous 20 % (`ACTION_BATTERY_LOW` /
+   niveau via `BatteryManager`), avec une notification « Relais en pause :
+   batterie faible ». Il reprend au-dessus d'un seuil un peu plus haut
+   (25 %, pour éviter le va-et-vient) ou une fois branché.
+   ⚠️ Ne s'applique PAS au mode A : une alerte en cours n'est jamais
+   coupée pour économiser la batterie.
+
+**Points à traiter avec ces décisions**
+- Le relais en veille garde la cadence lente (12-25 s) et passe en cadence
+  rapide (8 s) à la réception d'une alerte.
+- Redémarrer le relais après un redémarrage du téléphone si l'interrupteur
+  est actif : réintroduire `RECEIVE_BOOT_COMPLETED` + un receiver de boot.
+- Types de service (Android 14+) et permissions à déclarer :
+  `FOREGROUND_SERVICE_LOCATION` (mode A), `FOREGROUND_SERVICE_CONNECTED_DEVICE`
+  (mode B) ; déclaration et justification dans la Play Console
+  (« Contenu de l'application → Services de premier plan »).
+- Mettre à jour la politique de confidentialité (in-app) : relais app fermée,
+  envoi de SMS pour autrui uniquement si l'interrupteur est actif, conditions
+  « en charge » et « batterie faible ».
+- Mettre à jour l'écran « Fonctionnement » et les textes d'onboarding.
+- Tests terrain : mesurer la consommation (mode A sur 20 min d'alerte,
+  mode B sur une nuit), et vérifier le relais écran éteint (doze),
+  application fermée, après redémarrage du téléphone.
+
 ### Prérequis : file unique des opérations WiFi Direct (à faire EN PREMIER)
 
 Le ForegroundService va reprendre toute la pile WiFi P2P. C'est le moment
