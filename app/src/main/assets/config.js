@@ -32,7 +32,7 @@ var MARSEL_CONFIG = {
     // URL du script Google Apps Script d'ONA (« Déployer → Application Web »,
     // se termine par /exec) — cf. outils/feedback-google-apps-script/Code.gs.
     // Vide = le testeur passe par son application mail (comportement d'origine).
-    FEEDBACK_ENDPOINT_URL: '',
+    FEEDBACK_ENDPOINT_URL: 'https://script.google.com/macros/s/AKfycby9qpsd-hGxSC5weLn-KFb-P23D4-VAJ0awiRin9IVU9YuoK2re4FMhsUPeTkuHRBWC/exec',
     // Doit être IDENTIQUE à la constante TOKEN du script Apps Script.
     // Ce n'est pas un secret fort (il est lisible dans l'APK) : il écarte
     // seulement les envois au hasard ; le script limite aussi le débit.
