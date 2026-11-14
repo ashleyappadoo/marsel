@@ -273,10 +273,13 @@ Toutes déclarées dans `AndroidManifest.xml` et demandées dynamiquement au run
 | `RECORD_AUDIO` | Enregistrement audio discret |
 | `BLUETOOTH*` | Future fonctionnalité mesh Bluetooth |
 | `POST_NOTIFICATIONS` | Notifications système |
-| `FOREGROUND_SERVICE` | Service en arrière-plan |
-| `WAKE_LOCK` | Maintien actif pendant urgence |
+| `FOREGROUND_SERVICE` | `MarselForegroundService` (alerte en cours, relais en arrière-plan) |
+| `FOREGROUND_SERVICE_LOCATION` | Type `location` : GPS écran éteint pendant une alerte |
+| `FOREGROUND_SERVICE_MICROPHONE` | Type `microphone` : enregistrement audio pendant l'alerte |
+| `FOREGROUND_SERVICE_CONNECTED_DEVICE` | Type `connectedDevice` : réseau Marsel (WiFi Direct) |
+| `WAKE_LOCK` | Maintien actif pendant urgence (et relais branché) |
 | `VIBRATE` | Retour haptique |
-| `RECEIVE_BOOT_COMPLETED` | Démarrage automatique (non implémenté) |
+| `RECEIVE_BOOT_COMPLETED` | Relance du relais en arrière-plan après redémarrage (s'il est activé) |
 
 ---
 
@@ -591,7 +594,7 @@ La portée WiFi Direct est typiquement **50-100m en extérieur**, moins en inté
 
 - **Chiffrement E2E** : Chiffrer les paquets relay avec les clés publiques des contacts.
 - **Authentification relay** : Token ou challenge-response pour éviter les faux paquets.
-- **Service en arrière-plan** : `ForegroundService` pour maintenir le relay actif quand l'app est fermée.
+- **Service en arrière-plan** : fait sur `test/foreground` (`MarselForegroundService` : alerte en cours automatique, relais en arrière-plan opt-in) — reste les mesures batterie terrain, cf. TODO.md.
 - **LoRa** : Intégration radio longue portée (mentionné dans le cahier des charges).
 - **Messagerie** : Implémenter le chiffrement et le protocole de messagerie sécurisée.
 - **Base Angela** : Connecter l'API de lieux sûrs dynamiques.

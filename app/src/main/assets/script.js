@@ -2938,7 +2938,7 @@ function escapeHtml(str) {
    --------------------------------------------------------- */
 var MARSEL_PERM_GROUPS = [
     { key: 'location',            icon: '📍', title: 'Position',
-      desc: 'Pour partager ta position en cas d\'alerte (pour l\'instant, garde Marsel ouvert pendant l\'alerte : le suivi écran éteint arrive dans une prochaine version)',
+      desc: 'Pour partager ta position en cas d\'alerte — elle continue d\'être suivie écran éteint pendant toute l\'alerte, jusqu\'à ce que tu la termines',
       impact: 'Sans position, tes proches ne sauront pas où te trouver.' },
     { key: 'nearby',              icon: '📶', title: 'Appareils à proximité',
       desc: 'Pour le réseau Marsel entre téléphones',
@@ -2947,7 +2947,7 @@ var MARSEL_PERM_GROUPS = [
       desc: 'Pour alerter tes proches même sans internet',
       impact: 'Sans SMS, tes proches ne seront pas alertés hors internet.' },
     { key: 'notifications',       icon: '🔔', title: 'Notifications',
-      desc: 'Pour être prévenu·e d\'une alerte à proximité',
+      desc: 'Pour être prévenu·e d\'une alerte à proximité, et voir la notification « Alerte Marsel active » pendant ta propre alerte',
       impact: 'Sans notifications, tu ne verras pas les alertes des personnes autour de toi.' },
     { key: 'microphone',          icon: '🎙️', title: 'Microphone',
       desc: 'Pour l\'enregistrement de protection (shield)',
