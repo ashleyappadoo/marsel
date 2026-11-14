@@ -2,7 +2,7 @@ name: Android CI
 
 on:
   push:
-    branches: [ test/experimentation ]
+    branches: [ test/experimentation, test/foreground ]
   pull_request:
 
 jobs:

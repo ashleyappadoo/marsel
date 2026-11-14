@@ -2,6 +2,70 @@
 
 ## ForegroundService d'alerte (A5 / G5) — PRIORITAIRE, chantier séparé
 
+### État — branche `test/foreground` (14 novembre 2026)
+
+**Fait (code + tests JVM + CI verte)** :
+1. Moteur réseau extrait de `MainActivity` → `MarselEngine` (singleton du
+   processus, retenu par l'écran, l'alerte ou le relais). Sans alerte ni
+   relais, il s'arrête comme l'ancien `onDestroy`.
+2. File unique WiFi Direct `P2pOpQueue` (+ `P2pOpQueueTest`) : toutes les
+   opérations asynchrones `WifiP2pManager` passent par elle (5 s max par
+   opération, vidée quand le canal est perdu/recréé). Les comportements
+   validés sont conservés (R 5 min, anti-zombie, purge E/P, TTL 10 min,
+   recréation après 6 erreurs). Les fenêtres anti-chevauchement
+   existantes sont gardées en plus (pas supprimées, par prudence). Une
+   opération sans réponse compte comme une erreur (filet des 6 erreurs) ;
+   les relances de découverte identiques en attente sont fusionnées.
+3. `MarselForegroundService` :
+   - **mode A** démarré par `activateEmergency` (et à la réouverture de
+     l'app pendant une alerte), arrêté par `deactivateEmergency` /
+     `doLogout`. Types `location` + `connectedDevice` (+ `microphone`
+     pendant l'enregistrement audio). Wake lock partiel pendant l'alerte.
+     Minuteur natif 10 s → `marselTrackingTick` (JS ralenti écran éteint).
+     Sans écran (app balayée) : positions P et relance 20 min envoyées par
+     le moteur natif. Relance 20 min dédoublonnée (JS / natif / redémarrage
+     via `timeoutSent`). Notification « Alerte Marsel active » + action
+     « Terminer l'alerte » (confirmation, seulement après déverrouillage).
+   - **mode B** : Réglages > Réseau Marsel (`RelaySettings`,
+     SharedPreferences `marsel_relay` : activé, uniquement en charge, date
+     du consentement). `RelayPolicy` (+ `RelayPolicyTest`) : pause sous
+     20 %, reprise à 25 % ou au branchement ; « Uniquement en charge » ⇒
+     attente du chargeur. Notifications « Marsel — relais actif »,
+     « Relais en pause : batterie faible », « relais en attente de
+     charge ». Wake lock partiel pendant que le relais tourne (sans lui,
+     écran éteint et débranché, le relais s'endort) : impact batterie à
+     MESURER en terrain. `MarselBootReceiver`
+     (BOOT_COMPLETED, MY_PACKAGE_REPLACED) + `RECEIVE_BOOT_COMPLETED`.
+4. Politique de confidentialité, écran Fonctionnement et textes
+   d'onboarding mis à jour.
+
+**Choix techniques à connaître** :
+- Relance 20 min : minuteur du moteur (10 s) tenu par le wake lock partiel
+  du service plutôt qu'`AlarmManager.setExactAndAllowWhileIdle`, qui exige
+  `SCHEDULE_EXACT_ALARM` (refusée par défaut sur Android 14+) ou
+  `USE_EXACT_ALARM` (réservée aux applis réveil/agenda sur le Play Store).
+  Le wake lock d'un service de premier plan reste honoré en Doze.
+- Le paquet E de l'alerte n'est gardé qu'en mémoire côté natif (jamais
+  écrit en clair sur le disque) : si Android tue le processus, l'alerte
+  reprend à la réouverture de l'app (comme avant).
+- Les états « en pause » / « en attente de charge » gardent le service
+  (et sa notification) : un service ne peut pas être relancé depuis
+  l'arrière-plan au branchement du chargeur (Android 12+).
+- Sans écran, l'ACK des SMS relayés (attente côté JS) n'est pas suivi
+  pour la relance native des 20 min.
+
+**Reste à faire (hors code)** :
+- Play Console → Contenu de l'application → Services de premier plan :
+  déclarer `location` (alerte en cours déclenchée par l'utilisateur),
+  `connectedDevice` (relais WiFi Direct opt-in), `microphone`
+  (enregistrement de protection pendant l'alerte), avec vidéo si demandée.
+- Tests terrain : batterie (mode A sur 20 min, mode B sur une nuit en
+  charge et sur batterie), relais écran éteint (Doze), app balayée,
+  après redémarrage, Android 14/15 (types de service), Samsung/Xiaomi
+  (optimisations batterie constructeur).
+
+---
+
 **Limitation actuelle :** l'app ne survit pas de façon fiable en arrière-plan
 pendant une alerte.
 

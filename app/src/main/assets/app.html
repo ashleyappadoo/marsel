@@ -522,6 +522,45 @@
       </div>
     </div>
 
+    <!-- Section Réseau Marsel : relais en arrière-plan (ForegroundService,
+         mode B — TODO.md). Désactivé par défaut, consentement explicite. -->
+    <div id="relay-settings">
+      <h3 class="section-heading blue" style="margin-top:24px;">Réseau Marsel</h3>
+      <div class="settings-card">
+        <div class="settings-row">
+          <div class="settings-row-text">
+            <div class="settings-row-title">Relais en arrière-plan</div>
+            <div class="settings-row-subtitle" id="relay-status">Désactivé</div>
+          </div>
+          <label class="toggle-switch">
+            <input type="checkbox" id="toggle-relay" onchange="onRelayToggle(this)" />
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        <p class="relay-explain">
+          Aidez les personnes à proximité : votre téléphone relaie leurs alertes
+          Marsel et, s'il a une carte SIM et du réseau, envoie leurs SMS d'alerte
+          à leurs proches — même application fermée.<br />
+          <strong>Batterie :</strong> le WiFi Direct reste actif en permanence,
+          ce qui consomme davantage. Pause automatique sous 20 % de batterie
+          (reprise à 25 % ou dès le branchement).<br />
+          <strong>Notification permanente</strong> « Marsel — relais actif » tant
+          que le relais tourne. Il redémarre seul après un redémarrage du téléphone.
+        </p>
+        <div class="settings-divider"></div>
+        <div class="settings-row">
+          <div class="settings-row-text">
+            <div class="settings-row-title">Uniquement en charge</div>
+            <div class="settings-row-subtitle">Le relais ne tourne que téléphone branché : aucun coût batterie, idéal la nuit.</div>
+          </div>
+          <label class="toggle-switch">
+            <input type="checkbox" id="toggle-relay-charging" onchange="onRelayChargingToggle(this)" />
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+      </div>
+    </div>
+
     <!-- Section Aide -->
     <h3 class="section-heading blue" style="margin-top:24px;">Aide</h3>
     <div class="menu-card" onclick="showScreen('screen-how-it-works')">
@@ -699,12 +738,19 @@
     </div>
 
     <div class="howto-card">
+      <h3 class="howto-title">6. Écran éteint et application en arrière-plan</h3>
+      <p class="howto-text">Pendant une alerte, Marsel continue de fonctionner même écran éteint ou si vous changez d'application : position, réseau Marsel et relance de vos proches au bout de 20 minutes. Une notification permanente « <strong>Alerte Marsel active</strong> » le signale ; son bouton « Terminer l'alerte » ouvre Marsel pour confirmer la fin de l'alerte (après déverrouillage de l'app).</p>
+      <p class="howto-text" style="margin-top:10px;">Hors alerte, vous pouvez aider les personnes à proximité en activant <strong>Réglages &gt; Réseau Marsel &gt; Relais en arrière-plan</strong> (désactivé par défaut) : votre téléphone relaie leurs alertes et envoie leurs SMS s'il a une carte SIM et du réseau, même application fermée. Cela consomme de la batterie : l'option « <strong>Uniquement en charge</strong> » le limite aux moments où le téléphone est branché (idéal la nuit), et il se met en pause sous 20 % de batterie.</p>
+    </div>
+
+    <div class="howto-card">
       <h3 class="howto-title">Réglages utiles</h3>
       <p class="howto-text">
         Dans <strong>Réglages</strong>, vous pouvez activer :<br>
         • la <strong>localisation</strong>, indispensable pour partager votre position avec vos proches ;<br>
         • le <strong>flash LED discret</strong>, pour signaler votre position sans bruit ;<br>
-        • l'<strong>enregistrement audio discret</strong>, pour garder une trace de la situation.
+        • l'<strong>enregistrement audio discret</strong>, pour garder une trace de la situation ;<br>
+        • le <strong>relais en arrière-plan</strong> (Réseau Marsel), pour relayer les alertes des personnes à proximité même application fermée.
       </p>
     </div>
 
@@ -732,7 +778,7 @@
   <div class="screen-body" style="overflow-y:auto;">
     <div class="howto-card">
       <h3 class="howto-title">Politique de confidentialité de Marsel</h3>
-      <p class="howto-text">Version du 4 novembre 2026 — application en phase bêta.</p>
+      <p class="howto-text">Version du 14 novembre 2026 — application en phase bêta.</p>
       <p class="howto-text" style="margin-top:10px;">Marsel est une application de sécurité personnelle. Elle a été conçue pour que vos données restent sur votre téléphone : il n'y a <strong>ni compte en ligne, ni serveur Marsel</strong>. Cette politique explique, sans détour, quelles données sont utilisées, quand elles quittent votre téléphone, vers qui, et quels sont vos droits.</p>
       <p class="howto-text" style="margin-top:10px;"><strong>En cas de danger immédiat, appelez le 17 ou le 112</strong> (114 par SMS pour les personnes sourdes ou malentendantes). Violences conjugales : 3919 (gratuit et anonyme). Marsel ne remplace pas les services d'urgence.</p>
     </div>
@@ -750,7 +796,7 @@
         <li>votre <strong>mot de passe</strong> : il n'est jamais enregistré en clair, seule une empreinte cryptographique (PBKDF2) est conservée pour vérifier votre saisie ;</li>
         <li>vos <strong>proches de confiance</strong> (5 au maximum) : nom et numéro de téléphone. Ils sont choisis via le sélecteur de contacts d'Android : Marsel n'a pas accès à votre carnet d'adresses ;</li>
         <li>l'<strong>alerte en cours</strong> et l'<strong>historique des alertes</strong> envoyées ou reçues : identifiants, positions, heures, numéros de vos proches de confiance et, pour les alertes reçues d'autres téléphones Marsel, les numéros de leurs proches ;</li>
-        <li>vos <strong>réglages</strong> (localisation, flash, enregistrement audio) ;</li>
+        <li>vos <strong>réglages</strong> (localisation, flash, enregistrement audio, relais en arrière-plan et option « Uniquement en charge ») et, si vous activez le relais en arrière-plan, la date à laquelle vous avez donné votre accord ;</li>
         <li>les <strong>enregistrements audio</strong>, si vous avez activé cette option : ils sont enregistrés dans le dossier Musique/Marsel de votre téléphone ;</li>
         <li>les <strong>morceaux de carte</strong> déjà consultés (cache de 30 jours au plus), pour que la carte reste visible sans connexion ;</li>
         <li>des <strong>identifiants techniques</strong> de messages, gardés 10 minutes pour éviter de traiter deux fois la même alerte, et un identifiant propre à votre installation de Marsel.</li>
@@ -763,7 +809,7 @@
       <p class="howto-text"><strong>a) Lorsque vous déclenchez une alerte</strong>, un SMS est envoyé depuis votre carte SIM à vos proches de confiance. Il contient votre pseudo, un lien de localisation (Google Maps) et l'heure. Si l'alerte est toujours active au bout de 20 minutes, un nouveau SMS leur est envoyé avec votre position du moment. À la fin de l'alerte, un SMS les en informe, avec votre dernière position connue. Si l'enregistrement audio est activé, il peut leur être envoyé par MMS. Lorsque votre téléphone ne peut pas envoyer ces SMS, un téléphone Marsel voisin les envoie à sa place (voir b).</p>
       <p class="howto-text" style="margin-top:10px;"><strong>b) Sur le réseau Marsel</strong> (WiFi Direct, sans internet), votre alerte est diffusée aux téléphones Marsel situés à proximité (environ 50 à 100 m), qui peuvent la relayer de proche en proche (5 relais au plus). Sont transmis : un identifiant d'alerte aléatoire, un identifiant technique propre à votre installation de Marsel (il permet de relier entre elles les alertes d'un même téléphone), un alias (« Alerte Marsel #XXXX ») à la place de votre pseudo, votre position GPS et ses mises à jour pendant l'alerte, l'heure, le fait qu'un enregistrement audio existe, et <strong>les numéros de vos proches de confiance</strong>. Ces numéros permettent à un téléphone voisin d'envoyer les SMS à votre place si le vôtre ne le peut pas ; dans ce cas, votre pseudo est aussi transmis, pour que vos proches sachent qui les alerte.</p>
       <p class="howto-text" style="margin-top:10px;">Les autres utilisateurs ne voient que l'alias et la position sur leur carte. Ces informations peuvent rester temporairement enregistrées sur leurs appareils. À ce stade de la bêta, ces échanges <strong>ne sont pas chiffrés</strong> : un appareil à proximité pourrait techniquement les capter.</p>
-      <p class="howto-text" style="margin-top:10px;"><strong>c) Votre téléphone aide aussi les autres.</strong> Lorsque Marsel est ouvert, il reçoit et relaie les alertes des téléphones Marsel voisins. S'il dispose d'une carte SIM et d'un réseau, il peut envoyer automatiquement, depuis votre SIM et sans affichage, les SMS d'alerte ou de fin d'alerte d'une personne qui n'a pas de réseau. Ces SMS suivent les conditions de votre forfait. Vous pouvez vous y opposer en refusant l'autorisation SMS ou en fermant l'application.</p>
+      <p class="howto-text" style="margin-top:10px;"><strong>c) Votre téléphone aide aussi les autres.</strong> Lorsque Marsel est ouvert, pendant votre propre alerte en cours, et en permanence si vous activez le <strong>relais en arrière-plan</strong> (Réglages &gt; Réseau Marsel, désactivé par défaut, même application fermée), il reçoit et relaie les alertes des téléphones Marsel voisins. S'il dispose d'une carte SIM et d'un réseau, il peut envoyer automatiquement, depuis votre SIM et sans affichage, les SMS d'alerte ou de fin d'alerte d'une personne qui n'a pas de réseau. Ces SMS suivent les conditions de votre forfait. Vous pouvez vous y opposer en désactivant le relais en arrière-plan, en refusant l'autorisation SMS ou en fermant l'application.</p>
       <p class="howto-text" style="margin-top:10px;"><strong>d) La carte</strong> est fournie par OpenStreetMap. Pour l'afficher, votre téléphone demande aux serveurs de la Fondation OpenStreetMap les zones consultées, ce qui leur transmet votre adresse IP, ces zones et une identification technique de l'application (nom, version de Marsel et d'Android). Marsel ne leur envoie aucune autre donnée.</p>
       <p class="howto-text" style="margin-top:10px;"><strong>e) Le feedback bêta</strong> (facultatif) envoie à ONA votre nom, votre prénom, votre adresse e-mail, votre message, la version de l'application, la version d'Android et le modèle de votre téléphone, ainsi que les <strong>journaux techniques de la session</strong> : événements du réseau Marsel, positions GPS de la session, identifiants d'alertes et, le cas échéant, les numéros de vos proches de confiance ainsi que les alias ou pseudos d'autres utilisateurs reçus par le réseau Marsel. L'envoi passe par le service Google Apps Script / Gmail du compte d'ONA ou, à défaut, par votre propre application e-mail.</p>
       <p class="howto-text" style="margin-top:10px;"><strong>f) Les liens externes</strong> (Instagram, marselapp.com, ona-asso.fr) s'ouvrent dans votre navigateur ou l'application concernée, dont les propres politiques s'appliquent.</p>
@@ -775,7 +821,7 @@
         <li>aucune publicité, aucun outil de mesure d'audience ni traceur publicitaire ;</li>
         <li>aucune vente, location ou cession de vos données ;</li>
         <li>aucun compte en ligne ni serveur Marsel qui stockerait vos données ;</li>
-        <li>aucune localisation lorsque l'application est fermée ;</li>
+        <li>aucune localisation lorsque l'application est fermée, sauf pendant une <strong>alerte en cours</strong> : votre position continue alors d'être suivie et partagée, écran éteint ou application en arrière-plan, jusqu'à la fin de l'alerte, ce que signale la notification permanente « Alerte Marsel active ». Le relais en arrière-plan ne suit pas votre position ;</li>
         <li>aucune photo ni vidéo : la caméra sert uniquement au flash ;</li>
         <li>aucun accès à votre carnet d'adresses complet.</li>
       </ul>
@@ -787,7 +833,7 @@
         <li><strong>Position</strong> : partager votre position en cas d'alerte et l'afficher sur la carte ;</li>
         <li><strong>Appareils à proximité</strong> : faire fonctionner le réseau Marsel entre téléphones (WiFi Direct) ;</li>
         <li><strong>SMS</strong> : prévenir vos proches, ou ceux d'une personne hors réseau ;</li>
-        <li><strong>Notifications</strong> : vous avertir d'une alerte à proximité ;</li>
+        <li><strong>Notifications</strong> : vous avertir d'une alerte à proximité, et afficher la notification permanente d'une alerte en cours ou du relais en arrière-plan ;</li>
         <li><strong>Microphone</strong> : enregistrement audio de protection, si vous l'activez ;</li>
         <li><strong>Caméra</strong> : flash SOS uniquement.</li>
       </ul>

@@ -127,7 +127,13 @@ var MARSEL = {
     mapCenteredAcc: null,      // précision du fix sur lequel la carte a été centrée
 
     // Timer 20 minutes (Section 4)
-    timeoutTimer: null         // setTimeout handle for the 20-min still-active alert
+    timeoutTimer: null,        // setTimeout handle for the 20-min still-active alert
+    timeoutDueAt: 0,           // échéance (ms) de la relance 20 min, 0 si non armée
+
+    // ForegroundService (alerte en cours écran éteint)
+    lastPosSentAt: 0,          // dernier envoi de position (dédoublonnage minuteur JS / natif)
+    appUnlocked: false,        // écran de verrouillage Marsel passé
+    pendingEndAlert: false     // « Terminer l'alerte » touché avant le déverrouillage
 };
 
 /* Durée avant relance SMS "alerte toujours en cours" (20 min) */
@@ -1038,6 +1044,10 @@ function activateEmergency() {
     dbPut('emergency_events', emergencyData).catch(function () {});
     secureSet('marsel_emergency', JSON.stringify(emergencyData));
 
+    // Alerte en cours : service de premier plan (GPS, réseau Marsel,
+    // positions et relance 20 min continuent écran éteint / app en fond).
+    startNativeAlertService(emergencyData);
+
     // Show own incident on map (uniquement si vraie position)
     if (pos) addIncidentMarker(emergencyData);
 
@@ -1060,6 +1070,11 @@ function deactivateEmergency() {
     cancelEmergencyTimeout();
 
     MARSEL.emergencyActive = false;
+
+    // Fin d'alerte : le service « alerte en cours » s'arrête tout de suite
+    // (avant l'envoi des SMS de fin : une erreur plus bas ne doit pas le
+    // laisser tourner et envoyer une relance « toujours en cours »).
+    stopNativeAlertService();
 
     // Stop shield
     if (window.AndroidBridge) {
@@ -1785,9 +1800,67 @@ function startEmergencyTracking(emergencyData) {
     }, 2000);
     MARSEL.trackingInterval = setInterval(function () {
         if (!MARSEL.emergencyActive) { stopEmergencyTracking(); return; }
-        sendPositionUpdate(MARSEL.currentLat, MARSEL.currentLng);
+        trackingStep();
     }, 10000);
 }
+
+// Une position toutes les ~10 s au plus, que le déclencheur soit le minuteur
+// JS ou le minuteur natif du service (minuteurs JS ralentis écran éteint).
+function trackingStep() {
+    if (Date.now() - (MARSEL.lastPosSentAt || 0) < 9000) return;
+    sendPositionUpdate(MARSEL.currentLat, MARSEL.currentLng);
+}
+
+/* ── ForegroundService « alerte en cours » (TODO.md, mode A) ── */
+
+function startNativeAlertService(emergencyData) {
+    if (!emergencyData || !window.AndroidBridge || typeof AndroidBridge.startAlertService !== 'function') return;
+    try { AndroidBridge.startAlertService(JSON.stringify(emergencyData)); } catch (e) {}
+}
+
+function stopNativeAlertService() {
+    if (!window.AndroidBridge || typeof AndroidBridge.stopAlertService !== 'function') return;
+    try { AndroidBridge.stopAlertService(); } catch (e) {}
+}
+
+// Appelé toutes les 10 s par le service pendant l'alerte : rattrape les
+// minuteurs JS ralentis quand l'écran est éteint ou l'app en arrière-plan.
+window.marselTrackingTick = function () {
+    if (!MARSEL.emergencyActive) return;
+    trackingStep();
+    if (MARSEL.timeoutTimer && MARSEL.timeoutDueAt && Date.now() >= MARSEL.timeoutDueAt) {
+        cancelEmergencyTimeout();
+        triggerEmergencyTimeout();
+    }
+};
+
+// Action « Terminer l'alerte » de la notification. Jamais sans confirmation,
+// et jamais avant le déverrouillage de l'app (un tiers ne peut pas arrêter
+// l'alerte depuis l'écran de verrouillage).
+window.marselRequestEndAlert = function () {
+    if (!MARSEL.emergencyActive) { MARSEL.pendingEndAlert = false; return; }
+    if (!MARSEL.appUnlocked) {
+        MARSEL.pendingEndAlert = true;
+        showToast('Déverrouillez Marsel pour terminer l\'alerte');
+        return;
+    }
+    MARSEL.pendingEndAlert = false;
+    setTimeout(function () {
+        if (!MARSEL.emergencyActive) return;
+        if (window.confirm('Terminer l\'alerte en cours ?\nVos proches recevront le SMS de fin d\'alerte.')) {
+            deactivateEmergency();
+        }
+    }, 400);
+};
+
+window.marselCheckEndAlertRequest = function () {
+    var pending = false;
+    try {
+        pending = !!(window.AndroidBridge && typeof AndroidBridge.consumeEndAlertRequest === 'function'
+            && AndroidBridge.consumeEndAlertRequest());
+    } catch (e) {}
+    if (pending) marselRequestEndAlert();
+};
 
 function stopEmergencyTracking() {
     if (MARSEL.trackingInterval) {
@@ -1805,13 +1878,15 @@ function stopEmergencyTracking() {
 function armEmergencyTimeout(emergencyData) {
     cancelEmergencyTimeout();
     var startTs = (emergencyData && emergencyData.timestamp) || Date.now();
-    var remaining = startTs + EMERGENCY_TIMEOUT_MS - Date.now();
+    MARSEL.timeoutDueAt = startTs + EMERGENCY_TIMEOUT_MS;
+    var remaining = MARSEL.timeoutDueAt - Date.now();
     if (remaining < 0) remaining = 0;
     mLog('J', 'NET', 'Timer 20min armé, reste ' + Math.round(remaining / 1000) + 's');
     MARSEL.timeoutTimer = setTimeout(triggerEmergencyTimeout, remaining);
 }
 
 function cancelEmergencyTimeout() {
+    MARSEL.timeoutDueAt = 0;
     if (MARSEL.timeoutTimer) {
         clearTimeout(MARSEL.timeoutTimer);
         MARSEL.timeoutTimer = null;
@@ -1827,6 +1902,25 @@ function triggerEmergencyTimeout() {
     var savedEmergency = null;
     try { savedEmergency = JSON.parse(secureGet('marsel_emergency') || 'null'); } catch (e) {}
     if (!savedEmergency) return;
+
+    // Une seule relance par alerte : le service peut l'avoir déjà envoyée
+    // pendant que l'écran était fermé, ou elle est déjà partie avant un
+    // redémarrage de l'app.
+    var toId = savedEmergency.id || MARSEL.emergencyId || '';
+    var nativeDone = false;
+    try {
+        nativeDone = !!(window.AndroidBridge && typeof AndroidBridge.isAlertTimeoutHandled === 'function'
+            && AndroidBridge.isAlertTimeoutHandled(String(toId)));
+    } catch (e) {}
+    if (savedEmergency.timeoutSent || nativeDone) {
+        mLog('J', 'NET', 'Timer 20min : relance déjà envoyée pour cette alerte');
+        return;
+    }
+    savedEmergency.timeoutSent = true;
+    secureSet('marsel_emergency', JSON.stringify(savedEmergency));
+    if (window.AndroidBridge && typeof AndroidBridge.noteAlertTimeoutHandled === 'function') {
+        try { AndroidBridge.noteAlertTimeoutHandled(String(toId)); } catch (e) {}
+    }
 
     var pseudo = savedEmergency.pseudo || 'Utilisateur';
     // Position réelle uniquement (fix courant ou dernière position réelle de l'alerte)
@@ -1854,6 +1948,7 @@ function sendPositionUpdate(lat, lng) {
     var savedEmergency = null;
     try { savedEmergency = JSON.parse(secureGet('marsel_emergency') || 'null'); } catch (e) {}
     if (!savedEmergency || !MARSEL.emergencyId) return;
+    MARSEL.lastPosSentAt = Date.now();
 
     var updatePacket = {
         type: 'MARSEL_POSITION_UPDATE',
@@ -2143,8 +2238,11 @@ function unlockIntoApp() {
     try { userData = JSON.parse(secureGet('marsel_user') || 'null'); } catch (e) {}
     MARSEL.currentUser = userData;
     MARSEL.screenHistory = [];
+    MARSEL.appUnlocked = true;
     showScreen('screen-home');
     startRealGPS();
+    // « Terminer l'alerte » touché dans la notification avant le déverrouillage
+    if (MARSEL.pendingEndAlert) marselRequestEndAlert();
 }
 
 /* Déverrouillage (secret local déjà créé) — PLUS de compte email/mot de
@@ -2238,7 +2336,10 @@ function doLogout() {
     MARSEL.emergencyActive = false;
     MARSEL.emergencyId = null;
     MARSEL.currentUser = null;
+    MARSEL.appUnlocked = false;
+    MARSEL.pendingEndAlert = false;
     secureRemove('marsel_emergency');
+    stopNativeAlertService();
     stopGPS();
     MARSEL.screenHistory = [];
     initAuthScreen();
@@ -2340,6 +2441,64 @@ function saveSetting(key, value) {
             stopGPS();
         }
     }
+}
+
+/* ── Réseau Marsel : relais en arrière-plan (ForegroundService, mode B) ──
+   Réglage natif (SharedPreferences) : il doit être lisible au redémarrage du
+   téléphone, sans écran ni JavaScript. */
+var RELAY_STATUS_LABELS = {
+    OFF: 'Désactivé',
+    STARTING: 'Démarrage…',
+    ACTIVE: 'Actif — vous relayez les alertes à proximité',
+    WAITING_CHARGE: 'En attente : démarre dès que le téléphone est branché',
+    PAUSED_LOW_BATTERY: 'En pause : batterie faible (reprise à 25 % ou au branchement)'
+};
+
+function getRelayStatus() {
+    try {
+        if (window.AndroidBridge && typeof AndroidBridge.getRelayStatus === 'function') {
+            return JSON.parse(AndroidBridge.getRelayStatus());
+        }
+    } catch (e) {}
+    return null;
+}
+
+function loadRelaySettings() {
+    var section = document.getElementById('relay-settings');
+    var st = getRelayStatus();
+    if (!st) { if (section) section.style.display = 'none'; return; }
+    if (section) section.style.display = '';
+    var t = document.getElementById('toggle-relay');
+    var c = document.getElementById('toggle-relay-charging');
+    var label = document.getElementById('relay-status');
+    if (t) t.checked = !!st.enabled;
+    if (c) c.checked = !!st.chargingOnly;
+    if (label) label.textContent = RELAY_STATUS_LABELS[st.enabled ? st.state : 'OFF'] || '';
+}
+
+function onRelayToggle(el) {
+    if (!window.AndroidBridge || typeof AndroidBridge.setRelayEnabled !== 'function') { el.checked = false; return; }
+    if (el.checked) {
+        // Consentement explicite (date enregistrée sur l'appareil).
+        var ok = window.confirm(
+            'Activer le relais en arrière-plan ?\n\n' +
+            'Votre téléphone relaiera les alertes Marsel des personnes à proximité et, ' +
+            's\'il a une carte SIM et du réseau, enverra leurs SMS d\'alerte à leurs proches, ' +
+            'même application fermée.\n\n' +
+            'Cela consomme de la batterie (pause automatique sous 20 %) et affiche une ' +
+            'notification permanente « Marsel — relais actif ».');
+        if (!ok) { el.checked = false; return; }
+    }
+    try { AndroidBridge.setRelayEnabled(!!el.checked); } catch (e) {}
+    mLog('J', 'NET', 'Relais en arrière-plan ' + (el.checked ? 'activé' : 'désactivé'));
+    showToast(el.checked ? 'Relais en arrière-plan activé' : 'Relais en arrière-plan désactivé');
+    setTimeout(loadRelaySettings, 800);
+}
+
+function onRelayChargingToggle(el) {
+    if (!window.AndroidBridge || typeof AndroidBridge.setRelayChargingOnly !== 'function') return;
+    try { AndroidBridge.setRelayChargingOnly(!!el.checked); } catch (e) {}
+    setTimeout(loadRelaySettings, 800);
 }
 
 /* ---------------------------------------------------------
@@ -2660,6 +2819,7 @@ function showScreen(id, isBack) {
     }
     if (id === 'screen-settings') {
         loadSettings();
+        loadRelaySettings();
     }
     if (id === 'screen-contacts') {
         renderContacts();
@@ -2780,7 +2940,7 @@ function escapeHtml(str) {
    --------------------------------------------------------- */
 var MARSEL_PERM_GROUPS = [
     { key: 'location',            icon: '📍', title: 'Position',
-      desc: 'Pour partager ta position en cas d\'alerte (pour l\'instant, garde Marsel ouvert pendant l\'alerte : le suivi écran éteint arrive dans une prochaine version)',
+      desc: 'Pour partager ta position en cas d\'alerte — elle continue d\'être suivie écran éteint pendant toute l\'alerte, jusqu\'à ce que tu la termines',
       impact: 'Sans position, tes proches ne sauront pas où te trouver.' },
     { key: 'nearby',              icon: '📶', title: 'Appareils à proximité',
       desc: 'Pour le réseau Marsel entre téléphones',
@@ -2789,7 +2949,7 @@ var MARSEL_PERM_GROUPS = [
       desc: 'Pour alerter tes proches même sans internet',
       impact: 'Sans SMS, tes proches ne seront pas alertés hors internet.' },
     { key: 'notifications',       icon: '🔔', title: 'Notifications',
-      desc: 'Pour être prévenu·e d\'une alerte à proximité',
+      desc: 'Pour être prévenu·e d\'une alerte à proximité, et voir la notification « Alerte Marsel active » pendant ta propre alerte',
       impact: 'Sans notifications, tu ne verras pas les alertes des personnes autour de toi.' },
     { key: 'microphone',          icon: '🎙️', title: 'Microphone',
       desc: 'Pour l\'enregistrement de protection (shield)',
@@ -2974,7 +3134,11 @@ document.addEventListener('DOMContentLoaded', function () {
         // déclenche immédiatement via armEmergencyTimeout (remaining=0).
         startEmergencyTracking(savedEmergency);
         armEmergencyTimeout(savedEmergency);
+        // App rouverte pendant une alerte : le service d'alerte reprend.
+        startNativeAlertService(savedEmergency);
     }
+    // App ouverte par l'action « Terminer l'alerte » de la notification
+    marselCheckEndAlertRequest();
 
     // 4. After splash delay, ALWAYS route through the lock screen (TODO.md
     // §1.3) : même si un secret local existe déjà, il doit être re-saisi
