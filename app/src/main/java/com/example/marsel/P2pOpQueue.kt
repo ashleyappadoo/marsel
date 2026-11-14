@@ -45,9 +45,19 @@ class P2pOpQueue(
      * `done()` depuis son onSuccess/onFailure (ou tout de suite s'il n'a rien
      * lancé). Un `done()` en double ou tardif est sans effet.
      */
-    fun enqueue(label: String, body: (done: () -> Unit) -> Unit) {
+    fun enqueue(label: String, body: (done: () -> Unit) -> Unit) = enqueue(label, false, body)
+
+    /**
+     * [coalesce] : si une opération de même libellé attend déjà (pas encore
+     * lancée), celle-ci est ignorée — elle ferait exactement la même chose.
+     * Évite l'accumulation de relances de découverte quand le framework est lent.
+     * @return false si l'opération a été fusionnée avec une opération en attente.
+     */
+    fun enqueue(label: String, coalesce: Boolean, body: (done: () -> Unit) -> Unit): Boolean {
+        if (coalesce && pending.any { it.label == label }) return false
         pending.addLast(Op(label, body))
         if (running == null) scheduleRunNext()
+        return true
     }
 
     /** Abandonne l'opération en vol et toutes celles en attente. */

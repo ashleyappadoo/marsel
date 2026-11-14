@@ -13,7 +13,9 @@
    opération, vidée quand le canal est perdu/recréé). Les comportements
    validés sont conservés (R 5 min, anti-zombie, purge E/P, TTL 10 min,
    recréation après 6 erreurs). Les fenêtres anti-chevauchement
-   existantes sont gardées en plus (pas supprimées, par prudence).
+   existantes sont gardées en plus (pas supprimées, par prudence). Une
+   opération sans réponse compte comme une erreur (filet des 6 erreurs) ;
+   les relances de découverte identiques en attente sont fusionnées.
 3. `MarselForegroundService` :
    - **mode A** démarré par `activateEmergency` (et à la réouverture de
      l'app pendant une alerte), arrêté par `deactivateEmergency` /
@@ -30,7 +32,9 @@
      20 %, reprise à 25 % ou au branchement ; « Uniquement en charge » ⇒
      attente du chargeur. Notifications « Marsel — relais actif »,
      « Relais en pause : batterie faible », « relais en attente de
-     charge ». Wake lock seulement branché. `MarselBootReceiver`
+     charge ». Wake lock partiel pendant que le relais tourne (sans lui,
+     écran éteint et débranché, le relais s'endort) : impact batterie à
+     MESURER en terrain. `MarselBootReceiver`
      (BOOT_COMPLETED, MY_PACKAGE_REPLACED) + `RECEIVE_BOOT_COMPLETED`.
 4. Politique de confidentialité, écran Fonctionnement et textes
    d'onboarding mis à jour.

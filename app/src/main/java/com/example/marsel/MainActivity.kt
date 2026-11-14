@@ -231,7 +231,16 @@ class MainActivity : FragmentActivity() {
         // avait été fermé), l'écran s'y rattache simplement.
         engine = MarselEngine.get(this)
         engine.attachUi(webView)
-        if (intent?.action == MarselForegroundService.ACTION_END_ALERT) pendingEndAlert = true
+        // « Terminer l'alerte » : pris en compte une seule fois. Pas lors
+        // d'une recréation de l'activité ni d'une relance depuis les apps
+        // récentes, qui rejouent l'intent d'origine.
+        val fromHistory = ((intent?.flags ?: 0) and Intent.FLAG_ACTIVITY_LAUNCHED_FROM_HISTORY) != 0
+        if (savedInstanceState == null && !fromHistory &&
+            intent?.action == MarselForegroundService.ACTION_END_ALERT
+        ) {
+            pendingEndAlert = true
+            setIntent(Intent(intent).setAction(null))
+        }
 
         // --- WebView (configuration — l'instance existe déjà) ---
         webView.settings.javaScriptEnabled = true
@@ -464,8 +473,8 @@ class MainActivity : FragmentActivity() {
 
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
-        setIntent(intent)
         if (intent.action == MarselForegroundService.ACTION_END_ALERT) {
+            setIntent(Intent(intent).setAction(null))
             pendingEndAlert = true
             webView.evaluateJavascript(
                 "window.marselCheckEndAlertRequest && window.marselCheckEndAlertRequest()", null
@@ -487,6 +496,15 @@ class MainActivity : FragmentActivity() {
         // comme avant (serveurs, GPS, flash, enregistrement finalisé) ; sinon
         // il continue de tourner dans le ForegroundService.
         engine.detachUi(webView)
+        // Le service de premier plan peut garder le processus en vie : la
+        // WebView de cet écran doit s'arrêter, sinon ses minuteurs JS
+        // (positions, relance des 20 min) continueraient en double.
+        try {
+            (webView.parent as? android.view.ViewGroup)?.removeView(webView)
+            webView.destroy()
+        } catch (e: Exception) {
+            Log.w(TAG, "webView.destroy: ${e.message}")
+        }
     }
 
     // =========================================================================

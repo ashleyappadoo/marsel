@@ -1071,6 +1071,11 @@ function deactivateEmergency() {
 
     MARSEL.emergencyActive = false;
 
+    // Fin d'alerte : le service « alerte en cours » s'arrête tout de suite
+    // (avant l'envoi des SMS de fin : une erreur plus bas ne doit pas le
+    // laisser tourner et envoyer une relance « toujours en cours »).
+    stopNativeAlertService();
+
     // Stop shield
     if (window.AndroidBridge) {
         if (typeof AndroidBridge.stopFlash === 'function') {
@@ -1156,9 +1161,6 @@ function deactivateEmergency() {
 
     secureRemove('marsel_emergency');
     MARSEL.emergencyId = null;
-
-    // Fin d'alerte : le service « alerte en cours » s'arrête.
-    stopNativeAlertService();
 
     // Reset ring
     var fillEl = document.getElementById('progress-ring-fill');

@@ -135,6 +135,22 @@ class P2pOpQueueTest {
     }
 
     @Test
+    fun coalesce_skipsIdenticalPendingOperation_butNotTheRunningOne() {
+        val s = FakeScheduler()
+        val q = P2pOpQueue(s)
+        val log = mutableListOf<String>()
+        var doneFirst: (() -> Unit)? = null
+        q.enqueue("discover", true) { done -> log += "discover#1"; doneFirst = done }
+        s.advance()                                           // #1 en vol
+        assertEquals(true, q.enqueue("discover", true) { done -> log += "discover#2"; done() })
+        assertEquals(false, q.enqueue("discover", true) { done -> log += "discover#3"; done() })
+        assertEquals(true, q.enqueue("autre", true) { done -> log += "autre"; done() })
+        doneFirst!!()
+        s.advance()
+        assertEquals(listOf("discover#1", "discover#2", "autre"), log)
+    }
+
+    @Test
     fun synchronousDone_stillRunsNextOperation() {
         val s = FakeScheduler()
         val q = P2pOpQueue(s)

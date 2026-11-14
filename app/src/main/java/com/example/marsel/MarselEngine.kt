@@ -166,7 +166,10 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
     }
 
     fun detachUi(wv: WebView) {
-        if (attachedWebView === wv) attachedWebView = null
+        // Ancien écran détruit APRÈS l'ouverture du nouveau (retour puis
+        // relance rapide) : il ne doit rien couper à l'écran qui l'a remplacé.
+        if (attachedWebView !== wv) return
+        attachedWebView = null
         uiResumed = false
         // Écran fermé : sans alerte en cours, plus besoin du GPS.
         if (!holdReasons.contains(REASON_ALERT)) stopLocationUpdatesInternal()
@@ -177,7 +180,16 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
     fun onUiResumed() {
         if (destroyed) return
         uiResumed = true
+        val receiverKept = p2pReceiverRegistered
         registerP2pReceiverIfNeeded()
+        if (receiverKept) {
+            // Récepteur resté actif (alerte ou relais) : pas de ré-enregistrement,
+            // donc pas de STATE_CHANGED « collant » rejoué. L'écran reçoit l'état
+            // WiFi Direct comme avant (avertissement « WiFi désactivé »).
+            webView.evaluateJavascript(
+                "window.onP2PStateChanged && window.onP2PStateChanged($wifiP2pEnabled)", null
+            )
+        }
         startLocationUpdatesInternal()
         restartServiceDiscovery()
     }
@@ -225,7 +237,10 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
             logToJs("FGS", "alerte : paquet illisible, service non démarré")
             return
         }
-        if (id != alertId) alertTimeoutHandledFor = null
+        if (id != alertId) {
+            // Relance déjà envoyée par le natif avant un arrêt du processus ?
+            alertTimeoutHandledFor = if (fgsPrefs().getString(KEY_TIMEOUT_SENT_FOR, null) == id) id else null
+        }
         alertId = id
         alertPacketJson = emergencyJson
         val ts = obj.optLong("timestamp", 0L)
@@ -244,6 +259,7 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
         alertPacketJson = null
         alertId = null
         alertTimeoutHandledFor = null
+        fgsPrefs().edit().remove(KEY_TIMEOUT_SENT_FOR).apply()
         val app = applicationContext
         release(REASON_ALERT)
         MarselForegroundService.sync(app)
@@ -251,11 +267,23 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
     }
 
     /** true si la relance des 20 min de cette alerte est déjà partie (côté natif ou JS). */
-    fun isAlertTimeoutHandled(id: String): Boolean = id.isNotEmpty() && alertTimeoutHandledFor == id
+    fun isAlertTimeoutHandled(id: String): Boolean =
+        id.isNotEmpty() && (alertTimeoutHandledFor == id ||
+            fgsPrefs().getString(KEY_TIMEOUT_SENT_FOR, null) == id)
 
     fun noteAlertTimeoutHandled(id: String) {
-        if (id.isNotEmpty() && id == alertId) alertTimeoutHandledFor = id
+        if (id.isNotEmpty() && id == alertId) markTimeoutHandled(id)
     }
+
+    // Seul l'identifiant aléatoire de l'alerte est écrit (aucune donnée
+    // personnelle) : survit à un arrêt du processus, pour ne jamais envoyer
+    // deux fois la relance des 20 min.
+    private fun markTimeoutHandled(id: String) {
+        alertTimeoutHandledFor = id
+        fgsPrefs().edit().putString(KEY_TIMEOUT_SENT_FOR, id).apply()
+    }
+
+    private fun fgsPrefs() = getSharedPreferences(FGS_PREFS, Context.MODE_PRIVATE)
 
     val isAudioRecording: Boolean get() = audioActive
 
@@ -286,8 +314,8 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
                 Log.w(TAG, "position native: ${ex.message}")
             }
         }
-        if (alertTimeoutHandledFor != id && now >= alertStartedAt + ALERT_TIMEOUT_MS) {
-            alertTimeoutHandledFor = id
+        if (!isAlertTimeoutHandled(id) && now >= alertStartedAt + ALERT_TIMEOUT_MS) {
+            markTimeoutHandled(id)
             nativeTimeoutCascade(e, id, now)
         }
     }
@@ -684,7 +712,11 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
         override fun post(task: Runnable) { p2pHandler.post(task) }
         override fun postDelayed(task: Runnable, delayMs: Long) { p2pHandler.postDelayed(task, delayMs) }
         override fun cancel(task: Runnable) { p2pHandler.removeCallbacks(task) }
-    }) { label -> logToJs("P2P", "opération WiFi Direct sans réponse en 5 s : $label") }
+    }) { label ->
+        logToJs("P2P", "opération WiFi Direct sans réponse en 5 s : $label")
+        // Framework muet : compte pour le filet « 6 erreurs → recréation du canal ».
+        noteP2pError()
+    }
 
     /**
      * Met une opération WifiP2pManager dans la file unique. [call] reçoit le
@@ -697,11 +729,12 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
         call: (WifiP2pManager.ActionListener) -> Unit,
         onOk: () -> Unit = {},
         onFail: (Int) -> Unit = {},
-        onError: (Exception) -> Unit = { e -> logToJs("P2P", "$label : ${e.message}") }
+        onError: (Exception) -> Unit = { e -> logToJs("P2P", "$label : ${e.message}") },
+        coalesce: Boolean = false
     ) {
         runOnUiThread {
             if (destroyed) return@runOnUiThread
-            p2pOps.enqueue(label) { done ->
+            p2pOps.enqueue(label, coalesce) { done ->
                 if (destroyed) {
                     done()
                     return@enqueue
@@ -843,6 +876,8 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
         private const val AUDIO_MMS_MAX_BYTES = 1_000_000L       // 1 Mo (spec 5b)
         private const val AUDIO_DIR = "Marsel"
         private const val ALERT_TICK_MS = 10_000L
+        private const val FGS_PREFS = "marsel_fgs"
+        private const val KEY_TIMEOUT_SENT_FOR = "timeout_sent_for"
         // Même échéance que EMERGENCY_TIMEOUT_MS côté JavaScript.
         private const val ALERT_TIMEOUT_MS = 20 * 60_000L
     }
@@ -2515,6 +2550,7 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
             lastServiceRequestResetMs = now
             p2pOp(
                 "clearServiceRequests (re-arm)",
+                coalesce = true,
                 call = { l -> wifiP2pManager.clearServiceRequests(wifiP2pChannel, l) },
                 onOk = { addServiceRequestAndDiscover() },
                 onFail = { addServiceRequestAndDiscover() },
@@ -2537,6 +2573,7 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
         val request = WifiP2pDnsSdServiceRequest.newInstance()
         p2pOp(
             "addServiceRequest",
+            coalesce = true,
             call = { l -> wifiP2pManager.addServiceRequest(wifiP2pChannel, request, l) },
             onOk = { discoverServicesOnly() },
             onFail = { reason ->
@@ -2561,6 +2598,7 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
         if (p2pPermissionMissing()) return
         p2pOp(
             "discoverServices",
+            coalesce = true,
             call = { l -> wifiP2pManager.discoverServices(wifiP2pChannel, l) },
             onOk = {
                 noteP2pSuccess()

@@ -238,8 +238,12 @@ class MarselForegroundService : Service() {
         }
 
         // CPU éveillé pendant l'alerte (positions toutes les 10 s, relance des
-        // 20 min) ; pour le relais, seulement branché (aucun coût batterie).
-        if (alert || (relayRuns && plugged)) acquireWakeLock() else releaseWakeLock()
+        // 20 min) et pendant que le relais tourne : sans lui, écran éteint et
+        // débranché, le processeur s'endort et le relais cesse de découvrir
+        // ses voisins alors que la notification dit « relais actif ». C'est
+        // l'impact batterie annoncé à l'activation ; la pause sous 20 % et
+        // « Uniquement en charge » le bornent.
+        if (alert || relayRuns) acquireWakeLock() else releaseWakeLock()
     }
 
     private fun stopNow() {
