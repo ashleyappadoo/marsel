@@ -851,6 +851,13 @@ body {
   margin-top: 2px;
 }
 
+.relay-explain {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-grey);
+  margin: 0 0 12px;
+}
+
 .settings-divider {
   height: 1px;
   background: #F0F0F0;

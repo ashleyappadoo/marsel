@@ -31,9 +31,15 @@
     <!-- Notifications -->
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
-    <!-- Foreground service — conservé pour le ForegroundService d'alerte à venir
-         (chantier séparé, voir TODO.md). Aucun service déclaré pour l'instant. -->
+    <!-- ForegroundService Marsel (TODO.md) : mode A « alerte en cours »
+         (location + microphone pendant l'enregistrement audio) et mode B
+         « relais en arrière-plan » (connectedDevice : WiFi Direct). Pas de
+         ACCESS_BACKGROUND_LOCATION : le service de localisation n'est démarré
+         que depuis l'écran, au déclenchement de l'alerte. -->
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_LOCATION" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_CONNECTED_DEVICE" />
 
     <!-- Camera / Flash -->
     <uses-permission android:name="android.permission.CAMERA" />
@@ -47,7 +53,11 @@
 
     <!-- Bluetooth retiré (G3) : le MRN utilise uniquement le WiFi Direct/DNS-SD -->
 
-    <!-- Misc (RECEIVE_BOOT_COMPLETED retiré, G5 : aucun receiver de boot) -->
+    <!-- Redémarrage du relais en arrière-plan après reboot, seulement s'il a
+         été activé par l'utilisateur (MarselBootReceiver). -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <!-- Misc -->
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.VIBRATE" />
 
@@ -71,6 +81,20 @@
             </intent-filter>
 
         </activity>
+
+        <service
+            android:name=".MarselForegroundService"
+            android:exported="false"
+            android:foregroundServiceType="location|microphone|connectedDevice" />
+
+        <receiver
+            android:name=".MarselBootReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
 
         <!-- Feedback bêta (TODO/demande utilisateur) : nécessaire pour joindre
              le fichier de logs à l'email de feedback — un intent ACTION_SEND

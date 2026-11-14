@@ -64,6 +64,8 @@ import javax.crypto.Cipher
 import kotlin.concurrent.thread
 import android.content.ContextWrapper
 import android.webkit.ValueCallback
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * Pair Marsel confirmé : appareil vu via DNS-SD sur _marsel._tcp.
@@ -184,6 +186,160 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
     fun onUiPaused() {
         uiResumed = false
         if (!heldInBackground()) unregisterP2pReceiver()
+    }
+
+    // ── Mode A : alerte en cours (ForegroundService, TODO.md) ──────────────
+    // L'alerte reste pilotée par le JavaScript (SMS, cascade, fin d'alerte).
+    // Le moteur garde en mémoire (jamais sur disque) le paquet E de l'alerte
+    // pour que le service continue sans écran : GPS, diffusion du réseau
+    // Marsel, positions toutes les 10 s et relance des 20 min.
+    private var alertPacketJson: String? = null
+    private var alertId: String? = null
+    private var alertStartedAt = 0L
+    @Volatile private var alertTimeoutHandledFor: String? = null
+    private var lastNativePositionMs = 0L
+
+    // Toutes les 10 s pendant l'alerte (le service tient un wake lock
+    // partiel : ce minuteur tourne aussi écran éteint). Écran attaché : on
+    // réveille le JavaScript, dont les minuteurs sont ralentis en arrière-plan.
+    // Sans écran : positions et relance des 20 min faites ici.
+    private val alertTickRunnable = object : Runnable {
+        override fun run() {
+            if (destroyed || !isHeld(REASON_ALERT)) return
+            if (attachedWebView != null) {
+                webView.evaluateJavascript("window.marselTrackingTick && window.marselTrackingTick()", null)
+            } else {
+                nativeAlertTick()
+            }
+            mainHandler.postDelayed(this, ALERT_TICK_MS)
+        }
+    }
+
+    /** Démarre (ou reprend après redémarrage de l'écran) le mode « alerte en cours ». */
+    fun startAlertMode(emergencyJson: String) {
+        if (destroyed) return
+        val obj = try { JSONObject(emergencyJson) } catch (e: Exception) { null }
+        val id = obj?.optString("id")?.takeIf { it.isNotEmpty() }
+            ?: obj?.optString("messageId")?.takeIf { it.isNotEmpty() }
+        if (obj == null || id == null) {
+            logToJs("FGS", "alerte : paquet illisible, service non démarré")
+            return
+        }
+        if (id != alertId) alertTimeoutHandledFor = null
+        alertId = id
+        alertPacketJson = emergencyJson
+        val ts = obj.optLong("timestamp", 0L)
+        alertStartedAt = if (ts > 0L) ts else System.currentTimeMillis()
+        hold(REASON_ALERT)
+        mainHandler.removeCallbacks(alertTickRunnable)
+        mainHandler.postDelayed(alertTickRunnable, ALERT_TICK_MS)
+        MarselForegroundService.sync(this)
+        logToJs("FGS", "alerte en cours : service de premier plan actif (écran éteint/app en arrière-plan)")
+    }
+
+    /** Fin d'alerte (bouton, notification, déconnexion) : le service d'alerte s'arrête. */
+    fun stopAlertMode() {
+        mainHandler.removeCallbacks(alertTickRunnable)
+        val wasActive = alertId != null
+        alertPacketJson = null
+        alertId = null
+        alertTimeoutHandledFor = null
+        val app = applicationContext
+        release(REASON_ALERT)
+        MarselForegroundService.sync(app)
+        if (wasActive) logToJs("FGS", "alerte terminée : service d'alerte arrêté")
+    }
+
+    /** true si la relance des 20 min de cette alerte est déjà partie (côté natif ou JS). */
+    fun isAlertTimeoutHandled(id: String): Boolean = id.isNotEmpty() && alertTimeoutHandledFor == id
+
+    fun noteAlertTimeoutHandled(id: String) {
+        if (id.isNotEmpty() && id == alertId) alertTimeoutHandledFor = id
+    }
+
+    val isAudioRecording: Boolean get() = audioActive
+
+    private fun nativeAlertTick() {
+        val json = alertPacketJson ?: return
+        val e = try { JSONObject(json) } catch (ex: Exception) { return }
+        val id = alertId ?: return
+        val now = System.currentTimeMillis()
+        // Position RÉELLE uniquement (jamais de valeur par défaut).
+        if (hasLocation && now - lastNativePositionMs >= 9_000L) {
+            lastNativePositionMs = now
+            try {
+                val p = JSONObject()
+                p.put("type", "MARSEL_POSITION_UPDATE")
+                p.put("version", 1)
+                p.put("messageId", "${id}_pos_$now")
+                p.put("emergencyId", id)
+                p.put("userId", e.opt("userId"))
+                p.put("pseudo", e.opt("pseudo"))
+                p.put("lat", lastLat)
+                p.put("lng", lastLng)
+                p.put("timestamp", now)
+                p.put("contacts", e.optJSONArray("contacts") ?: JSONArray())
+                p.put("hopCount", 0)
+                p.put("maxHops", e.optInt("maxHops", 5))
+                sendEmergencyViaRelay(p.toString())
+            } catch (ex: Exception) {
+                Log.w(TAG, "position native: ${ex.message}")
+            }
+        }
+        if (alertTimeoutHandledFor != id && now >= alertStartedAt + ALERT_TIMEOUT_MS) {
+            alertTimeoutHandledFor = id
+            nativeTimeoutCascade(e, id, now)
+        }
+    }
+
+    // Relance « toujours en cours » des 20 min quand aucun écran n'est
+    // ouvert : même message et même cascade que le JavaScript (SMS direct si
+    // réseau validé + SIM, sinon paquet T relayé par le réseau Marsel).
+    private fun nativeTimeoutCascade(e: JSONObject, id: String, now: Long) {
+        val pseudo = e.optString("pseudo").ifEmpty { "Utilisateur" }
+        val savedLat = e.optDouble("lat")
+        val savedLng = e.optDouble("lng")
+        val pos: Pair<Double, Double>? = when {
+            hasLocation -> lastLat to lastLng
+            !savedLat.isNaN() && !savedLng.isNaN() -> savedLat to savedLng
+            else -> null
+        }
+        val posLine = pos?.let { "\nPosition : https://maps.google.com/?q=${it.first},${it.second}" } ?: ""
+        val hasAudio = audioActive
+        val msg = "⚠️ ALERTE MARSEL TOUJOURS EN COURS depuis 20 min. " +
+            "$pseudo n'a pas désactivé son alerte.$posLine" +
+            (if (hasAudio) "\nUn enregistrement audio est en cours." else "")
+        val contacts = e.optJSONArray("contacts") ?: JSONArray()
+        val mobiles = (0 until contacts.length()).mapNotNull { i ->
+            contacts.optJSONObject(i)?.optString("mobile")?.trim()?.takeIf { it.isNotEmpty() }
+        }
+        val quality = detectNetworkQuality()
+        if ((quality == "MOBILE_STABLE" || quality == "WIFI_STABLE") && canSendSmsDirect()) {
+            thread { mobiles.forEach { sendSMSDirect(it, msg) } }
+            logToJs("FGS", "relance 20 min : SMS direct ($quality) → ${mobiles.size} proche(s)")
+        } else {
+            try {
+                val t = JSONObject()
+                t.put("type", "MARSEL_TIMEOUT_SMS_REQUEST")
+                t.put("version", 1)
+                t.put("messageId", "${id}_timeout_$now")
+                t.put("emergencyId", id)
+                t.put("userId", e.opt("userId"))
+                t.put("pseudo", pseudo)
+                t.put("lat", pos?.first ?: JSONObject.NULL)
+                t.put("lng", pos?.second ?: JSONObject.NULL)
+                t.put("timestamp", now)
+                t.put("contacts", contacts)
+                t.put("audio", if (hasAudio) "1" else "0")
+                t.put("hopCount", 0)
+                t.put("maxHops", e.optInt("maxHops", 5))
+                sendEmergencyViaRelay(t.toString())
+                logToJs("FGS", "relance 20 min déléguée au réseau Marsel (paquet T)")
+            } catch (ex: Exception) {
+                Log.w(TAG, "relance native: ${ex.message}")
+            }
+        }
+        showNotificationDirect("⚠️ Alerte Marsel", "Alerte toujours active depuis 20 min — proches renotifiés")
     }
 
     private fun registerP2pReceiverIfNeeded() {
@@ -686,6 +842,9 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
         private const val AUDIO_SEGMENT_MS = 5 * 60 * 1000       // rotation 5 min
         private const val AUDIO_MMS_MAX_BYTES = 1_000_000L       // 1 Mo (spec 5b)
         private const val AUDIO_DIR = "Marsel"
+        private const val ALERT_TICK_MS = 10_000L
+        // Même échéance que EMERGENCY_TIMEOUT_MS côté JavaScript.
+        private const val ALERT_TIMEOUT_MS = 20 * 60_000L
     }
 
     // =========================================================================
@@ -3105,11 +3264,19 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
     }
 
     fun startAudioRecord() {
-        runOnUiThread { startAudioRecordingInternal() }
+        runOnUiThread {
+            startAudioRecordingInternal()
+            // Enregistrement pendant l'alerte : le service ajoute le type
+            // « microphone » pour continuer écran éteint.
+            MarselForegroundService.sync(this)
+        }
     }
 
     fun stopAudioRecord() {
-        runOnUiThread { stopAudioRecordingInternal() }
+        runOnUiThread {
+            stopAudioRecordingInternal()
+            MarselForegroundService.sync(this)
+        }
     }
 
     fun getRecordings(): String = listRecordingsJson()

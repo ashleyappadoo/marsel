@@ -522,6 +522,45 @@
       </div>
     </div>
 
+    <!-- Section Réseau Marsel : relais en arrière-plan (ForegroundService,
+         mode B — TODO.md). Désactivé par défaut, consentement explicite. -->
+    <div id="relay-settings">
+      <h3 class="section-heading blue" style="margin-top:24px;">Réseau Marsel</h3>
+      <div class="settings-card">
+        <div class="settings-row">
+          <div class="settings-row-text">
+            <div class="settings-row-title">Relais en arrière-plan</div>
+            <div class="settings-row-subtitle" id="relay-status">Désactivé</div>
+          </div>
+          <label class="toggle-switch">
+            <input type="checkbox" id="toggle-relay" onchange="onRelayToggle(this)" />
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+        <p class="relay-explain">
+          Aidez les personnes à proximité : votre téléphone relaie leurs alertes
+          Marsel et, s'il a une carte SIM et du réseau, envoie leurs SMS d'alerte
+          à leurs proches — même application fermée.<br />
+          <strong>Batterie :</strong> le WiFi Direct reste actif en permanence,
+          ce qui consomme davantage. Pause automatique sous 20 % de batterie
+          (reprise à 25 % ou dès le branchement).<br />
+          <strong>Notification permanente</strong> « Marsel — relais actif » tant
+          que le relais tourne. Il redémarre seul après un redémarrage du téléphone.
+        </p>
+        <div class="settings-divider"></div>
+        <div class="settings-row">
+          <div class="settings-row-text">
+            <div class="settings-row-title">Uniquement en charge</div>
+            <div class="settings-row-subtitle">Le relais ne tourne que téléphone branché : aucun coût batterie, idéal la nuit.</div>
+          </div>
+          <label class="toggle-switch">
+            <input type="checkbox" id="toggle-relay-charging" onchange="onRelayChargingToggle(this)" />
+            <span class="toggle-slider"></span>
+          </label>
+        </div>
+      </div>
+    </div>
+
     <!-- Section Aide -->
     <h3 class="section-heading blue" style="margin-top:24px;">Aide</h3>
     <div class="menu-card" onclick="showScreen('screen-how-it-works')">

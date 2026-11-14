@@ -79,6 +79,12 @@ class MainActivity : FragmentActivity() {
     // il peut survivre à l'écran (ForegroundService). L'écran s'y attache.
     private lateinit var engine: MarselEngine
 
+    // Action « Terminer l'alerte » de la notification d'alerte en cours :
+    // mémorisée ici, le JavaScript la lit (consumeEndAlertRequest) quand il
+    // est prêt — après le déverrouillage de l'app si l'écran de verrouillage
+    // Marsel est affiché.
+    @Volatile private var pendingEndAlert = false
+
     companion object {
         private const val TAG = "MARSEL"
         private const val OSM_TILE_HOST = "tile.openstreetmap.org"
@@ -225,6 +231,7 @@ class MainActivity : FragmentActivity() {
         // avait été fermé), l'écran s'y rattache simplement.
         engine = MarselEngine.get(this)
         engine.attachUi(webView)
+        if (intent?.action == MarselForegroundService.ACTION_END_ALERT) pendingEndAlert = true
 
         // --- WebView (configuration — l'instance existe déjà) ---
         webView.settings.javaScriptEnabled = true
@@ -450,6 +457,20 @@ class MainActivity : FragmentActivity() {
     override fun onResume() {
         super.onResume()
         engine.onUiResumed()
+        // Relais en arrière-plan activé mais service non démarré (ex. démarrage
+        // refusé par Android en arrière-plan) : l'écran au premier plan le relance.
+        MarselForegroundService.sync(this)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.action == MarselForegroundService.ACTION_END_ALERT) {
+            pendingEndAlert = true
+            webView.evaluateJavascript(
+                "window.marselCheckEndAlertRequest && window.marselCheckEndAlertRequest()", null
+            )
+        }
     }
 
     override fun onPause() {
@@ -923,6 +944,55 @@ class MainActivity : FragmentActivity() {
 
         @JavascriptInterface
         fun sendWifiMessage(message: String) = engine.sendWifiMessage(message)
+
+        // -----------------------------------------------------------------------
+        // ForegroundService — mode A « alerte en cours » (TODO.md)
+        // -----------------------------------------------------------------------
+
+        @JavascriptInterface
+        fun startAlertService(emergencyJson: String) {
+            runOnUiThread { engine.startAlertMode(emergencyJson) }
+        }
+
+        @JavascriptInterface
+        fun stopAlertService() {
+            runOnUiThread { engine.stopAlertMode() }
+        }
+
+        @JavascriptInterface
+        fun isAlertTimeoutHandled(emergencyId: String): Boolean = engine.isAlertTimeoutHandled(emergencyId)
+
+        @JavascriptInterface
+        fun noteAlertTimeoutHandled(emergencyId: String) {
+            runOnUiThread { engine.noteAlertTimeoutHandled(emergencyId) }
+        }
+
+        /** true une seule fois après un appui sur « Terminer l'alerte » dans la notification. */
+        @JavascriptInterface
+        fun consumeEndAlertRequest(): Boolean {
+            val pending = pendingEndAlert
+            pendingEndAlert = false
+            return pending
+        }
+
+        // -----------------------------------------------------------------------
+        // ForegroundService — mode B « relais en arrière-plan » (Réglages)
+        // -----------------------------------------------------------------------
+
+        @JavascriptInterface
+        fun getRelayStatus(): String = MarselForegroundService.statusJson(this@MainActivity)
+
+        @JavascriptInterface
+        fun setRelayEnabled(enabled: Boolean) {
+            RelaySettings.setEnabled(this@MainActivity, enabled)
+            runOnUiThread { MarselForegroundService.sync(this@MainActivity) }
+        }
+
+        @JavascriptInterface
+        fun setRelayChargingOnly(chargingOnly: Boolean) {
+            RelaySettings.setChargingOnly(this@MainActivity, chargingOnly)
+            runOnUiThread { MarselForegroundService.sync(this@MainActivity) }
+        }
     }
 
     // =========================================================================
