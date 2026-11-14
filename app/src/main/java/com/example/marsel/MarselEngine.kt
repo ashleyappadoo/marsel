@@ -255,6 +255,7 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
         destroyed = true
         synchronized(Companion) { if (instance === this) instance = null }
         if (!started) return
+        p2pOps.clear()
         p2pHandler.removeCallbacksAndMessages(null)
         mainHandler.removeCallbacksAndMessages(null)
         unregisterP2pReceiver()
@@ -517,6 +518,53 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
     // DNS-SD connection-less relay: re-arm périodique adaptatif (A4/3a)
     // 8s quand une alerte est active (émise OU reçue non résolue), 25s en veille.
     private val p2pHandler = Handler(Looper.getMainLooper())
+
+    // ── File unique des opérations WifiP2pManager (TODO.md, prérequis) ────
+    // Toute opération asynchrone sur le canal passe par p2pOp() : une seule
+    // en vol à la fois, la suivante part de la réponse de la précédente (ou
+    // après 5 s sans réponse). Plus de collisions BUSY (reason=2) ni de
+    // requête effacée en plein vol (reason=3) entre déclencheurs concurrents.
+    private val p2pOps = P2pOpQueue(object : P2pOpQueue.Scheduler {
+        override fun post(task: Runnable) { p2pHandler.post(task) }
+        override fun postDelayed(task: Runnable, delayMs: Long) { p2pHandler.postDelayed(task, delayMs) }
+        override fun cancel(task: Runnable) { p2pHandler.removeCallbacks(task) }
+    }) { label -> logToJs("P2P", "opération WiFi Direct sans réponse en 5 s : $label") }
+
+    /**
+     * Met une opération WifiP2pManager dans la file unique. [call] reçoit le
+     * listener à passer au framework ; [onOk]/[onFail] sont ses rappels ;
+     * [onError] reçoit une exception levée par l'appel (permission retirée…).
+     * Utilisable depuis n'importe quel thread.
+     */
+    private fun p2pOp(
+        label: String,
+        call: (WifiP2pManager.ActionListener) -> Unit,
+        onOk: () -> Unit = {},
+        onFail: (Int) -> Unit = {},
+        onError: (Exception) -> Unit = { e -> logToJs("P2P", "$label : ${e.message}") }
+    ) {
+        runOnUiThread {
+            if (destroyed) return@runOnUiThread
+            p2pOps.enqueue(label) { done ->
+                if (destroyed) {
+                    done()
+                    return@enqueue
+                }
+                try {
+                    call(object : WifiP2pManager.ActionListener {
+                        override fun onSuccess() {
+                            try { onOk() } finally { done() }
+                        }
+                        override fun onFailure(reason: Int) {
+                            try { onFail(reason) } finally { done() }
+                        }
+                    })
+                } catch (e: Exception) {
+                    try { onError(e) } finally { done() }
+                }
+            }
+        }
+    }
     private val rediscoverRunnable = object : Runnable {
         override fun run() {
             purgeExpiredMarselPeers()
@@ -1398,21 +1446,18 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
         // test terrain — impossible de corréler une négociation avec un trou de
         // découverte).
         logToJs("P2P", "connect() vers ${device.deviceName} (paquet urgent en attente)")
-        try {
-            wifiP2pManager.connect(wifiP2pChannel, config, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() {
-                    Log.d(TAG, "Connecting to ${device.deviceName}")
-                }
-                override fun onFailure(reason: Int) {
-                    logToJs("P2P", "connect() vers ${device.deviceName} ÉCHEC reason=$reason")
-                    // BUSY (2) est banal pendant une découverte : ne pas le
-                    // compter vers la recréation du canal (6 échecs).
-                    if (reason != WifiP2pManager.BUSY) noteP2pError()
-                }
-            })
-        } catch (e: SecurityException) {
-            logToJs("P2P", "connect() refusé (permission appareils à proximité ?) : ${e.message}")
-        }
+        p2pOp(
+            "connect ${device.deviceName}",
+            call = { l -> wifiP2pManager.connect(wifiP2pChannel, config, l) },
+            onOk = { Log.d(TAG, "Connecting to ${device.deviceName}") },
+            onFail = { reason ->
+                logToJs("P2P", "connect() vers ${device.deviceName} ÉCHEC reason=$reason")
+                // BUSY (2) est banal pendant une découverte : ne pas le
+                // compter vers la recréation du canal (6 échecs).
+                if (reason != WifiP2pManager.BUSY) noteP2pError()
+            },
+            onError = { e -> logToJs("P2P", "connect() refusé (permission appareils à proximité ?) : ${e.message}") }
+        )
     }
 
     // =========================================================================
@@ -1468,6 +1513,9 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
     // =========================================================================
     private fun onChannelLost() {
         logToJs("P2P", "CHANNEL PERDU — réinitialisation complète du WiFi P2P")
+        if (destroyed) return
+        // Les opérations en file visaient le canal mort : abandonnées.
+        p2pOps.clear()
         try {
             wifiP2pChannel = wifiP2pManager.initialize(this, mainLooper) { onChannelLost() }
             setupDnsSdListeners()
@@ -1535,9 +1583,12 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
 
     // Recréation dure du channel (close + initialize) : dernier recours quand
     // le framework répond ERROR en boucle alors que les permissions sont là.
-    private fun recreateP2pChannel(why: String) {
+    private fun recreateP2pChannel(why: String, cancelPendingConnect: Boolean = false) {
+        if (destroyed) return
         logToJs("P2P", "RECRÉATION du channel WiFi P2P ($why)")
         consecutiveP2pErrors.set(0)
+        // File unique : tout ce qui attendait visait l'ancien canal.
+        p2pOps.clear()
         try {
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O_MR1) {
                 try { wifiP2pChannel.close() } catch (e: Exception) { Log.v(TAG, "channel close: ${e.message}") }
@@ -1547,6 +1598,19 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
             wifiP2pChannel = wifiP2pManager.initialize(this, mainLooper) { onChannelLost() }
             setupDnsSdListeners()
             invalidateInFlightP2pChains()  // la chaîne « en vol » visait l'ancien canal
+            // Annulation de la négociation connect() en suspens : la
+            // négociation est gérée par le framework (pas par notre canal),
+            // donc l'annuler sur le canal neuf fonctionne ; mise en tête de
+            // file, avant le ré-enregistrement et la découverte.
+            if (cancelPendingConnect && groupOwnerAddress == null) {
+                p2pOp(
+                    "cancelConnect",
+                    call = { l -> wifiP2pManager.cancelConnect(wifiP2pChannel, l) },
+                    onOk = { logToJs("P2P", "négociation connect() en suspens annulée") },
+                    onFail = { /* rien en cours : normal */ },
+                    onError = { e -> Log.v(TAG, "cancelConnect: ${e.message}") }
+                )
+            }
             reRegisterActiveServicesSafely()
             kickDiscoveryNow()
         } catch (e: Exception) {
@@ -1585,22 +1649,14 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
                 silentRecoveries = 0
                 lastDnsSdEventMs = System.currentTimeMillis()
                 val why = "surdité DNS-SD : ${silentMs / 1000}s sans rien recevoir malgré un appareil à proximité"
-                // Une négociation connect() restée en suspens met la découverte
-                // en pause côté framework, et fermer NOTRE canal ne l'annule pas
-                // forcément : on l'annule explicitement d'abord.
-                if (groupOwnerAddress == null) {
-                    try {
-                        wifiP2pManager.cancelConnect(wifiP2pChannel, object : WifiP2pManager.ActionListener {
-                            override fun onSuccess() { logToJs("P2P", "négociation connect() en suspens annulée") }
-                            override fun onFailure(reason: Int) { /* rien en cours : normal */ }
-                        })
-                    } catch (e: Exception) { Log.v(TAG, "cancelConnect: ${e.message}") }
-                }
                 // Posté, PAS appelé ici : recreateP2pChannel() appelle
                 // kickDiscoveryNow(), qui re-poste rediscoverRunnable — exécuté
                 // DEPUIS rediscoverRunnable.run(), ça créait une seconde boucle
                 // de découverte permanente (run() se re-poste aussi à la fin).
-                p2pHandler.post { recreateP2pChannel(why) }
+                // cancelPendingConnect : une négociation connect() restée en
+                // suspens met la découverte en pause côté framework, et fermer
+                // NOTRE canal ne l'annule pas forcément.
+                p2pHandler.post { recreateP2pChannel(why, cancelPendingConnect = true) }
                 return true
             }
             // QA-FIX : ne réarmer lastDnsSdEventMs QUE si fullServiceRecovery()
@@ -1635,33 +1691,37 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
         }
         logToJs("DNS-SD", "RECOVERY ($reason)")
         lastServiceRequestResetMs = System.currentTimeMillis()
-        try {
-            wifiP2pManager.clearServiceRequests(wifiP2pChannel, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() = step2()
-                override fun onFailure(reason: Int) = step2()
-                private fun step2() {
-                    try {
-                        wifiP2pManager.clearLocalServices(wifiP2pChannel, object : WifiP2pManager.ActionListener {
-                            override fun onSuccess() = finish()
-                            override fun onFailure(reason: Int) = finish()
-                            private fun finish() {
-                                reRegisterActiveServices()
-                                addServiceRequestAndDiscover()
-                            }
-                        })
-                    } catch (e: Exception) {
-                        // QA-FIX : visible aussi côté JS (avant : uniquement Logcat,
-                        // invisible dans l'overlay de debug terrain).
-                        logToJs("DNS-SD", "fullServiceRecovery step2 exception: ${e.message}")
-                        Log.e(TAG, "fullServiceRecovery step2: ${e.message}")
-                    }
-                }
-            })
-        } catch (e: Exception) {
-            logToJs("DNS-SD", "fullServiceRecovery exception: ${e.message}")
-            Log.e(TAG, "fullServiceRecovery: ${e.message}")
-        }
+        p2pOp(
+            "clearServiceRequests (recovery)",
+            call = { l -> wifiP2pManager.clearServiceRequests(wifiP2pChannel, l) },
+            onOk = { recoveryClearLocalServices() },
+            onFail = { recoveryClearLocalServices() },
+            onError = { e ->
+                logToJs("DNS-SD", "fullServiceRecovery exception: ${e.message}")
+                Log.e(TAG, "fullServiceRecovery: ${e.message}")
+            }
+        )
         return true
+    }
+
+    private fun recoveryClearLocalServices() {
+        p2pOp(
+            "clearLocalServices (recovery)",
+            call = { l -> wifiP2pManager.clearLocalServices(wifiP2pChannel, l) },
+            onOk = { recoveryFinish() },
+            onFail = { recoveryFinish() },
+            onError = { e ->
+                // QA-FIX : visible aussi côté JS (avant : uniquement Logcat,
+                // invisible dans l'overlay de debug terrain).
+                logToJs("DNS-SD", "fullServiceRecovery step2 exception: ${e.message}")
+                Log.e(TAG, "fullServiceRecovery step2: ${e.message}")
+            }
+        )
+    }
+
+    private fun recoveryFinish() {
+        reRegisterActiveServices()
+        addServiceRequestAndDiscover()
     }
 
     // QA-FIX (reason=2) : reRegisterActiveServices() émet jusqu'à ~10 appels
@@ -1934,36 +1994,36 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
     // =========================================================================
     private fun addLocalServiceSafe(info: WifiP2pDnsSdServiceInfo, label: String, onOk: (() -> Unit)? = null) {
         if (p2pPermissionMissing()) return
-        try {
-            wifiP2pManager.addLocalService(wifiP2pChannel, info, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() {
-                    noteP2pSuccess()
-                    logToJs("DNS-SD", "$label registered ✓")
-                    onOk?.invoke()
-                }
-                override fun onFailure(r: Int) {
-                    logToJs("DNS-SD", "$label register FAILED: $r")
-                    noteP2pError()
-                }
-            })
-        } catch (ex: SecurityException) {
-            logToJs("DNS-SD", "$label denied: ${ex.message}")
-        }
+        p2pOp(
+            "addLocalService $label",
+            call = { l -> wifiP2pManager.addLocalService(wifiP2pChannel, info, l) },
+            onOk = {
+                noteP2pSuccess()
+                logToJs("DNS-SD", "$label registered ✓")
+                onOk?.invoke()
+            },
+            onFail = { r ->
+                logToJs("DNS-SD", "$label register FAILED: $r")
+                noteP2pError()
+            },
+            onError = { ex -> logToJs("DNS-SD", "$label denied: ${ex.message}") }
+        )
     }
 
     private fun safeRemoveLocalService(info: WifiP2pDnsSdServiceInfo, label: String, onDone: (() -> Unit)? = null) {
-        try {
-            wifiP2pManager.removeLocalService(wifiP2pChannel, info, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() { onDone?.invoke() }
-                override fun onFailure(r: Int) {
-                    logToJs("DNS-SD", "removeLocalService $label failed: $r")
-                    onDone?.invoke()
-                }
-            })
-        } catch (ex: Exception) {
-            logToJs("DNS-SD", "removeLocalService $label error: ${ex.message}")
-            onDone?.invoke()
-        }
+        p2pOp(
+            "removeLocalService $label",
+            call = { l -> wifiP2pManager.removeLocalService(wifiP2pChannel, info, l) },
+            onOk = { onDone?.invoke() },
+            onFail = { r ->
+                logToJs("DNS-SD", "removeLocalService $label failed: $r")
+                onDone?.invoke()
+            },
+            onError = { ex ->
+                logToJs("DNS-SD", "removeLocalService $label error: ${ex.message}")
+                onDone?.invoke()
+            }
+        )
     }
 
     // -------------------------------------------------------------------------
@@ -2216,40 +2276,38 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
     // Register the emergency alert service (called once on EMERGENCY, after clearLocalServices).
     private fun registerAlertService(info: WifiP2pDnsSdServiceInfo) {
         if (p2pPermissionMissing()) return
-        try {
-            wifiP2pManager.addLocalService(wifiP2pChannel, info, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() {
-                    noteP2pSuccess()
-                    activeAlertServiceInfo = info
-                    logToJs("DNS-SD", "marsel-alert registered ✓ — broadcasting continuously")
-                }
-                override fun onFailure(r: Int) {
-                    logToJs("DNS-SD", "marsel-alert register FAILED: $r")
-                    noteP2pError()
-                }
-            })
-        } catch (ex: SecurityException) {
-            logToJs("DNS-SD", "registerAlertService denied: ${ex.message}")
-        }
+        p2pOp(
+            "addLocalService marsel-alert",
+            call = { l -> wifiP2pManager.addLocalService(wifiP2pChannel, info, l) },
+            onOk = {
+                noteP2pSuccess()
+                activeAlertServiceInfo = info
+                logToJs("DNS-SD", "marsel-alert registered ✓ — broadcasting continuously")
+            },
+            onFail = { r ->
+                logToJs("DNS-SD", "marsel-alert register FAILED: $r")
+                noteP2pError()
+            },
+            onError = { ex -> logToJs("DNS-SD", "registerAlertService denied: ${ex.message}") }
+        )
     }
 
     // Add a position service without touching the alert service.
     private fun addPosServiceSafe(info: WifiP2pDnsSdServiceInfo) {
         if (p2pPermissionMissing()) return
-        try {
-            wifiP2pManager.addLocalService(wifiP2pChannel, info, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() {
-                    noteP2pSuccess()
-                    logToJs("DNS-SD", "marsel-pos registered ✓")
-                }
-                override fun onFailure(r: Int) {
-                    logToJs("DNS-SD", "marsel-pos register FAILED: $r")
-                    noteP2pError()
-                }
-            })
-        } catch (ex: SecurityException) {
-            logToJs("DNS-SD", "addPosServiceSafe denied: ${ex.message}")
-        }
+        p2pOp(
+            "addLocalService marsel-pos",
+            call = { l -> wifiP2pManager.addLocalService(wifiP2pChannel, info, l) },
+            onOk = {
+                noteP2pSuccess()
+                logToJs("DNS-SD", "marsel-pos registered ✓")
+            },
+            onFail = { r ->
+                logToJs("DNS-SD", "marsel-pos register FAILED: $r")
+                noteP2pError()
+            },
+            onError = { ex -> logToJs("DNS-SD", "addPosServiceSafe denied: ${ex.message}") }
+        )
     }
 
     // TEST-FIX latence : le cycle complet clear→add→discover à CHAQUE période
@@ -2296,15 +2354,16 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
                 return
             }
             lastServiceRequestResetMs = now
-            try {
-                wifiP2pManager.clearServiceRequests(wifiP2pChannel, object : WifiP2pManager.ActionListener {
-                    override fun onSuccess() { addServiceRequestAndDiscover() }
-                    override fun onFailure(reason: Int) { addServiceRequestAndDiscover() }
-                })
-            } catch (e: Exception) {
-                logToJs("DNS-SD", "restartServiceDiscovery exception: ${e.message}")
-                Log.e(TAG, "restartServiceDiscovery: ${e.message}")
-            }
+            p2pOp(
+                "clearServiceRequests (re-arm)",
+                call = { l -> wifiP2pManager.clearServiceRequests(wifiP2pChannel, l) },
+                onOk = { addServiceRequestAndDiscover() },
+                onFail = { addServiceRequestAndDiscover() },
+                onError = { e ->
+                    logToJs("DNS-SD", "restartServiceDiscovery exception: ${e.message}")
+                    Log.e(TAG, "restartServiceDiscovery: ${e.message}")
+                }
+            )
         } else if (discoveryChainInFlight() || serviceBurstInFlight()) {
             // Une chaîne clear→add→discover est encore en vol (elle se termine
             // elle-même par discoverServices — un second appel échouerait en
@@ -2316,63 +2375,67 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
     }
 
     private fun addServiceRequestAndDiscover() {
-        try {
-            val request = WifiP2pDnsSdServiceRequest.newInstance()
-            wifiP2pManager.addServiceRequest(wifiP2pChannel, request, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() { discoverServicesOnly() }
-                override fun onFailure(reason: Int) {
-                    logToJs("DNS-SD", "addServiceRequest ÉCHEC reason=$reason")
-                    lastServiceRequestResetMs = 0  // re-arm complet au prochain cycle
-                    // QA-FIX (reason=2) : ce callback ne comptait PAS pour le filet
-                    // de sécurité (recreateP2pChannel après 6 échecs consécutifs) —
-                    // trou confirmé en analysant un blocage réel de 25 minutes en
-                    // test terrain où c'est justement CET appel qui échouait en
-                    // boucle (reason=2/BUSY) sans jamais déclencher la recréation
-                    // du channel.
-                    noteP2pError()
-                }
-            })
-        } catch (e: Exception) {
-            logToJs("DNS-SD", "addServiceRequestAndDiscover exception: ${e.message}")
-            Log.e(TAG, "addServiceRequestAndDiscover: ${e.message}")
-        }
+        val request = WifiP2pDnsSdServiceRequest.newInstance()
+        p2pOp(
+            "addServiceRequest",
+            call = { l -> wifiP2pManager.addServiceRequest(wifiP2pChannel, request, l) },
+            onOk = { discoverServicesOnly() },
+            onFail = { reason ->
+                logToJs("DNS-SD", "addServiceRequest ÉCHEC reason=$reason")
+                lastServiceRequestResetMs = 0  // re-arm complet au prochain cycle
+                // QA-FIX (reason=2) : ce callback ne comptait PAS pour le filet
+                // de sécurité (recreateP2pChannel après 6 échecs consécutifs) —
+                // trou confirmé en analysant un blocage réel de 25 minutes en
+                // test terrain où c'est justement CET appel qui échouait en
+                // boucle (reason=2/BUSY) sans jamais déclencher la recréation
+                // du channel.
+                noteP2pError()
+            },
+            onError = { e ->
+                logToJs("DNS-SD", "addServiceRequestAndDiscover exception: ${e.message}")
+                Log.e(TAG, "addServiceRequestAndDiscover: ${e.message}")
+            }
+        )
     }
 
     private fun discoverServicesOnly() {
         if (p2pPermissionMissing()) return
-        try {
-            wifiP2pManager.discoverServices(wifiP2pChannel, object : WifiP2pManager.ActionListener {
-                override fun onSuccess() {
-                    noteP2pSuccess()
-                    Log.d(TAG, "DNS-SD discovery running")
+        p2pOp(
+            "discoverServices",
+            call = { l -> wifiP2pManager.discoverServices(wifiP2pChannel, l) },
+            onOk = {
+                noteP2pSuccess()
+                Log.d(TAG, "DNS-SD discovery running")
+            },
+            onFail = { reason ->
+                // Échec visible dans l'overlay (avant : Log.w invisible en test
+                // mobile) + re-arm complet au prochain cycle.
+                lastServiceRequestResetMs = 0
+                noteP2pError()
+                val nowMono = SystemClock.elapsedRealtime()
+                if (reason == WifiP2pManager.NO_SERVICE_REQUESTS &&
+                    nowMono - lastNoRequestRearmMs > 15_000L
+                ) {
+                    // Aucune requête de service : la découverte ne peut rien
+                    // recevoir tant qu'un re-arm complet n'a pas eu lieu —
+                    // ne pas attendre le prochain cycle (8-20 s). Au plus une
+                    // fois par 15 s : si l'échec persiste, on retombe sur la
+                    // cadence normale (pas de boucle de re-arm toutes les 3 s).
+                    lastNoRequestRearmMs = nowMono
+                    val wait = scheduleDeferredRearm()
+                    logToJs("DNS-SD", "discoverServices ÉCHEC reason=3 (aucune requête de service) — re-arm complet dans ${wait}ms")
+                } else {
+                    logToJs("DNS-SD", "discoverServices ÉCHEC reason=$reason — re-arm au prochain cycle")
                 }
-                override fun onFailure(reason: Int) {
-                    // Échec visible dans l'overlay (avant : Log.w invisible en test
-                    // mobile) + re-arm complet au prochain cycle.
-                    lastServiceRequestResetMs = 0
-                    noteP2pError()
-                    val nowMono = SystemClock.elapsedRealtime()
-                    if (reason == WifiP2pManager.NO_SERVICE_REQUESTS &&
-                        nowMono - lastNoRequestRearmMs > 15_000L
-                    ) {
-                        // Aucune requête de service : la découverte ne peut rien
-                        // recevoir tant qu'un re-arm complet n'a pas eu lieu —
-                        // ne pas attendre le prochain cycle (8-20 s). Au plus une
-                        // fois par 15 s : si l'échec persiste, on retombe sur la
-                        // cadence normale (pas de boucle de re-arm toutes les 3 s).
-                        lastNoRequestRearmMs = nowMono
-                        val wait = scheduleDeferredRearm()
-                        logToJs("DNS-SD", "discoverServices ÉCHEC reason=3 (aucune requête de service) — re-arm complet dans ${wait}ms")
-                    } else {
-                        logToJs("DNS-SD", "discoverServices ÉCHEC reason=$reason — re-arm au prochain cycle")
-                    }
+            },
+            onError = { e ->
+                if (e is SecurityException) {
+                    logToJs("DNS-SD", "discoverServices refusé (NEARBY_WIFI_DEVICES?): ${e.message}")
+                } else {
+                    Log.e(TAG, "discoverServicesOnly: ${e.message}")
                 }
-            })
-        } catch (e: SecurityException) {
-            logToJs("DNS-SD", "discoverServices refusé (NEARBY_WIFI_DEVICES?): ${e.message}")
-        } catch (e: Exception) {
-            Log.e(TAG, "discoverServicesOnly: ${e.message}")
-        }
+            }
+        )
     }
 
     // =========================================================================
@@ -3135,41 +3198,40 @@ class MarselEngine private constructor(base: Context) : ContextWrapper(base) {
     }
 
     fun stopP2PDiscovery() {
-        wifiP2pManager.stopPeerDiscovery(wifiP2pChannel, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() {
-                Log.d(TAG, "P2P discovery stopped")
-            }
-            override fun onFailure(reason: Int) {
-                Log.e(TAG, "P2P stop discovery failed: reason=$reason")
-            }
-        })
+        if (!started) return
+        p2pOp(
+            "stopPeerDiscovery",
+            call = { l -> wifiP2pManager.stopPeerDiscovery(wifiP2pChannel, l) },
+            onOk = { Log.d(TAG, "P2P discovery stopped") },
+            onFail = { reason -> Log.e(TAG, "P2P stop discovery failed: reason=$reason") }
+        )
     }
 
     /** Ne retourne que les pairs Marsel confirmés (Section 2). */
     fun getP2PPeersJson(): String = marselPeersJson()
 
     fun createP2PGroup() {
-        wifiP2pManager.createGroup(wifiP2pChannel, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() {
-                Log.d(TAG, "P2P group created (autonomous GO)")
-            }
-            override fun onFailure(reason: Int) {
-                Log.e(TAG, "createP2PGroup failed: reason=$reason")
-            }
-        })
+        if (!started) return
+        p2pOp(
+            "createGroup",
+            call = { l -> wifiP2pManager.createGroup(wifiP2pChannel, l) },
+            onOk = { Log.d(TAG, "P2P group created (autonomous GO)") },
+            onFail = { reason -> Log.e(TAG, "createP2PGroup failed: reason=$reason") }
+        )
     }
 
     fun removeP2PGroup() {
-        wifiP2pManager.removeGroup(wifiP2pChannel, object : WifiP2pManager.ActionListener {
-            override fun onSuccess() {
+        if (!started) return
+        p2pOp(
+            "removeGroup",
+            call = { l -> wifiP2pManager.removeGroup(wifiP2pChannel, l) },
+            onOk = {
                 Log.d(TAG, "P2P group removed")
                 isGroupOwner = false
                 groupOwnerAddress = null
-            }
-            override fun onFailure(reason: Int) {
-                Log.e(TAG, "removeP2PGroup failed: reason=$reason")
-            }
-        })
+            },
+            onFail = { reason -> Log.e(TAG, "removeP2PGroup failed: reason=$reason") }
+        )
     }
 
     fun showNotification(title: String, body: String) {
